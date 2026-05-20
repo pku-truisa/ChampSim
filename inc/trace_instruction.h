@@ -46,6 +46,12 @@ struct input_instr {
 
   unsigned long long destination_memory[NUM_INSTR_DESTINATIONS]; // output memory
   unsigned long long source_memory[NUM_INSTR_SOURCES];           // input memory
+  
+  unsigned char is_malloc; // 0: normal instruction, 1: malloc, 2: free, 3: mmap in MainImage, 4: munmap
+                           // destination_memory[0] is malloc/free/mmap return value 
+                           // source_memory[0] is malloc/mmap size argument
+                           // source memory[0] is free address argument
+                           // source memory[1] is munmap length argument
 };
 
 struct cloudsuite_instr {
@@ -63,6 +69,12 @@ struct cloudsuite_instr {
   unsigned long long source_memory[NUM_INSTR_SOURCES];                 // input memory
 
   unsigned char asid[2];
+  
+  unsigned char is_malloc; // 0: normal instruction, 1: malloc, 2: free, 3: mmap in MainImage, 4: munmap
+                           // destination_memory[0] is malloc/free/mmap return value 
+                           // source_memory[0] is malloc/mmap size argument
+                           // source memory[0] is free address argument
+                           // source memory[1] is munmap length argument
 };
 // NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 

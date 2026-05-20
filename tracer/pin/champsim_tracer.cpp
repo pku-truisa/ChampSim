@@ -24,11 +24,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <unordered_set>
 
 #include "../../inc/trace_instruction.h"
 #include "pin.H"
 
 using trace_instr_format_t = input_instr;
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20  // Linux x86_64 
+#endif
 
 /* ================================================================== */
 // Global variables
@@ -41,6 +46,16 @@ INT64 trace_insts_left = 0;
 INT64 fast_forward_insts_left = 0;
 bool skip_dumping_instructions = false;
 
+std::ofstream malloc_outfile;
+trace_instr_format_t event_instr;
+std::unordered_set<ADDRINT> tracked_addresses;
+ADDRINT pending_alloc_size = 0;
+int pending_alloc_type = 0; // 0: none, 1: malloc, 3: mmap
+bool trace_limit_reached = false;
+
+// Malloc hook to prevent malloc/free reentrancy
+bool in_allocator_hook = false;
+
 // Prototype
 VOID insert_analysis_functions(INS ins);
 
@@ -52,6 +67,10 @@ KNOB<std::string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "champsim.
 KNOB<UINT64> KnobFastForward(KNOB_MODE_WRITEONCE, "pintool", "s", "0", "How many instructions to fast-forward before tracing begins");
 
 KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "1000000", "How many instructions to trace");
+
+KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "malloc.trace", "specify file name for malloc tracer output");
+
+KNOB<UINT64> KnobMallocSizeThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "0", "Minimum allocation size to trace (bytes, 0 to trace all)");
 
 /* ===================================================================== */
 // Utilities
@@ -66,6 +85,8 @@ INT32 Usage()
             << "Specify the output trace file with -o" << std::endl
             << "Specify the number of instructions to skip before tracing with -s" << std::endl
             << "Specify the number of instructions to trace with -t" << std::endl
+            << "Specify the malloc text output file with -m" << std::endl
+            << "Specify minimum allocation size to trace with -k (0 to trace all)" << std::endl
             << std::endl;
 
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
@@ -97,6 +118,7 @@ void fast_forward_ins()
 void check_end_of_trace()
 {
   if (trace_insts_left <= 0) {
+    trace_limit_reached = true;
     std::cout << "Reaching trace length limit, terminating early.\n";
     PIN_ExitApplication(0);
   }
@@ -157,6 +179,153 @@ void WriteToSet(T* begin, T* end, UINT32 r)
   *found_reg = r;
 }
 
+void WriteEventInstruction()
+{
+  if (!trace_limit_reached && outfile.is_open()) {
+    typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
+    std::memcpy(buf, &event_instr, sizeof(trace_instr_format_t));
+    outfile.write(buf, sizeof(trace_instr_format_t));
+  }
+}
+
+VOID MallocBefore(ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 1; // 1: malloc
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 1;
+}
+
+VOID MallocAfter(ADDRINT ret)
+{
+  if (!in_allocator_hook || pending_alloc_type != 1) return;
+
+  if (ret != 0 && !trace_limit_reached) {
+    if (malloc_outfile.is_open()) {
+      malloc_outfile << "APP_MALLOC(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+    }
+
+    event_instr.destination_memory[0] = ret;
+//    event_instr.destination_memory[1] = ret + pending_alloc_size;
+
+    WriteEventInstruction();
+    tracked_addresses.insert(ret);
+  }
+
+  pending_alloc_size = 0;
+  pending_alloc_type = 0;
+  in_allocator_hook = false;
+}
+
+VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
+{
+  if (trace_limit_reached || ptr == 0) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  auto it = tracked_addresses.find(ptr);
+  if (it == tracked_addresses.end()) {
+    in_allocator_hook = false;
+    return;
+  }
+
+  if (malloc_outfile.is_open()) {
+    malloc_outfile << "APP_FREE(0x" << std::hex << ptr << ")" << std::dec << std::endl;
+  }
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 2; // 2: free
+  event_instr.source_memory[0] = ptr;
+  WriteEventInstruction();
+
+  tracked_addresses.erase(it);
+  in_allocator_hook = false;
+}
+
+VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (!(flags & MAP_ANONYMOUS) || length < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = length;
+  pending_alloc_type = 3; // 3: mmap
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 3;
+}
+
+VOID MmapAfter(ADDRINT ret)
+{
+  if (!in_allocator_hook || pending_alloc_type != 3) return;
+
+  if (ret != 0 && ret != (ADDRINT)-1 && !trace_limit_reached) {
+    if (malloc_outfile.is_open()) {
+      malloc_outfile << "APP_MMAP(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+    }
+
+    event_instr.destination_memory[0] = ret;
+//    event_instr.destination_memory[1] = ret + pending_alloc_size;
+
+    WriteEventInstruction();
+    tracked_addresses.insert(ret);
+  }
+
+  pending_alloc_size = 0;
+  pending_alloc_type = 0;
+  in_allocator_hook = false;
+}
+
+VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
+{
+  if (trace_limit_reached || addr == 0 || addr == (ADDRINT)-1) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  auto it = tracked_addresses.find(addr);
+  if (it == tracked_addresses.end()) {
+    in_allocator_hook = false;
+    return;
+  }
+
+  if (malloc_outfile.is_open()) {
+    malloc_outfile << "APP_MUNMAP(0x" << std::hex << addr << ", " << std::dec << length << ")" << std::dec << std::endl;
+  }
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 4; // 4: munmap
+  event_instr.source_memory[0] = addr;
+  event_instr.source_memory[1] = length;
+  WriteEventInstruction();
+
+  tracked_addresses.erase(it);
+  in_allocator_hook = false;
+}
+
 /* ===================================================================== */
 // Instrumentation callbacks
 /* ===================================================================== */
@@ -205,6 +374,58 @@ VOID insert_analysis_functions(INS ins)
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)WriteCurrentInstruction, IARG_END);
 }
 
+VOID ImageLoad(IMG img, VOID* v)
+{
+  bool is_main_executable = IMG_IsMainExecutable(img);
+
+  RTN rtn = RTN_FindByName(img, "malloc");
+  if (!RTN_Valid(rtn)) {
+    rtn = RTN_FindByName(img, "__libc_malloc");
+  }
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  rtn = RTN_FindByName(img, "free");
+  if (!RTN_Valid(rtn)) {
+    rtn = RTN_FindByName(img, "__libc_free");
+  }
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_INST_PTR, IARG_END);
+    RTN_Close(rtn);
+  }
+  
+  if (is_main_executable) {
+    // If the main executable is statically linked, it might contain mmap/munmap implementations that we also want to hook.
+    rtn = RTN_FindByName(img, "mmap");
+    if (RTN_Valid(rtn)) {
+      RTN_Open(rtn);
+      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_INST_PTR, IARG_END);
+      RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+      RTN_Close(rtn);
+    }
+
+    rtn = RTN_FindByName(img, "mmap64");
+    if (RTN_Valid(rtn)) {
+      RTN_Open(rtn);
+      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_INST_PTR, IARG_END);
+      RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+      RTN_Close(rtn);
+    }
+
+    rtn = RTN_FindByName(img, "munmap");
+    if (RTN_Valid(rtn)) {
+      RTN_Open(rtn);
+      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
+      RTN_Close(rtn);
+    }
+  }
+}
+
 /*!
  * Print out analysis results.
  * This function is called when the application exits.
@@ -212,7 +433,10 @@ VOID insert_analysis_functions(INS ins)
  * @param[in]   v               value specified by the tool in the
  *                              PIN_AddFiniFunction function call
  */
-VOID Fini(INT32 code, VOID* v) { outfile.close(); }
+VOID Fini(INT32 code, VOID* v) { 
+  outfile.close();
+  malloc_outfile.close();
+}
 
 /*!
  * The main procedure of the tool.
@@ -225,6 +449,7 @@ int main(int argc, char* argv[])
 {
   // Initialize PIN library. Print help message if -h(elp) is specified
   // in the command line or the command line is invalid
+  PIN_InitSymbols();
   if (PIN_Init(argc, argv))
     return Usage();
 
@@ -237,7 +462,15 @@ int main(int argc, char* argv[])
     exit(1);
   }
 
+  malloc_outfile.open(KnobMallocOutputFile.Value().c_str(), std::ios_base::out);
+  if (!malloc_outfile) {
+    std::cout << "Couldn't open malloc trace file. Exiting." << std::endl;
+    exit(1);
+  }
+
   TRACE_AddInstrumentFunction(insert_instrumentation, 0);
+
+  IMG_AddInstrumentFunction(ImageLoad, 0);
 
   // Register function to be called when the application exits
   PIN_AddFiniFunction(Fini, 0);
