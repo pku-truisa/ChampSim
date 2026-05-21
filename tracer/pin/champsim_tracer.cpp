@@ -66,7 +66,7 @@ KNOB<std::string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "champsim.
 
 KNOB<UINT64> KnobFastForward(KNOB_MODE_WRITEONCE, "pintool", "s", "0", "How many instructions to fast-forward before tracing begins");
 
-KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "1000000", "How many instructions to trace");
+KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "0", "How many instructions to trace (0 for unlimited)");
 
 KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "malloc.trace", "specify file name for malloc tracer output");
 
@@ -84,7 +84,7 @@ INT32 Usage()
   std::cerr << "This tool creates a register and memory access trace" << std::endl
             << "Specify the output trace file with -o" << std::endl
             << "Specify the number of instructions to skip before tracing with -s" << std::endl
-            << "Specify the number of instructions to trace with -t" << std::endl
+            << "Specify the number of instructions to trace with -t (0 for unlimited)" << std::endl
             << "Specify the malloc text output file with -m" << std::endl
             << "Specify minimum allocation size to trace with -k (0 to trace all)" << std::endl
             << std::endl;
@@ -117,12 +117,15 @@ void fast_forward_ins()
 
 void check_end_of_trace()
 {
-  if (trace_insts_left <= 0) {
-    trace_limit_reached = true;
-    std::cout << "Reaching trace length limit, terminating early.\n";
-    PIN_ExitApplication(0);
+  if (trace_insts_left > 0) {
+    trace_insts_left -= 1;
+    if (trace_insts_left == 0) {
+      trace_limit_reached = true;
+      std::cout << "Reaching trace length limit, terminating early.\n";
+      PIN_ExitApplication(0);
+    }
   }
-  trace_insts_left -= 1;
+  // If trace_insts_left == 0 initially, it means unlimited tracing - don't decrement or exit
 }
 
 template <typename Func>
@@ -216,11 +219,10 @@ VOID MallocAfter(ADDRINT ret)
 
   if (ret != 0 && !trace_limit_reached) {
     if (malloc_outfile.is_open()) {
-      malloc_outfile << "APP_MALLOC(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+      malloc_outfile << "malloc(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
     }
 
     event_instr.destination_memory[0] = ret;
-//    event_instr.destination_memory[1] = ret + pending_alloc_size;
 
     WriteEventInstruction();
     tracked_addresses.insert(ret);
@@ -244,7 +246,7 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
   }
 
   if (malloc_outfile.is_open()) {
-    malloc_outfile << "APP_FREE(0x" << std::hex << ptr << ")" << std::dec << std::endl;
+    malloc_outfile << "free(0x" << std::hex << ptr << ")" << std::dec << std::endl;
   }
 
   event_instr = {};
@@ -284,7 +286,7 @@ VOID MmapAfter(ADDRINT ret)
 
   if (ret != 0 && ret != (ADDRINT)-1 && !trace_limit_reached) {
     if (malloc_outfile.is_open()) {
-      malloc_outfile << "APP_MMAP(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+      malloc_outfile << "app_mmap(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
     }
 
     event_instr.destination_memory[0] = ret;
@@ -312,7 +314,7 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
   }
 
   if (malloc_outfile.is_open()) {
-    malloc_outfile << "APP_MUNMAP(0x" << std::hex << addr << ", " << std::dec << length << ")" << std::dec << std::endl;
+    malloc_outfile << "app_munmap(0x" << std::hex << addr << ", " << std::dec << length << ")" << std::dec << std::endl;
   }
 
   event_instr = {};
