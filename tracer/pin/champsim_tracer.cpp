@@ -50,7 +50,8 @@ std::ofstream malloc_outfile;
 trace_instr_format_t event_instr;
 std::unordered_set<ADDRINT> tracked_addresses;
 ADDRINT pending_alloc_size = 0;
-int pending_alloc_type = 0; // 0: none, 1: malloc, 3: mmap
+ADDRINT pending_alloc_memptr = 0; // for posix_memalign
+int pending_alloc_type = 0; // 0: none, 1: malloc, 3: mmap, 5: calloc, 6: realloc, 7: aligned_alloc, 8: posix_memalign, 9: memalign
 bool trace_limit_reached = false;
 
 // Malloc hook to prevent malloc/free reentrancy
@@ -223,15 +224,33 @@ VOID MallocBefore(ADDRINT size, ADDRINT ip)
 
 VOID MallocAfter(ADDRINT ret)
 {
-  if (!in_allocator_hook || pending_alloc_type != 1) return;
+  if (!in_allocator_hook) return;
+  
+  // Handle different allocation types that use MallocAfter as the After callback
+  bool is_valid_type = (pending_alloc_type == 1 || pending_alloc_type == 5 || 
+                        pending_alloc_type == 6 || pending_alloc_type == 7 ||
+                        pending_alloc_type == 9);
+  
+  if (!is_valid_type) {
+    in_allocator_hook = false;
+    return;
+  }
 
   if (ret != 0 && !trace_limit_reached) {
+    const char* alloc_type_str = "";
+    switch (pending_alloc_type) {
+      case 1: alloc_type_str = "malloc"; break;
+      case 5: alloc_type_str = "calloc"; break;
+      case 6: alloc_type_str = "realloc"; break;
+      case 7: alloc_type_str = "aligned_alloc"; break;
+      case 9: alloc_type_str = "memalign"; break;
+    }
+    
     if (malloc_outfile.is_open()) {
-      malloc_outfile << "malloc(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+      malloc_outfile << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
     }
 
     event_instr.destination_memory[0] = ret;
-
     WriteEventInstruction();
     tracked_addresses.insert(ret);
   }
@@ -265,6 +284,142 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
 
   tracked_addresses.erase(it);
   in_allocator_hook = false;
+}
+
+VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  ADDRINT total_size = nmemb * size;
+  if (total_size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = total_size;
+  pending_alloc_type = 5; // 5: calloc
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 5;
+}
+
+VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 6; // 6: realloc
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 6;
+  event_instr.source_memory[0] = ptr; // old pointer
+}
+
+VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 7; // 7: aligned_alloc
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 7;
+}
+
+VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 8; // 8: posix_memalign
+  pending_alloc_memptr = memptr; // save for After callback
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 8;
+}
+
+VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
+{
+  if (!in_allocator_hook || pending_alloc_type != 8) return;
+
+  // For posix_memalign, the return value is the error code (0 on success)
+  // The actual pointer is stored in *memptr
+  if (ret == 0 && !trace_limit_reached && pending_alloc_memptr != 0) {
+    // Read the allocated address from memptr
+    ADDRINT allocated_addr = 0;
+    PIN_SafeCopy(&allocated_addr, (VOID*)pending_alloc_memptr, sizeof(ADDRINT));
+
+    if (allocated_addr != 0) {
+      if (malloc_outfile.is_open()) {
+        malloc_outfile << "posix_memalign(" << std::dec << pending_alloc_size << ")=0x" << std::hex << allocated_addr << std::dec << std::endl;
+      }
+
+      event_instr.destination_memory[0] = allocated_addr;
+      WriteEventInstruction();
+      tracked_addresses.insert(allocated_addr);
+    }
+  }
+
+  pending_alloc_size = 0;
+  pending_alloc_type = 0;
+  pending_alloc_memptr = 0;
+  in_allocator_hook = false;
+}
+
+VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 9; // 9: memalign
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 9;
 }
 
 VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
@@ -386,8 +541,6 @@ VOID insert_analysis_functions(INS ins)
 
 VOID ImageLoad(IMG img, VOID* v)
 {
-  bool is_main_executable = IMG_IsMainExecutable(img);
-
   RTN rtn = RTN_FindByName(img, "malloc");
   if (!RTN_Valid(rtn)) {
     rtn = RTN_FindByName(img, "__libc_malloc");
@@ -408,31 +561,75 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_INST_PTR, IARG_END);
     RTN_Close(rtn);
   }
-  
-  if (is_main_executable) {
-    // If the main executable is statically linked, it might contain mmap/munmap implementations that we also want to hook.
-    rtn = RTN_FindByName(img, "mmap");
-    if (RTN_Valid(rtn)) {
-      RTN_Open(rtn);
-      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_INST_PTR, IARG_END);
-      RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-      RTN_Close(rtn);
-    }
 
-    rtn = RTN_FindByName(img, "mmap64");
-    if (RTN_Valid(rtn)) {
-      RTN_Open(rtn);
-      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_INST_PTR, IARG_END);
-      RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-      RTN_Close(rtn);
-    }
+  // Hook calloc for all images
+  rtn = RTN_FindByName(img, "calloc");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
 
-    rtn = RTN_FindByName(img, "munmap");
-    if (RTN_Valid(rtn)) {
-      RTN_Open(rtn);
-      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
-      RTN_Close(rtn);
-    }
+  // Hook realloc for all images
+  rtn = RTN_FindByName(img, "realloc");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // Hook aligned_alloc for all images (C11 standard)
+  rtn = RTN_FindByName(img, "aligned_alloc");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AlignedAllocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // Hook posix_memalign for all images (POSIX standard)
+  rtn = RTN_FindByName(img, "posix_memalign");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_INST_PTR, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // Hook memalign for all images (traditional function)
+  rtn = RTN_FindByName(img, "memalign");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // Hook mmap/mmap64/munmap for all images (not just main executable)
+  // This allows tracking direct mmap calls from shared libraries
+  rtn = RTN_FindByName(img, "mmap");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  rtn = RTN_FindByName(img, "mmap64");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  rtn = RTN_FindByName(img, "munmap");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
+    RTN_Close(rtn);
   }
 }
 

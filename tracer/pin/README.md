@@ -47,7 +47,7 @@ The default value is 0, which means trace all allocations regardless of size.
 -a
 Only generate memory allocation trace, skip instruction trace.
 When this flag is set, the output file will contain only memory allocation events
-(malloc/free/mmap/munmap) and no regular instructions. This is useful for creating
+(malloc/free/calloc/realloc/mmap/munmap/aligned_alloc/posix_memalign/memalign) and no regular instructions. This is useful for creating
 smaller traces focused on memory allocation patterns.
 ```
 
@@ -78,8 +78,15 @@ Enable malloc/free event tracing with minimum size threshold:
 
     pin -t obj-intel64/champsim_tracer.so -m malloc_events.trace -k 1024 -- ./my_program
 
+The tracer now automatically hooks additional memory allocation functions:
+- `calloc`, `realloc` - C standard library allocation functions
+- `aligned_alloc` - C11 aligned allocation
+- `posix_memalign` - POSIX aligned allocation  
+- `memalign` - Traditional aligned allocation
+- `mmap`/`munmap` - Memory mapping (from all shared libraries, not just main executable)
+
 ### Trace only memory allocation events
-Generate a trace containing only memory allocation events (malloc/free/mmap/munmap), skipping all regular instructions:
+Generate a trace containing only memory allocation events, skipping all regular instructions:
 
     pin -t obj-intel64/champsim_tracer.so -o alloc_only.trace -a -- ./my_program
 
