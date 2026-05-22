@@ -236,7 +236,7 @@ VOID MallocAfter(ADDRINT ret)
     return;
   }
 
-  if (ret != 0 && !trace_limit_reached) {
+  if (!trace_limit_reached) {
     const char* alloc_type_str = "";
     switch (pending_alloc_type) {
       case 1: alloc_type_str = "malloc"; break;
@@ -247,12 +247,51 @@ VOID MallocAfter(ADDRINT ret)
     }
     
     if (malloc_outfile.is_open()) {
-      malloc_outfile << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+      if (pending_alloc_type == 6) {
+        // For realloc, show both old and new pointers
+        ADDRINT old_ptr = event_instr.source_memory[0];
+        if (ret != 0) {
+          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec;
+          if (old_ptr == 0) {
+            // realloc(NULL, size) behaves like malloc
+            malloc_outfile << " [new]";
+          } else if (old_ptr == ret) {
+            malloc_outfile << " [in-place]";
+          } else {
+            malloc_outfile << " [moved]";
+          }
+        } else {
+          // realloc failed, old pointer is still valid
+          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << pending_alloc_size << ")=NULL [failed]";
+        }
+        malloc_outfile << std::dec << std::endl;
+      } else {
+        // For other allocation functions
+        if (ret != 0) {
+          malloc_outfile << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+        } else {
+          malloc_outfile << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=NULL [failed]" << std::endl;
+        }
+      }
     }
 
-    event_instr.destination_memory[0] = ret;
-    WriteEventInstruction();
-    tracked_addresses.insert(ret);
+    // Only track successful allocations
+    if (ret != 0) {
+      event_instr.destination_memory[0] = ret;
+      WriteEventInstruction();
+      tracked_addresses.insert(ret);
+      
+      // For realloc with different pointers, remove old pointer from tracking
+      if (pending_alloc_type == 6) {
+        ADDRINT old_ptr = event_instr.source_memory[0];
+        if (old_ptr != 0 && old_ptr != ret) {
+          auto it = tracked_addresses.find(old_ptr);
+          if (it != tracked_addresses.end()) {
+            tracked_addresses.erase(it);
+          }
+        }
+      }
+    }
   }
 
   pending_alloc_size = 0;
