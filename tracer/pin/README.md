@@ -43,6 +43,12 @@ The default is malloc.trace.
 -k <number>
 Minimum allocation size to trace for malloc events (in bytes).
 The default value is 0, which means trace all allocations regardless of size.
+
+-a
+Only generate memory allocation trace, skip instruction trace.
+When this flag is set, the output file will contain only memory allocation events
+(malloc/free/mmap/munmap) and no regular instructions. This is useful for creating
+smaller traces focused on memory allocation patterns.
 ```
 
 ## Usage Examples
@@ -71,6 +77,13 @@ Specify a custom output filename:
 Enable malloc/free event tracing with minimum size threshold:
 
     pin -t obj-intel64/champsim_tracer.so -m malloc_events.trace -k 1024 -- ./my_program
+
+### Trace only memory allocation events
+Generate a trace containing only memory allocation events (malloc/free/mmap/munmap), skipping all regular instructions:
+
+    pin -t obj-intel64/champsim_tracer.so -o alloc_only.trace -a -- ./my_program
+
+This creates a much smaller trace file that focuses solely on memory allocation patterns.
 
 Traces created with the champsim_tracer.so are approximately 64 bytes per instruction, but they generally compress down to less than a byte per instruction using xz compression.
 

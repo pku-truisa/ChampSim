@@ -72,6 +72,8 @@ KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "mal
 
 KNOB<UINT64> KnobMallocSizeThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "0", "Minimum allocation size to trace (bytes, 0 to trace all)");
 
+KNOB<BOOL> KnobAllocOnly(KNOB_MODE_WRITEONCE, "pintool", "a", "0", "Only generate memory allocation trace, skip instruction trace");
+
 /* ===================================================================== */
 // Utilities
 /* ===================================================================== */
@@ -87,6 +89,7 @@ INT32 Usage()
             << "Specify the number of instructions to trace with -t (0 for unlimited)" << std::endl
             << "Specify the malloc text output file with -m" << std::endl
             << "Specify minimum allocation size to trace with -k (0 to trace all)" << std::endl
+            << "Use -a to only generate memory allocation trace (skip instruction trace)" << std::endl
             << std::endl;
 
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
@@ -163,6 +166,11 @@ void ResetCurrentInstruction(VOID* ip)
 
 void WriteCurrentInstruction()
 {
+  if (KnobAllocOnly.Value()) {
+    // In allocation-only mode, skip writing instruction trace
+    return;
+  }
+  
   typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
   std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
   outfile.write(buf, sizeof(trace_instr_format_t));
