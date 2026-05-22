@@ -220,6 +220,97 @@ VOID MallocBefore(ADDRINT size, ADDRINT ip)
   event_instr = {};
   event_instr.ip = (unsigned long long int)ip;
   event_instr.is_malloc = 1;
+  event_instr.source_memory[0] = size;  // size argument
+}
+
+VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  ADDRINT total_size = nmemb * size;
+  if (total_size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = total_size;
+  pending_alloc_type = 5; // 5: calloc
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 5;
+  event_instr.source_memory[0] = total_size;  // total size (nmemb * size)
+}
+
+VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 6; // 6: realloc
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 6;
+  event_instr.source_memory[0] = size;     // size argument (consistent with other alloc functions)
+  event_instr.source_memory[1] = ptr;      // old pointer address
+}
+
+VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 7; // 7: aligned_alloc
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 7;
+  event_instr.source_memory[0] = size;  // size argument
+}
+
+VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+  if (in_allocator_hook) return;
+  in_allocator_hook = true;
+
+  if (size < KnobMallocSizeThreshold.Value()) {
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
+    in_allocator_hook = false;
+    return;
+  }
+
+  pending_alloc_size = size;
+  pending_alloc_type = 9; // 9: memalign
+
+  event_instr = {};
+  event_instr.ip = (unsigned long long int)ip;
+  event_instr.is_malloc = 9;
+  event_instr.source_memory[0] = size;  // size argument
 }
 
 VOID MallocAfter(ADDRINT ret)
@@ -249,9 +340,10 @@ VOID MallocAfter(ADDRINT ret)
     if (malloc_outfile.is_open()) {
       if (pending_alloc_type == 6) {
         // For realloc, show both old and new pointers
-        ADDRINT old_ptr = event_instr.source_memory[0];
+        ADDRINT size = event_instr.source_memory[0];     // size argument
+        ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer address
         if (ret != 0) {
-          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec;
+          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=0x" << std::hex << ret << std::dec;
           if (old_ptr == 0) {
             // realloc(NULL, size) behaves like malloc
             malloc_outfile << " [new]";
@@ -262,7 +354,7 @@ VOID MallocAfter(ADDRINT ret)
           }
         } else {
           // realloc failed, old pointer is still valid
-          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << pending_alloc_size << ")=NULL [failed]";
+          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=NULL [failed]";
         }
         malloc_outfile << std::dec << std::endl;
       } else {
@@ -283,7 +375,7 @@ VOID MallocAfter(ADDRINT ret)
       
       // For realloc with different pointers, remove old pointer from tracking
       if (pending_alloc_type == 6) {
-        ADDRINT old_ptr = event_instr.source_memory[0];
+        ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer is now in source_memory[1]
         if (old_ptr != 0 && old_ptr != ret) {
           auto it = tracked_addresses.find(old_ptr);
           if (it != tracked_addresses.end()) {
@@ -325,71 +417,6 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
   in_allocator_hook = false;
 }
 
-VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
-{
-  if (trace_limit_reached) return;
-  if (in_allocator_hook) return;
-  in_allocator_hook = true;
-
-  ADDRINT total_size = nmemb * size;
-  if (total_size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
-  pending_alloc_size = total_size;
-  pending_alloc_type = 5; // 5: calloc
-
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 5;
-}
-
-VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
-{
-  if (trace_limit_reached) return;
-  if (in_allocator_hook) return;
-  in_allocator_hook = true;
-
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
-  pending_alloc_size = size;
-  pending_alloc_type = 6; // 6: realloc
-
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 6;
-  event_instr.source_memory[0] = ptr; // old pointer
-}
-
-VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
-{
-  if (trace_limit_reached) return;
-  if (in_allocator_hook) return;
-  in_allocator_hook = true;
-
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
-  pending_alloc_size = size;
-  pending_alloc_type = 7; // 7: aligned_alloc
-
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 7;
-}
-
 VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
 {
   if (trace_limit_reached) return;
@@ -410,6 +437,7 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
   event_instr = {};
   event_instr.ip = (unsigned long long int)ip;
   event_instr.is_malloc = 8;
+  event_instr.source_memory[0] = size;  // size argument
 }
 
 VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
@@ -440,27 +468,6 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
   in_allocator_hook = false;
 }
 
-VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
-{
-  if (trace_limit_reached) return;
-  if (in_allocator_hook) return;
-  in_allocator_hook = true;
-
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
-  pending_alloc_size = size;
-  pending_alloc_type = 9; // 9: memalign
-
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 9;
-}
-
 VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
 {
   if (trace_limit_reached) return;
@@ -480,6 +487,7 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
   event_instr = {};
   event_instr.ip = (unsigned long long int)ip;
   event_instr.is_malloc = 3;
+  event_instr.source_memory[0] = length;  // size argument (length for mmap)
 }
 
 VOID MmapAfter(ADDRINT ret)
@@ -591,16 +599,6 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
-  rtn = RTN_FindByName(img, "free");
-  if (!RTN_Valid(rtn)) {
-    rtn = RTN_FindByName(img, "__libc_free");
-  }
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_INST_PTR, IARG_END);
-    RTN_Close(rtn);
-  }
-
   // Hook calloc for all images
   rtn = RTN_FindByName(img, "calloc");
   if (RTN_Valid(rtn)) {
@@ -625,15 +623,6 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AlignedAllocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_INST_PTR, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // Hook posix_memalign for all images (POSIX standard)
-  rtn = RTN_FindByName(img, "posix_memalign");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_INST_PTR, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_INST_PTR, IARG_END);
     RTN_Close(rtn);
   }
 

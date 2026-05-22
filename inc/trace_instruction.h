@@ -47,11 +47,29 @@ struct input_instr {
   unsigned long long destination_memory[NUM_INSTR_DESTINATIONS]; // output memory
   unsigned long long source_memory[NUM_INSTR_SOURCES];           // input memory
   
-  unsigned char is_malloc; // 0: normal instruction, 1: malloc, 2: free, 3: mmap in MainImage, 4: munmap
-                           // destination_memory[0] is malloc/free/mmap return value 
-                           // source_memory[0] is malloc/mmap size argument
-                           // source memory[0] is free address argument
-                           // source memory[1] is munmap length argument
+  unsigned char is_malloc; // Memory allocation event type identifier:
+                           //   0: normal instruction (not a memory allocation event)
+                           //   1: malloc - standard memory allocation
+                           //   2: free - memory deallocation
+                           //   3: mmap - memory mapping (anonymous mappings only)
+                           //   4: munmap - unmap memory region
+                           //   5: calloc - allocate and zero-initialize array
+                           //   6: realloc - reallocate memory block
+                           //      - source_memory[0]: size argument
+                           //      - source_memory[1]: old pointer address
+                           //      - destination_memory[0]: new pointer address (may be same or different)
+                           //   7: aligned_alloc - aligned memory allocation (C11)
+                           //   8: posix_memalign - POSIX aligned allocation
+                           //   9: memalign - traditional aligned allocation
+                           //
+                           // For allocation events (1, 3, 5, 6, 7, 8, 9):
+                           //   - destination_memory[0]: allocated address (return value)
+                           //   - source_memory[0]: size argument
+                           //   - source_memory[1]: additional arguments if needed (e.g., old pointer for realloc)
+                           //
+                           // For deallocation events (2, 4):
+                           //   - source_memory[0]: pointer/address to free/unmap
+                           //   - source_memory[1]: length (for munmap only)
 };
 
 struct cloudsuite_instr {
@@ -70,11 +88,7 @@ struct cloudsuite_instr {
 
   unsigned char asid[2];
   
-  unsigned char is_malloc; // 0: normal instruction, 1: malloc, 2: free, 3: mmap in MainImage, 4: munmap
-                           // destination_memory[0] is malloc/free/mmap return value 
-                           // source_memory[0] is malloc/mmap size argument
-                           // source memory[0] is free address argument
-                           // source memory[1] is munmap length argument
+  unsigned char is_malloc; // Memory allocation event type identifier:
 };
 // NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 
