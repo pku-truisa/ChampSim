@@ -79,7 +79,7 @@ Enable malloc/free event tracing with minimum size threshold:
     pin -t obj-intel64/champsim_tracer.so -m malloc_events.trace -k 1024 -- ./my_program
 
 The tracer now automatically hooks additional memory allocation functions:
-- `calloc`, `realloc` - C standard library allocation functions
+- `malloc`, `free`, `calloc`, `realloc` - C standard library allocation functions
 - `aligned_alloc` - C11 aligned allocation
 - `posix_memalign` - POSIX aligned allocation  
 - `memalign` - Traditional aligned allocation
@@ -91,6 +91,72 @@ Generate a trace containing only memory allocation events, skipping all regular 
     pin -t obj-intel64/champsim_tracer.so -o alloc_only.trace -a -- ./my_program
 
 This creates a much smaller trace file that focuses solely on memory allocation patterns.
+
+## Analyzing Memory Allocation Traces
+
+The `analyze_malloc.py` tool can be used to analyze and modify memory allocation traces. It provides the following features:
+
+1. **Size Adjustment**: Adjusts allocation sizes smaller than a threshold to the nearest power of 2
+2. **Memory Tracking**: Tracks active memory objects and records peak memory usage
+3. **Comparative Analysis**: Compares peak memory usage before and after size adjustments
+
+### Supported Functions
+
+The tool supports all memory allocation functions tracked by champsim_tracer:
+- `malloc(size)=address`
+- `calloc(size)=address`
+- `realloc(old_ptr, size)=address [status]`
+- `aligned_alloc(size)=address`
+- `memalign(size)=address`
+- `posix_memalign(size)=address`
+- `app_mmap(length)=address`
+- `free(address)`
+- `app_munmap(address, length)`
+
+### Usage
+
+```bash
+# Basic usage (default threshold: 1024 bytes)
+python3 analyze_malloc.py -i malloc.trace
+
+# Specify output file and custom threshold
+python3 analyze_malloc.py -i malloc.trace -o modified.trace -s 2048
+```
+
+### Parameters
+
+- `-i, --input`: Required input file path
+- `-o, --output`: Optional output file path (default: input_file.modified)
+- `-s, --size`: Size threshold in bytes (default: 1024). Sizes below this value will be adjusted to the next power of 2
+
+### Example Output
+
+The tool provides detailed statistics:
+
+```
+Processing complete!
+Total 7 memory allocation calls found
+Modified 7 size parameters
+
+=== Peak Memory Usage Comparison ===
+Original peak memory: 0.00 MB (2,700 bytes)
+Modified peak memory: 0.00 MB (3,840 bytes)
+Memory increase:      0.00 MB (1,140 bytes)
+Increase percentage:  42.22%
+
+=== Final State Statistics ===
+Final active object count: 4
+Final memory usage:    0.00 MB (2,560 bytes)
+Output file saved to: modified.trace
+```
+
+### Use Cases
+
+This tool is useful for:
+- Studying the impact of memory alignment on peak memory usage
+- Analyzing memory allocation patterns in applications
+- Understanding how size adjustments affect overall memory consumption
+- Preprocessing traces for cache simulation studies
 
 Traces created with the champsim_tracer.so are approximately 64 bytes per instruction, but they generally compress down to less than a byte per instruction using xz compression.
 
