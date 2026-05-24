@@ -102,16 +102,19 @@ The `analyze_malloc.py` tool can be used to analyze and modify memory allocation
 
 ### Supported Functions
 
-The tool supports all memory allocation functions tracked by champsim_tracer:
-- `malloc(size)=address`
-- `calloc(size)=address`
-- `realloc(old_ptr, size)=address [status]`
-- `aligned_alloc(size)=address`
-- `memalign(size)=address`
-- `posix_memalign(size)=address`
-- `app_mmap(length)=address`
-- `free(address)`
-- `app_munmap(address, length)`
+The tool supports all memory allocation functions tracked by champsim_tracer. Each trace line includes an instruction count prefix (`instrCount:<count>`) to track memory object lifecycle:
+
+- `instrCount:<count> malloc(size)=address`
+- `instrCount:<count> calloc(size)=address`
+- `instrCount:<count> realloc(old_ptr, size)=address [status]`
+- `instrCount:<count> aligned_alloc(size)=address`
+- `instrCount:<count> memalign(size)=address`
+- `instrCount:<count> posix_memalign(size)=address`
+- `instrCount:<count> app_mmap(length)=address`
+- `instrCount:<count> free(address)`
+- `instrCount:<count> app_munmap(address, length)`
+
+The instruction count indicates the number of instructions executed when the allocation/deallocation occurred, which can be used to calculate memory object lifetime (destruction_instr - creation_instr).
 
 ### Usage
 

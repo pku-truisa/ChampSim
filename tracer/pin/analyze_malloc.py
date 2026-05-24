@@ -7,16 +7,16 @@ Features:
 2. Track active memory objects and record peak memory usage
 3. Compare and analyze peak memory usage differences before and after modifications
 
-Supported trace functions:
-- malloc(size)=address
-- calloc(size)=address
-- realloc(old_ptr, size)=address [status]
-- aligned_alloc(size)=address
-- memalign(size)=address
-- posix_memalign(size)=address
-- app_mmap(length)=address
-- free(address)
-- app_munmap(address, length)
+Supported trace functions (with instruction count prefix):
+- instrCount:<count> malloc(size)=address
+- instrCount:<count> calloc(size)=address
+- instrCount:<count> realloc(old_ptr, size)=address [status]
+- instrCount:<count> aligned_alloc(size)=address
+- instrCount:<count> memalign(size)=address
+- instrCount:<count> posix_memalign(size)=address
+- instrCount:<count> app_mmap(length)=address
+- instrCount:<count> free(address)
+- instrCount:<count> app_munmap(address, length)
 
 Usage:
     python3 analyze_malloc.py -i <input_file> [-o <output_file>] [-s <threshold>]
@@ -107,34 +107,39 @@ def process_malloc_file(input_file, output_file, threshold):
     - posix_memalign: POSIX aligned allocation
     - app_mmap: Anonymous memory mapping
     - free/app_munmap: Deallocation operations
+    
+    All trace lines include instruction count prefix: instrCount:<count>
+    This allows tracking memory object lifecycle (destruction_instr - creation_instr).
     """
     # Regular expressions to match various memory allocation calls
+    # Format: instrCount:<count> function(args)=result [status]
+    
     # malloc(size)=address
-    malloc_pattern = re.compile(r'^(malloc)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
+    malloc_pattern = re.compile(r'^instrCount:\d+\s+(malloc)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
     
     # calloc(size)=address (same as malloc, only one size parameter)
-    calloc_pattern = re.compile(r'^(calloc)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
+    calloc_pattern = re.compile(r'^instrCount:\d+\s+(calloc)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
     
     # realloc(old_ptr, size)=address [status]
-    realloc_pattern = re.compile(r'^(realloc)\((0x[0-9a-f]+),\s*(\d+)\)=(0x[0-9a-f]+|NULL)(?:\s+\[(new|in-place|moved|failed)\])?$')
+    realloc_pattern = re.compile(r'^instrCount:\d+\s+(realloc)\((0x[0-9a-f]+),\s*(\d+)\)=(0x[0-9a-f]+|NULL)(?:\s+\[(new|in-place|moved|failed)\])?$')
     
     # aligned_alloc(size)=address
-    aligned_alloc_pattern = re.compile(r'^(aligned_alloc)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
+    aligned_alloc_pattern = re.compile(r'^instrCount:\d+\s+(aligned_alloc)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
     
     # memalign(size)=address
-    memalign_pattern = re.compile(r'^(memalign)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
+    memalign_pattern = re.compile(r'^instrCount:\d+\s+(memalign)\((\d+)\)=(0x[0-9a-f]+)(?:\s+\[(new|failed)\])?$')
     
     # posix_memalign(size)=address
-    posix_memalign_pattern = re.compile(r'^(posix_memalign)\((\d+)\)=(0x[0-9a-f]+)$')
+    posix_memalign_pattern = re.compile(r'^instrCount:\d+\s+(posix_memalign)\((\d+)\)=(0x[0-9a-f]+)$')
     
     # app_mmap(length)=address
-    mmap_pattern = re.compile(r'^(app_mmap)\((\d+)\)=(0x[0-9a-f]+)$')
+    mmap_pattern = re.compile(r'^instrCount:\d+\s+(app_mmap)\((\d+)\)=(0x[0-9a-f]+)$')
     
     # free(address)
-    free_pattern = re.compile(r'^free\((0x[0-9a-f]+)\)$')
+    free_pattern = re.compile(r'^instrCount:\d+\s+free\((0x[0-9a-f]+)\)$')
     
     # app_munmap(address, length)
-    munmap_pattern = re.compile(r'^app_munmap\((0x[0-9a-f]+),\s*(\d+)\)$')
+    munmap_pattern = re.compile(r'^instrCount:\d+\s+app_munmap\((0x[0-9a-f]+),\s*(\d+)\)$')
     
     modified_count = 0
     total_count = 0

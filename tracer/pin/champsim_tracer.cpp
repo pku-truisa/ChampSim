@@ -343,7 +343,7 @@ VOID MallocAfter(ADDRINT ret)
         ADDRINT size = event_instr.source_memory[0];     // size argument
         ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer address
         if (ret != 0) {
-          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=0x" << std::hex << ret << std::dec;
+          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=0x" << std::hex << ret << std::dec;
           if (old_ptr == 0) {
             // realloc(NULL, size) behaves like malloc
             malloc_outfile << " [new]";
@@ -354,15 +354,15 @@ VOID MallocAfter(ADDRINT ret)
           }
         } else {
           // realloc failed, old pointer is still valid
-          malloc_outfile << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=NULL [failed]";
+          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=NULL [failed]";
         }
         malloc_outfile << std::dec << std::endl;
       } else {
         // For other allocation functions
         if (ret != 0) {
-          malloc_outfile << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
         } else {
-          malloc_outfile << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=NULL [failed]" << std::endl;
+          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=NULL [failed]" << std::endl;
         }
       }
     }
@@ -404,7 +404,7 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
   }
 
   if (malloc_outfile.is_open()) {
-    malloc_outfile << "free(0x" << std::hex << ptr << ")" << std::dec << std::endl;
+    malloc_outfile << "instrCount:" << std::dec << instrCount << " free(0x" << std::hex << ptr << ")" << std::dec << std::endl;
   }
 
   event_instr = {};
@@ -453,7 +453,7 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
 
     if (allocated_addr != 0) {
       if (malloc_outfile.is_open()) {
-        malloc_outfile << "posix_memalign(" << std::dec << pending_alloc_size << ")=0x" << std::hex << allocated_addr << std::dec << std::endl;
+        malloc_outfile << "instrCount:" << std::dec << instrCount << " posix_memalign(" << std::dec << pending_alloc_size << ")=0x" << std::hex << allocated_addr << std::dec << std::endl;
       }
 
       event_instr.destination_memory[0] = allocated_addr;
@@ -496,7 +496,7 @@ VOID MmapAfter(ADDRINT ret)
 
   if (ret != 0 && ret != (ADDRINT)-1 && !trace_limit_reached) {
     if (malloc_outfile.is_open()) {
-      malloc_outfile << "app_mmap(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+      malloc_outfile << "instrCount:" << std::dec << instrCount << " app_mmap(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
     }
 
     event_instr.destination_memory[0] = ret;
@@ -524,7 +524,7 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
   }
 
   if (malloc_outfile.is_open()) {
-    malloc_outfile << "app_munmap(0x" << std::hex << addr << ", " << std::dec << length << ")" << std::dec << std::endl;
+    malloc_outfile << "instrCount:" << std::dec << instrCount << " app_munmap(0x" << std::hex << addr << ", " << std::dec << length << ")" << std::dec << std::endl;
   }
 
   event_instr = {};
