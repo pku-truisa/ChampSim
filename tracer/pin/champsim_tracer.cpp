@@ -669,7 +669,9 @@ VOID ImageLoad(IMG img, VOID* v)
  *                              PIN_AddFiniFunction function call
  */
 VOID Fini(INT32 code, VOID* v) { 
-  outfile.close();
+  if (outfile.is_open()) {
+    outfile.close();
+  }
   malloc_outfile.close();
 }
 
@@ -691,10 +693,13 @@ int main(int argc, char* argv[])
   trace_insts_left = KnobTraceLen.Value();
   fast_forward_insts_left = KnobFastForward.Value();
 
-  outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
-  if (!outfile) {
-    std::cout << "Couldn't open output trace file. Exiting." << std::endl;
-    exit(1);
+  // Only open instruction trace file if not in allocation-only mode
+  if (!KnobAllocOnly.Value()) {
+    outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
+    if (!outfile) {
+      std::cout << "Couldn't open output trace file. Exiting." << std::endl;
+      exit(1);
+    }
   }
 
   malloc_outfile.open(KnobMallocOutputFile.Value().c_str(), std::ios_base::out);
