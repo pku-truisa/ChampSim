@@ -664,6 +664,26 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
+  // Hook posix_memalign for all images (POSIX standard)
+  rtn = RTN_FindByName(img, "posix_memalign");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_INST_PTR, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_INST_PTR, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // Hook free for all images
+  rtn = RTN_FindByName(img, "free");
+  if (!RTN_Valid(rtn)) {
+    rtn = RTN_FindByName(img, "__libc_free");
+  }
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_INST_PTR, IARG_END);
+    RTN_Close(rtn);
+  }
+
   // Hook mmap/mmap64/munmap for all images (not just main executable)
   // This allows tracking direct mmap calls from shared libraries
   rtn = RTN_FindByName(img, "mmap");
