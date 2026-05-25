@@ -19,17 +19,15 @@ Supported trace functions (with instruction count prefix):
 - instrCount:<count> app_munmap(address, length)
 
 Usage:
-    python3 analyze_malloc.py -i <input_file> [-o <output_file>] [-s <threshold>]
+    python3 analyze_malloc.py -i <input_file> [-s <threshold>]
     
 Parameters:
     -i, --input     Required input file path
-    -o, --output    Optional output file path, defaults to input_file.modified
     -s, --size      Optional size threshold in bytes, defaults to 1024
     
 Examples:
     python3 analyze_malloc.py -i trace.malloc
-    python3 analyze_malloc.py -i trace.malloc -o output.malloc
-    python3 analyze_malloc.py -i trace.malloc -o output.malloc -s 2048
+    python3 analyze_malloc.py -i trace.malloc -s 2048
 """
 
 import re
@@ -93,7 +91,7 @@ class MemoryTracker:
         return len(self.active_objects)
 
 
-def process_malloc_file(input_file, output_file, threshold):
+def process_malloc_file(input_file, threshold):
     """
     Process memory allocation trace file.
     Adjust size parameters of all malloc/calloc/realloc/aligned_alloc/memalign/posix_memalign/mmap calls (if smaller than threshold) to the nearest power of 2.
@@ -144,11 +142,28 @@ def process_malloc_file(input_file, output_file, threshold):
     modified_count = 0
     total_count = 0
     
+    # Statistics for each allocation function type
+    func_stats = {
+        'malloc': 0,
+        'calloc': 0,
+        'realloc': 0,
+        'aligned_alloc': 0,
+        'memalign': 0,
+        'posix_memalign': 0,
+        'app_mmap': 0,
+        'free': 0,
+        'app_munmap': 0
+    }
+    
     # Create two trackers: one for original size, one for modified size
     tracker_original = MemoryTracker()
     tracker_modified = MemoryTracker()
     
-    with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+    # Store complete trace information for large objects
+    # Key: address, Value: {'size': int, 'original_size': int, 'trace_line': str}
+    large_objects_info = {}
+    
+    with open(input_file, 'r') as infile:
         for line in infile:
             line = line.strip()
             
@@ -157,6 +172,7 @@ def process_malloc_file(input_file, output_file, threshold):
             if match:
                 total_count += 1
                 func_name = match.group(1)
+                func_stats['malloc'] += 1
                 original_size = int(match.group(2))
                 address = match.group(3)
                 
@@ -172,15 +188,13 @@ def process_malloc_file(input_file, output_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_modified.add_object(address, modified_size)
                 
-                # Write modified line
-                if original_size != modified_size:
-                    status = match.group(4)
-                    if status:
-                        outfile.write(f"{func_name}({modified_size})={address} [{status}]\n")
-                    else:
-                        outfile.write(f"{func_name}({modified_size})={address}\n")
-                else:
-                    outfile.write(line + '\n')
+                # Store trace info for large objects (using modified size for filtering)
+                if modified_size >= threshold:
+                    large_objects_info[address] = {
+                        'size': modified_size,
+                        'original_size': original_size,
+                        'trace_line': line
+                    }
                 continue
             
             # Process calloc call
@@ -188,6 +202,7 @@ def process_malloc_file(input_file, output_file, threshold):
             if match:
                 total_count += 1
                 func_name = match.group(1)
+                func_stats['calloc'] += 1
                 original_size = int(match.group(2))
                 address = match.group(3)
                 
@@ -203,15 +218,13 @@ def process_malloc_file(input_file, output_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_modified.add_object(address, modified_size)
                 
-                # Write modified line
-                if original_size != modified_size:
-                    status = match.group(4)
-                    if status:
-                        outfile.write(f"{func_name}({modified_size})={address} [{status}]\n")
-                    else:
-                        outfile.write(f"{func_name}({modified_size})={address}\n")
-                else:
-                    outfile.write(line + '\n')
+                # Store trace info for large objects
+                if modified_size >= threshold:
+                    large_objects_info[address] = {
+                        'size': modified_size,
+                        'original_size': original_size,
+                        'trace_line': line
+                    }
                 continue
             
             # Process realloc call
@@ -219,6 +232,7 @@ def process_malloc_file(input_file, output_file, threshold):
             if match:
                 total_count += 1
                 func_name = match.group(1)
+                func_stats['realloc'] += 1
                 address_old = match.group(2)
                 original_size = int(match.group(3))
                 address_new = match.group(4)
@@ -235,16 +249,16 @@ def process_malloc_file(input_file, output_file, threshold):
                 if address_new != "NULL":
                     tracker_original.update_object(address_old, address_new, original_size)
                     tracker_modified.update_object(address_old, address_new, modified_size)
-                
-                # Write modified line
-                if original_size != modified_size:
-                    status = match.group(5)
-                    if status:
-                        outfile.write(f"{func_name}({address_old}, {modified_size})={address_new} [{status}]\n")
-                    else:
-                        outfile.write(f"{func_name}({address_old}, {modified_size})={address_new}\n")
-                else:
-                    outfile.write(line + '\n')
+                    
+                    # Update large objects info
+                    if address_old in large_objects_info:
+                        del large_objects_info[address_old]
+                    if modified_size >= threshold:
+                        large_objects_info[address_new] = {
+                            'size': modified_size,
+                            'original_size': original_size,
+                            'trace_line': line
+                        }
                 continue
             
             # Process aligned_alloc call
@@ -252,6 +266,7 @@ def process_malloc_file(input_file, output_file, threshold):
             if match:
                 total_count += 1
                 func_name = match.group(1)
+                func_stats['aligned_alloc'] += 1
                 original_size = int(match.group(2))
                 address = match.group(3)
                 
@@ -267,15 +282,13 @@ def process_malloc_file(input_file, output_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_modified.add_object(address, modified_size)
                 
-                # Write modified line
-                if original_size != modified_size:
-                    status = match.group(4)
-                    if status:
-                        outfile.write(f"{func_name}({modified_size})={address} [{status}]\n")
-                    else:
-                        outfile.write(f"{func_name}({modified_size})={address}\n")
-                else:
-                    outfile.write(line + '\n')
+                # Store trace info for large objects
+                if modified_size >= threshold:
+                    large_objects_info[address] = {
+                        'size': modified_size,
+                        'original_size': original_size,
+                        'trace_line': line
+                    }
                 continue
             
             # Process memalign call
@@ -283,6 +296,7 @@ def process_malloc_file(input_file, output_file, threshold):
             if match:
                 total_count += 1
                 func_name = match.group(1)
+                func_stats['memalign'] += 1
                 original_size = int(match.group(2))
                 address = match.group(3)
                 
@@ -298,15 +312,13 @@ def process_malloc_file(input_file, output_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_modified.add_object(address, modified_size)
                 
-                # Write modified line
-                if original_size != modified_size:
-                    status = match.group(4)
-                    if status:
-                        outfile.write(f"{func_name}({modified_size})={address} [{status}]\n")
-                    else:
-                        outfile.write(f"{func_name}({modified_size})={address}\n")
-                else:
-                    outfile.write(line + '\n')
+                # Store trace info for large objects
+                if modified_size >= threshold:
+                    large_objects_info[address] = {
+                        'size': modified_size,
+                        'original_size': original_size,
+                        'trace_line': line
+                    }
                 continue
             
             # Process posix_memalign call
@@ -314,6 +326,7 @@ def process_malloc_file(input_file, output_file, threshold):
             if match:
                 total_count += 1
                 func_name = match.group(1)
+                func_stats['posix_memalign'] += 1
                 original_size = int(match.group(2))
                 address = match.group(3)
                 
@@ -328,12 +341,6 @@ def process_malloc_file(input_file, output_file, threshold):
                 # Track original and modified memory objects separately
                 tracker_original.add_object(address, original_size)
                 tracker_modified.add_object(address, modified_size)
-                
-                # Write modified line
-                if original_size != modified_size:
-                    outfile.write(f"{func_name}({modified_size})={address}\n")
-                else:
-                    outfile.write(line + '\n')
                 continue
             
             # Process app_mmap call
@@ -341,6 +348,7 @@ def process_malloc_file(input_file, output_file, threshold):
             if match:
                 total_count += 1
                 func_name = match.group(1)
+                func_stats['app_mmap'] += 1
                 original_size = int(match.group(2))
                 address = match.group(3)
                 
@@ -356,35 +364,37 @@ def process_malloc_file(input_file, output_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_modified.add_object(address, modified_size)
                 
-                # Write modified line
-                if original_size != modified_size:
-                    outfile.write(f"{func_name}({modified_size})={address}\n")
-                else:
-                    outfile.write(line + '\n')
+                # Store trace info for large objects
+                if modified_size >= threshold:
+                    large_objects_info[address] = {
+                        'size': modified_size,
+                        'original_size': original_size,
+                        'trace_line': line
+                    }
                 continue
             
             # Process free call
             match = free_pattern.match(line)
             if match:
+                func_stats['free'] += 1
                 address = match.group(1)
                 # Remove object from both trackers
                 tracker_original.remove_object(address)
                 tracker_modified.remove_object(address)
-                outfile.write(line + '\n')
                 continue
             
             # Process app_munmap call
             match = munmap_pattern.match(line)
             if match:
+                func_stats['app_munmap'] += 1
                 address = match.group(1)
                 # Remove object from both trackers
                 tracker_original.remove_object(address)
                 tracker_modified.remove_object(address)
-                outfile.write(line + '\n')
+                # Also remove from large objects info
+                if address in large_objects_info:
+                    del large_objects_info[address]
                 continue
-            
-            # Write other lines as is
-            outfile.write(line + '\n')
     
     # Calculate statistics
     original_peak = tracker_original.max_memory
@@ -395,6 +405,36 @@ def process_malloc_file(input_file, output_file, threshold):
     print(f"Processing complete!")
     print(f"Total {total_count} memory allocation calls found")
     print(f"Modified {modified_count} size parameters")
+    print(f"\n=== Function Call Statistics ===")
+    print(f"{'Function':<20} {'Count':>10} {'Percentage':>12}")
+    print(f"{'-'*20} {'-'*10} {'-'*12}")
+    
+    # Allocation functions
+    alloc_funcs = ['malloc', 'calloc', 'realloc', 'aligned_alloc', 'memalign', 'posix_memalign', 'app_mmap']
+    alloc_total = sum(func_stats[func] for func in alloc_funcs)
+    
+    for func in alloc_funcs:
+        count = func_stats[func]
+        percentage = (count / total_count * 100) if total_count > 0 else 0
+        print(f"{func:<20} {count:>10,} {percentage:>11.2f}%")
+    
+    print(f"{'-'*20} {'-'*10} {'-'*12}")
+    print(f"{'Total Alloc':<20} {alloc_total:>10,} {(alloc_total/total_count*100) if total_count > 0 else 0:>11.2f}%")
+    print()
+    
+    # Deallocation functions
+    dealloc_funcs = ['free', 'app_munmap']
+    dealloc_total = sum(func_stats[func] for func in dealloc_funcs)
+    
+    for func in dealloc_funcs:
+        count = func_stats[func]
+        percentage = (count / total_count * 100) if total_count > 0 else 0
+        print(f"{func:<20} {count:>10,} {percentage:>11.2f}%")
+    
+    print(f"{'-'*20} {'-'*10} {'-'*12}")
+    print(f"{'Total Dealloc':<20} {dealloc_total:>10,} {(dealloc_total/total_count*100) if total_count > 0 else 0:>11.2f}%")
+    print()
+    
     print(f"\n=== Peak Memory Usage Comparison ===")
     print(f"Original peak memory: {tracker_original.get_max_memory_mb():.2f} MB ({original_peak:,} bytes)")
     print(f"Modified peak memory: {tracker_modified.get_max_memory_mb():.2f} MB ({modified_peak:,} bytes)")
@@ -403,7 +443,24 @@ def process_malloc_file(input_file, output_file, threshold):
     print(f"\n=== Final State Statistics ===")
     print(f"Final active object count: {tracker_modified.get_active_count():,}")
     print(f"Final memory usage:    {tracker_modified.get_current_memory_mb():.2f} MB ({tracker_modified.current_memory:,} bytes)")
-    print(f"Output file saved to: {output_file}")
+    
+    # Write large objects with complete trace information to objects.log
+    objects_log_file = input_file + ".objects.log"
+    large_objects_list = [(addr, info) for addr, info in large_objects_info.items()]
+    large_objects_list.sort(key=lambda x: x[1]['size'], reverse=True)  # Sort by size in descending order
+    
+    with open(objects_log_file, 'w') as obj_file:
+        obj_file.write(f"# Active Memory Objects (modified size >= {threshold} bytes)\n")
+        obj_file.write(f"# Total objects: {len(large_objects_list)}\n")
+        obj_file.write(f"# Sorted by modified size (descending)\n")
+        obj_file.write(f"# Format: Original Trace Line\n")
+        obj_file.write(f"#\n")
+        
+        for addr, info in large_objects_list:
+            obj_file.write(f"{info['trace_line']}\n")
+    
+    print(f"\nLarge objects log saved to: {objects_log_file}")
+    print(f"Total large objects (modified size >= {threshold} bytes): {len(large_objects_list):,}")
 
 
 if __name__ == "__main__":
@@ -414,8 +471,7 @@ if __name__ == "__main__":
         epilog="""
 Examples:
   python3 analyze_malloc.py -i trace.malloc
-  python3 analyze_malloc.py -i trace.malloc -o output.malloc
-  python3 analyze_malloc.py -i trace.malloc -o output.malloc -s 2048
+  python3 analyze_malloc.py -i trace.malloc -s 2048
         """
     )
     
@@ -424,14 +480,10 @@ Examples:
                         required=True,
                         help='Required input file path')
     
-    parser.add_argument('-o', '--output',
-                        default=None,
-                        help='Optional output file path, defaults to input_file.modified')
-    
     parser.add_argument('-s', '--size',
                         type=int,
                         default=1024,
-                        help='size threshold (bytes), defaults to 1024. Sizes smaller than this will be adjusted to the nearest power of 2')
+                        help='Size threshold (bytes) for power-of-2 adjustment, defaults to 1024. Sizes smaller than this will be adjusted to the nearest power of 2')
     
     # Parse arguments
     args = parser.parse_args()
@@ -439,20 +491,12 @@ Examples:
     # Get input file path
     input_file = args.input
     
-    # Determine output file path
-    if args.output:
-        output_file = args.output
-    else:
-        # If no output file is specified, default to input_file.modified
-        output_file = input_file + ".modified"
-    
     # Get threshold
     threshold = args.size
     
     print("Starting to process memory allocation trace file...")
     print(f"Input file: {input_file}")
-    print(f"Output file: {output_file}")
     print(f"Size threshold: {threshold} bytes")
     print("-" * 50)
     
-    process_malloc_file(input_file, output_file, threshold)
+    process_malloc_file(input_file, threshold)
