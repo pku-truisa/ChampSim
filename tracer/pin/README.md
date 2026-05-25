@@ -92,6 +92,8 @@ Generate a trace containing only memory allocation events, skipping all regular 
 
 This creates a much smaller trace file that focuses solely on memory allocation patterns.
 
+**Performance Optimization**: In allocation-only mode (`-a`), the tracer skips all instruction-level analysis (register tracking, memory operand analysis, etc.) and only maintains an instruction counter for the malloc trace. This significantly improves tracing speed compared to normal mode while still providing accurate `instrCount` values in the malloc trace output.
+
 ## Analyzing Memory Allocation Traces
 
 The `analyze_malloc.py` tool can be used to analyze and modify memory allocation traces. It provides the following features:

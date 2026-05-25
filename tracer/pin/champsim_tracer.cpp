@@ -132,6 +132,12 @@ void check_end_of_trace()
   // If trace_insts_left == 0 initially, it means unlimited tracing - don't decrement or exit
 }
 
+// Simple instruction counter for allocation-only mode
+void increment_instr_count()
+{
+  instrCount++;
+}
+
 template <typename Func>
 void for_ins_in_trace(const TRACE& trace, Func f)
 {
@@ -144,6 +150,16 @@ void for_ins_in_trace(const TRACE& trace, Func f)
 
 void insert_instrumentation(TRACE trace, void* v)
 {
+  // In allocation-only mode, skip all instruction-level instrumentation
+  // Only keep the counter for malloc trace's instrCount
+  if (KnobAllocOnly.Value()) {
+    // Just increment instruction counter without detailed analysis
+    for_ins_in_trace(trace, [](const INS& ins) {
+      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)increment_instr_count, IARG_END);
+    });
+    return;
+  }
+  
   if (fast_forward_insts_left > 500) {
     TRACE_InsertCall(trace, IPOINT_BEFORE, (AFUNPTR)fast_forward_trace, IARG_UINT32, TRACE_NumIns(trace), IARG_END);
   } else {
