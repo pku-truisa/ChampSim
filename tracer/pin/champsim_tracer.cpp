@@ -490,7 +490,7 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
-  if (!(flags & MAP_ANONYMOUS) || length < KnobMallocSizeThreshold.Value()) {
+  if (length < KnobMallocSizeThreshold.Value()) {
     pending_alloc_size = 0;
     pending_alloc_type = 0;
     in_allocator_hook = false;
