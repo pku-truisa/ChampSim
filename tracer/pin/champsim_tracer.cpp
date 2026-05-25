@@ -343,60 +343,58 @@ VOID MallocAfter(ADDRINT ret)
     return;
   }
 
-  if (!trace_limit_reached) {
-    const char* alloc_type_str = "";
-    switch (pending_alloc_type) {
-      case 1: alloc_type_str = "malloc"; break;
-      case 5: alloc_type_str = "calloc"; break;
-      case 6: alloc_type_str = "realloc"; break;
-      case 7: alloc_type_str = "aligned_alloc"; break;
-      case 9: alloc_type_str = "memalign"; break;
-    }
-    
-    if (malloc_outfile.is_open()) {
-      if (pending_alloc_type == 6) {
-        // For realloc, show both old and new pointers
-        ADDRINT size = event_instr.source_memory[0];     // size argument
-        ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer address
-        if (ret != 0) {
-          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=0x" << std::hex << ret << std::dec;
-          if (old_ptr == 0) {
-            // realloc(NULL, size) behaves like malloc
-            malloc_outfile << " [new]";
-          } else if (old_ptr == ret) {
-            malloc_outfile << " [in-place]";
-          } else {
-            malloc_outfile << " [moved]";
-          }
+  const char* alloc_type_str = "";
+  switch (pending_alloc_type) {
+    case 1: alloc_type_str = "malloc"; break;
+    case 5: alloc_type_str = "calloc"; break;
+    case 6: alloc_type_str = "realloc"; break;
+    case 7: alloc_type_str = "aligned_alloc"; break;
+    case 9: alloc_type_str = "memalign"; break;
+  }
+  
+  if (malloc_outfile.is_open()) {
+    if (pending_alloc_type == 6) {
+      // For realloc, show both old and new pointers
+      ADDRINT size = event_instr.source_memory[0];     // size argument
+      ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer address
+      if (ret != 0) {
+        malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=0x" << std::hex << ret << std::dec;
+        if (old_ptr == 0) {
+          // realloc(NULL, size) behaves like malloc
+          malloc_outfile << " [new]";
+        } else if (old_ptr == ret) {
+          malloc_outfile << " [in-place]";
         } else {
-          // realloc failed, old pointer is still valid
-          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=NULL [failed]";
+          malloc_outfile << " [moved]";
         }
-        malloc_outfile << std::dec << std::endl;
       } else {
-        // For other allocation functions
-        if (ret != 0) {
-          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
-        } else {
-          malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=NULL [failed]" << std::endl;
-        }
+        // realloc failed, old pointer is still valid
+        malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=NULL [failed]";
+      }
+      malloc_outfile << std::dec << std::endl;
+    } else {
+      // For other allocation functions
+      if (ret != 0) {
+        malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
+      } else {
+        malloc_outfile << "instrCount:" << std::dec << instrCount << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=NULL [failed]" << std::endl;
       }
     }
+  }
 
-    // Only track successful allocations
-    if (ret != 0) {
-      event_instr.destination_memory[0] = ret;
-      WriteEventInstruction();
-      tracked_addresses.insert(ret);
-      
-      // For realloc with different pointers, remove old pointer from tracking
-      if (pending_alloc_type == 6) {
-        ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer is now in source_memory[1]
-        if (old_ptr != 0 && old_ptr != ret) {
-          auto it = tracked_addresses.find(old_ptr);
-          if (it != tracked_addresses.end()) {
-            tracked_addresses.erase(it);
-          }
+  // Only track successful allocations for instruction trace
+  if (!trace_limit_reached && ret != 0) {
+    event_instr.destination_memory[0] = ret;
+    WriteEventInstruction();
+    tracked_addresses.insert(ret);
+    
+    // For realloc with different pointers, remove old pointer from tracking
+    if (pending_alloc_type == 6) {
+      ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer is now in source_memory[1]
+      if (old_ptr != 0 && old_ptr != ret) {
+        auto it = tracked_addresses.find(old_ptr);
+        if (it != tracked_addresses.end()) {
+          tracked_addresses.erase(it);
         }
       }
     }
@@ -409,7 +407,8 @@ VOID MallocAfter(ADDRINT ret)
 
 VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
 {
-  if (trace_limit_reached || ptr == 0) return;
+  if (ptr == 0) return;
+
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
@@ -423,13 +422,17 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
     malloc_outfile << "instrCount:" << std::dec << instrCount << " free(0x" << std::hex << ptr << ")" << std::dec << std::endl;
   }
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 2; // 2: free
-  event_instr.source_memory[0] = ptr;
-  WriteEventInstruction();
+  // Only write to instruction trace if not reached limit
+  if (!trace_limit_reached) {
+    event_instr = {};
+    event_instr.ip = (unsigned long long int)ip;
+    event_instr.is_malloc = 2; // 2: free
+    event_instr.source_memory[0] = ptr;
+    WriteEventInstruction();
 
-  tracked_addresses.erase(it);
+    tracked_addresses.erase(it);
+  }
+
   in_allocator_hook = false;
 }
 
@@ -462,7 +465,7 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
 
   // For posix_memalign, the return value is the error code (0 on success)
   // The actual pointer is stored in *memptr
-  if (ret == 0 && !trace_limit_reached && pending_alloc_memptr != 0) {
+  if (ret == 0 && pending_alloc_memptr != 0) {
     // Read the allocated address from memptr
     ADDRINT allocated_addr = 0;
     PIN_SafeCopy(&allocated_addr, (VOID*)pending_alloc_memptr, sizeof(ADDRINT));
@@ -472,9 +475,11 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
         malloc_outfile << "instrCount:" << std::dec << instrCount << " posix_memalign(" << std::dec << pending_alloc_size << ")=0x" << std::hex << allocated_addr << std::dec << std::endl;
       }
 
-      event_instr.destination_memory[0] = allocated_addr;
-      WriteEventInstruction();
-      tracked_addresses.insert(allocated_addr);
+      if (!trace_limit_reached) {
+        event_instr.destination_memory[0] = allocated_addr;
+        WriteEventInstruction();
+        tracked_addresses.insert(allocated_addr);
+      }
     }
   }
 
@@ -510,16 +515,19 @@ VOID MmapAfter(ADDRINT ret)
 {
   if (!in_allocator_hook || pending_alloc_type != 3) return;
 
-  if (ret != 0 && ret != (ADDRINT)-1 && !trace_limit_reached) {
+  if (ret != 0 && ret != (ADDRINT)-1) {
     if (malloc_outfile.is_open()) {
       malloc_outfile << "instrCount:" << std::dec << instrCount << " app_mmap(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
     }
 
-    event_instr.destination_memory[0] = ret;
+    // Only write to instruction trace if not reached limit
+    if (!trace_limit_reached) {
+      event_instr.destination_memory[0] = ret;
 //    event_instr.destination_memory[1] = ret + pending_alloc_size;
 
-    WriteEventInstruction();
-    tracked_addresses.insert(ret);
+      WriteEventInstruction();
+      tracked_addresses.insert(ret);
+    }
   }
 
   pending_alloc_size = 0;
@@ -529,7 +537,8 @@ VOID MmapAfter(ADDRINT ret)
 
 VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
 {
-  if (trace_limit_reached || addr == 0 || addr == (ADDRINT)-1) return;
+  if (addr == 0 || addr == (ADDRINT)-1) return;
+  
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
@@ -543,14 +552,18 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
     malloc_outfile << "instrCount:" << std::dec << instrCount << " app_munmap(0x" << std::hex << addr << ", " << std::dec << length << ")" << std::dec << std::endl;
   }
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 4; // 4: munmap
-  event_instr.source_memory[0] = addr;
-  event_instr.source_memory[1] = length;
-  WriteEventInstruction();
+  // Only write to instruction trace if not reached limit
+  if (!trace_limit_reached) {
+    event_instr = {};
+    event_instr.ip = (unsigned long long int)ip;
+    event_instr.is_malloc = 4; // 4: munmap
+    event_instr.source_memory[0] = addr;
+    event_instr.source_memory[1] = length;
+    WriteEventInstruction();
 
-  tracked_addresses.erase(it);
+    tracked_addresses.erase(it);
+  }
+  
   in_allocator_hook = false;
 }
 
