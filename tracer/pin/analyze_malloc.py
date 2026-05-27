@@ -18,6 +18,25 @@ import argparse
 import lzma
 
 
+class Tee:
+    """Write to multiple file objects simultaneously."""
+    def __init__(self, *files):
+        self.files = files
+    def write(self, obj):
+        for f in self.files:
+            try:
+                f.write(obj)
+                f.flush()
+            except ValueError:
+                pass
+    def flush(self):
+        for f in self.files:
+            try:
+                f.flush()
+            except ValueError:
+                pass
+
+
 def next_power_of_2(n):
     if n <= 0:
         return 1
@@ -529,8 +548,21 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--size', type=int, default=1024,
                         help='Size threshold for power-of-2 adjustment (default: 1024)')
     args = parser.parse_args()
+    
+    # Determine base name for log files
+    if args.input.endswith('.xz'):
+        base_name = args.input[:-3]
+    else:
+        base_name = args.input
+    
+    result_log = open(base_name + ".result.log", "w")
+    original_stdout = sys.stdout
+    sys.stdout = Tee(original_stdout, result_log)
+    
     print("Starting to process memory allocation trace file...")
     print(f"Input file: {args.input}")
     print(f"Size threshold: {args.size} bytes")
     print("-" * 50)
     process_malloc_file(args.input, args.size)
+    
+    result_log.close()
