@@ -23,7 +23,6 @@
 
 #include "deadlock.h"
 #include "instruction.h"
-#include "memory_object_table.h"
 #include "util/bits.h" // for lg2, bitmask
 #include "util/span.h"
 #include "util/units.h"
@@ -287,38 +286,11 @@ long DRAM_CHANNEL::populate_dbus()
       // set when bankgroup dbus will be next ready
       bankgroup_readytime[op_bankgroup] = current_time + DRAM_DBUS_RETURN_TIME + DRAM_DBUS_BANKGROUP_STALL;
 
+      // Record row buffer hit/miss (includes per-object stats)
       if (iter_next_process->row_buffer_hit) {
-        if (write_mode) {
-          ++sim_stats.WQ_ROW_BUFFER_HIT;
-        } else {
-          ++sim_stats.RQ_ROW_BUFFER_HIT;
-        }
-      } else if (write_mode) {
-        ++sim_stats.WQ_ROW_BUFFER_MISS;
+        sim_stats.record_row_hit(iter_next_process->pkt->value().address, write_mode, warmup);
       } else {
-        ++sim_stats.RQ_ROW_BUFFER_MISS;
-      }
-
-      // Per-object DRAM stats
-      if (!warmup) {
-        champsim::page_number ppage{iter_next_process->pkt->value().address.to<uint64_t>() >> LOG2_PAGE_SIZE};
-        uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
-        if (alloc_id > 0) {
-          auto& obj_stats = mol_table.get_dram_stats(alloc_id, sim_stats.name);
-          if (iter_next_process->row_buffer_hit) {
-            if (write_mode) {
-              ++obj_stats.wq_row_buffer_hit;
-            } else {
-              ++obj_stats.rq_row_buffer_hit;
-            }
-          } else {
-            if (write_mode) {
-              ++obj_stats.wq_row_buffer_miss;
-            } else {
-              ++obj_stats.rq_row_buffer_miss;
-            }
-          }
-        }
+        sim_stats.record_row_miss(iter_next_process->pkt->value().address, write_mode, warmup);
       }
 
       ++progress;
