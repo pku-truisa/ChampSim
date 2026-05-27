@@ -28,13 +28,19 @@ The default is champsim.trace.
 
 -s <number>
 Specify the number of instructions to skip in the program before tracing begins.
-This is useful for skipping initialization code that you don't want to include in your trace.
+This is useful for skipping initialization code that you don't want to include in your instruction trace.
 The default value is 0 (start tracing from the beginning).
+
+Note: -s only affects the instruction trace (champsim.trace). Malloc/free events (malloc.trace)
+are always recorded from the very beginning of execution, regardless of the -s value.
 
 -t <number>
 The number of instructions to trace, after -s instructions have been skipped.
 The default value is 0, which means trace all instructions (unlimited).
 If you specify a positive number N, the tracer will stop after tracing N instructions.
+
+Note: -t has no effect in allocation-only mode (-a). When -a is used, malloc tracing
+continues until the program exits naturally.
 
 -m <filename>
 Specify the output file for malloc/free event traces.
@@ -49,6 +55,10 @@ Only generate memory allocation trace, skip instruction trace.
 When this flag is set, the output file will contain only memory allocation events
 (malloc/free/calloc/realloc/mmap/munmap/aligned_alloc/posix_memalign/memalign) and no regular instructions. This is useful for creating
 smaller traces focused on memory allocation patterns.
+
+Note: When -a is used, the -s (fast-forward) and -t (trace length) options have no effect.
+Malloc tracing runs from program start to program exit, and the program will not be
+terminated early by -t.
 ```
 
 ## Usage Examples
@@ -122,38 +132,16 @@ The instruction count indicates the number of instructions executed when the all
 
 ```bash
 # Basic usage (default threshold: 1024 bytes)
-python3 analyze_malloc.py -i malloc.trace
+    python3 analyze_malloc.py -i malloc.trace
 
-# Specify output file and custom threshold
-python3 analyze_malloc.py -i malloc.trace -o modified.trace -s 2048
+# Specify custom threshold
+python3 analyze_malloc.py -i malloc.trace -s 2048
 ```
 
 ### Parameters
 
 - `-i, --input`: Required input file path
-- `-o, --output`: Optional output file path (default: input_file.modified)
-- `-s, --size`: Size threshold in bytes (default: 1024). Sizes below this value will be adjusted to the next power of 2
-
-### Example Output
-
-The tool provides detailed statistics:
-
-```
-Processing complete!
-Total 7 memory allocation calls found
-Modified 7 size parameters
-
-=== Peak Memory Usage Comparison ===
-Original peak memory: 0.00 MB (2,700 bytes)
-Modified peak memory: 0.00 MB (3,840 bytes)
-Memory increase:      0.00 MB (1,140 bytes)
-Increase percentage:  42.22%
-
-=== Final State Statistics ===
-Final active object count: 4
-Final memory usage:    0.00 MB (2,560 bytes)
-Output file saved to: modified.trace
-```
+- `-s, --size`: Size threshold in bytes (default: 1024). Sizes smaller than this value will be adjusted to the nearest power of 2
 
 ### Use Cases
 
