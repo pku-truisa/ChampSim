@@ -81,6 +81,17 @@ class MemoryTracker:
             size = self.active_objects.pop(address)
             self.current_memory -= size
     
+    def reduce_object(self, address, length):
+        """Reduce a memory object by the given length (partial munmap).
+        If length >= current size, the object is fully removed."""
+        if address in self.active_objects:
+            current_size = self.active_objects[address]
+            if length >= current_size:
+                self.remove_object(address)
+            else:
+                self.active_objects[address] = current_size - length
+                self.current_memory -= length
+    
     def update_object(self, old_address, new_address, new_size):
         """Update a memory object (realloc)"""
         # First remove the old object
@@ -411,6 +422,19 @@ def process_malloc_file(input_file, threshold):
                 
                 tracker_original.add_object(address, original_size)
                 tracker_modified.add_object(address, modified_size)
+                
+                if modified_size >= threshold:
+                    large_objects_info[address] = {
+                        'func': func_name,
+                        'alloc_ip': alloc_ip,
+                        'alloc_instr': instr_cnt,
+                        'size': modified_size,
+                        'original_size': original_size,
+                        'free_instr': None,
+                        'free_ip': None,
+                        'trace_line': line
+                    }
+                
                 track_ip(alloc_ip, func_name, original_size)
                 continue
             
@@ -477,13 +501,16 @@ def process_malloc_file(input_file, threshold):
                 instr_cnt = int(match.group(1)) if match.group(1) else 0
                 munmap_ip = match.group(2) if match.group(2) else "0x0"
                 address = match.group(3)
+                length = int(match.group(4))
                 
-                tracker_original.remove_object(address)
-                tracker_modified.remove_object(address)
+                tracker_original.reduce_object(address, length)
+                tracker_modified.reduce_object(address, length)
                 
                 if address in large_objects_info:
-                    large_objects_info[address]['free_instr'] = instr_cnt
-                    large_objects_info[address]['free_ip'] = munmap_ip
+                    # If the object was fully removed, record free info
+                    if address not in tracker_original.active_objects and address not in tracker_modified.active_objects:
+                        large_objects_info[address]['free_instr'] = instr_cnt
+                        large_objects_info[address]['free_ip'] = munmap_ip
                 continue
     
     # Calculate statistics
