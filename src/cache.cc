@@ -28,6 +28,7 @@
 #include "chrono.h"
 #include "deadlock.h"
 #include "instruction.h"
+#include "memory_object_table.h"
 #include "util/algorithm.h"
 #include "util/bits.h"
 #include "util/span.h"
@@ -228,10 +229,30 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
   if (way != set_end) {
     if (way->valid && way->prefetch) {
       ++sim_stats.pf_useless;
+
+      // Per-object prefetch useless stats
+      if (!warmup) {
+        champsim::page_number ppage{way->address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+        uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+        if (alloc_id > 0) {
+          auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+          ++obj_stats.pf_useless;
+        }
+      }
     }
 
     if (fill_mshr.type == access_type::PREFETCH) {
       ++sim_stats.pf_fill;
+
+      // Per-object prefetch fill stats
+      if (!warmup) {
+        champsim::page_number ppage{fill_mshr.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+        uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+        if (alloc_id > 0) {
+          auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+          ++obj_stats.pf_fill;
+        }
+      }
     }
   }
 
@@ -248,9 +269,35 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
   }
 
   // COLLECT STATS
-  if (fill_mshr.type != access_type::PREFETCH)
-    sim_stats.total_miss_latency_cycles += (current_time - (fill_mshr.time_enqueued + clock_period)) / clock_period;
+  if (fill_mshr.type != access_type::PREFETCH) {
+    auto miss_lat = (current_time - (fill_mshr.time_enqueued + clock_period)) / clock_period;
+    sim_stats.total_miss_latency_cycles += miss_lat;
+
+    // Per-object miss latency stats
+    if (!warmup) {
+      champsim::page_number ppage{fill_mshr.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+      uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+      if (alloc_id > 0) {
+        auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+        obj_stats.total_miss_latency += miss_lat;
+      }
+    }
+  }
   sim_stats.mshr_return.increment(std::pair{fill_mshr.type, fill_mshr.cpu});
+
+  // Per-object mshr_return stats
+  if (!warmup) {
+    champsim::page_number ppage{fill_mshr.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+    uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+    if (alloc_id > 0) {
+      auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+      ++obj_stats.mshr_return;
+      auto type_idx = champsim::to_underlying(fill_mshr.type);
+      if (type_idx < 5) {
+        ++obj_stats.hits[type_idx];
+      }
+    }
+  }
 
   response_type response{fill_mshr.address, fill_mshr.v_address, fill_mshr.data_promise->data, metadata_thru, fill_mshr.instr_depend_on_me};
   for (auto* ret : fill_mshr.to_return) {
@@ -289,6 +336,19 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   if (hit) {
     sim_stats.hits.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
+    // Per-object hit stats
+    if (!warmup) {
+      champsim::page_number ppage{handle_pkt.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+      uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+      if (alloc_id > 0) {
+        auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+        auto type_idx = champsim::to_underlying(handle_pkt.type);
+        if (type_idx < 5) {
+          ++obj_stats.hits[type_idx];
+        }
+      }
+    }
+
     response_type response{handle_pkt.address, handle_pkt.v_address, way->data, metadata_thru, handle_pkt.instr_depend_on_me};
     for (auto* ret : handle_pkt.to_return) {
       ret->push_back(response);
@@ -299,6 +359,17 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
     // update prefetch stats and reset prefetch bit
     if (useful_prefetch) {
       ++sim_stats.pf_useful;
+
+      // Per-object prefetch useful stats
+      if (!warmup) {
+        champsim::page_number ppage{handle_pkt.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+        uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+        if (alloc_id > 0) {
+          auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+          ++obj_stats.pf_useful;
+        }
+      }
+
       way->prefetch = false;
     }
   }
@@ -355,11 +426,31 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
       // Mark the prefetch as useful
       if (mshr_entry->prefetch_from_this) {
         ++sim_stats.pf_useful;
+
+        // Per-object prefetch useful stats (inflight upgrade)
+        if (!warmup) {
+          champsim::page_number ppage{handle_pkt.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+          uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+          if (alloc_id > 0) {
+            auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+            ++obj_stats.pf_useful;
+          }
+        }
       }
     }
 
     // COLLECT STATS
     sim_stats.mshr_merge.increment(std::pair{to_allocate.type, to_allocate.cpu});
+
+    // Per-object mshr_merge stats
+    if (!warmup) {
+      champsim::page_number ppage{handle_pkt.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+      uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+      if (alloc_id > 0) {
+        auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+        ++obj_stats.mshr_merge;
+      }
+    }
 
     *mshr_entry = mshr_type::merge(*mshr_entry, to_allocate);
   } else {
@@ -382,6 +473,19 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
 
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
+  // Per-object miss stats
+  if (!warmup) {
+    champsim::page_number ppage{handle_pkt.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+    uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+    if (alloc_id > 0) {
+      auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+      auto type_idx = champsim::to_underlying(handle_pkt.type);
+      if (type_idx < 5) {
+        ++obj_stats.misses[type_idx];
+      }
+    }
+  }
+
   return true;
 }
 
@@ -398,6 +502,19 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
   inflight_writes.push_back(to_allocate);
 
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
+
+  // Per-object miss stats (write)
+  if (!warmup) {
+    champsim::page_number ppage{handle_pkt.address.to<uint64_t>() >> LOG2_PAGE_SIZE};
+    uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+    if (alloc_id > 0) {
+      auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+      auto type_idx = champsim::to_underlying(handle_pkt.type);
+      if (type_idx < 5) {
+        ++obj_stats.misses[type_idx];
+      }
+    }
+  }
 
   return true;
 }
@@ -591,6 +708,16 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
 {
   ++sim_stats.pf_requested;
 
+  // Per-object prefetch requested stats
+  if (!warmup) {
+    champsim::page_number ppage{pf_addr.to<uint64_t>() >> LOG2_PAGE_SIZE};
+    uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+    if (alloc_id > 0) {
+      auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+      ++obj_stats.pf_requested;
+    }
+  }
+
   if (std::size(internal_PQ) >= PQ_SIZE) {
     return false;
   }
@@ -605,6 +732,16 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
 
   internal_PQ.emplace_back(pf_packet, true, !fill_this_level);
   ++sim_stats.pf_issued;
+
+  // Per-object prefetch issued stats
+  if (!warmup) {
+    champsim::page_number ppage{pf_addr.to<uint64_t>() >> LOG2_PAGE_SIZE};
+    uint64_t alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
+    if (alloc_id > 0) {
+      auto& obj_stats = mol_table.get_cache_stats(alloc_id, NAME);
+      ++obj_stats.pf_issued;
+    }
+  }
 
   return true;
 }

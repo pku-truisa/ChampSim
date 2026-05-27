@@ -28,6 +28,7 @@
 #include "chrono.h"
 
 class MEMORY_CONTROLLER;
+class MemoryObjectTable;
 
 using pte_entry = champsim::data::size<long long, std::ratio<8>>;
 
@@ -75,6 +76,10 @@ public:
   VirtualMemory(champsim::data::bytes page_table_page_size, std::size_t page_table_levels, champsim::chrono::clock::duration minor_penalty,
                 MEMORY_CONTROLLER& dram_, std::optional<uint64_t> randomization_seed_);
 
+  // Set the memory object table reference for reverse page table registration
+  void set_mol_table(MemoryObjectTable& mol) { mol_table = &mol; }
+
+  MemoryObjectTable* mol_table = nullptr;
   /**
    * Find the bit location of the lowest bit for the given page table level.
    */

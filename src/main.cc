@@ -30,8 +30,10 @@
 #include "defaults.hpp"
 #include "dpc_api.h"
 #include "environment.h"
+#include "memory_object_table.h"
 #include "ooo_cpu.h" // for O3_CPU
 #include "phase_info.h"
+#include "ptw.h"
 #include "stats_printer.h"
 #include "tracereader.h"
 #include "vmem.h"
@@ -148,6 +150,13 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
     fmt::print("Core {}: {}\n", index, trace_names[index]);
   }
 
+  // Wire up the memory object table to all VirtualMemory instances via PTW
+  for (PageTableWalker& ptw : gen_environment.ptw_view()) {
+    if (ptw.vmem != nullptr) {
+      ptw.vmem->set_mol_table(mol_table);
+    }
+  }
+
   auto phase_stats = champsim::main(gen_environment, phases, traces);
 
   fmt::print("\nChampSim completed all CPUs\n\n");
@@ -170,6 +179,9 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
       champsim::json_printer{json_file}.print(phase_stats);
     }
   }
+
+  // Output per-object memory statistics
+  print_memory_object_stats("memory_object_stats.txt");
 
   return 0;
 }

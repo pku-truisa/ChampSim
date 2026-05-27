@@ -21,6 +21,7 @@
 
 #include "champsim.h"
 #include "dram_controller.h"
+#include "memory_object_table.h"
 #include "util/bits.h"
 
 using namespace champsim::data::data_literals;
@@ -114,6 +115,11 @@ std::pair<champsim::page_number, champsim::chrono::clock::duration> VirtualMemor
   }
 
   auto penalty = fault ? minor_fault_penalty : champsim::chrono::clock::duration::zero();
+
+  // Register the PA→VA mapping in the memory object table
+  if (mol_table != nullptr) {
+    mol_table->register_mapping(champsim::page_number{vaddr}, ppage->second);
+  }
 
   if constexpr (champsim::debug_print) {
     fmt::print("[VMEM] {} paddr: {} vpage: {} fault: {}\n", __func__, ppage->second, champsim::page_number{vaddr}, fault);

@@ -25,6 +25,7 @@
 #include <type_traits>
 
 #include "instruction.h"
+#include "memory_object_table.h"
 #include "util/detect.h"
 
 namespace champsim
@@ -126,7 +127,38 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
     // Inflate trace format into core model instructions
     auto begin = std::begin(trace_read_buf);
     auto end = std::next(begin, bytes_read / sizeof(T));
-    std::transform(begin, end, std::back_inserter(instr_buffer), [cpu = this->cpu](T t) { return ooo_model_instr{cpu, t}; });
+    std::transform(begin, end, std::back_inserter(instr_buffer), [cpu = this->cpu](T t) {
+      // Process memory allocation/deallocation events before creating ooo_model_instr
+      if (t.is_malloc > 0) {
+        uint8_t alloc_type = t.is_malloc;
+        switch (alloc_type) {
+          case 1: // malloc
+          case 3: // mmap
+          case 5: // calloc
+          case 7: // aligned_alloc
+          case 8: // posix_memalign
+          case 9: // memalign
+            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
+            break;
+          case 6: // realloc
+            // Free the old allocation first, then record the new one
+            if (t.source_memory[1] != 0) {
+              mol_table.record_free(champsim::address{t.source_memory[1]});
+            }
+            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
+            break;
+          case 2: // free
+            mol_table.record_free(champsim::address{t.source_memory[0]});
+            break;
+          case 4: // munmap
+            mol_table.record_free(champsim::address{t.source_memory[0]});
+            break;
+          default:
+            break;
+        }
+      }
+      return ooo_model_instr{cpu, t};
+    });
 
     // Set branch targets
     set_branch_targets(std::begin(instr_buffer), std::end(instr_buffer));
