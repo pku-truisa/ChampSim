@@ -141,6 +141,7 @@ def process_malloc_file(input_file, threshold):
 
     tracker_original = MemoryTracker()
     threshold_trackers = {t: MemoryTracker() for t in thresholds_list}
+    threshold_modified_counts = {t: 0 for t in thresholds_list}
     tracker_single = threshold_trackers[threshold] if threshold in threshold_trackers else MemoryTracker()
     # Remove threshold from thresholds_list to avoid double-counting (tracker_single handles it)
     if threshold in threshold_trackers:
@@ -180,7 +181,13 @@ def process_malloc_file(input_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_single.add_object(address, single_size)
                 for t in thresholds_list:
-                    threshold_trackers[t].add_object(address, next_power_of_2(original_size) if original_size < t else original_size)
+                    if original_size < t:
+                        new_sz = next_power_of_2(original_size)
+                        threshold_trackers[t].add_object(address, new_sz)
+                        if new_sz != original_size:
+                            threshold_modified_counts[t] += 1
+                    else:
+                        threshold_trackers[t].add_object(address, original_size)
                 if single_size >= threshold:
                     large_objects_info[address] = {
                         'func': func_name, 'alloc_ip': alloc_ip, 'alloc_instr': instr_cnt,
@@ -208,7 +215,13 @@ def process_malloc_file(input_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_single.add_object(address, single_size)
                 for t in thresholds_list:
-                    threshold_trackers[t].add_object(address, next_power_of_2(original_size) if original_size < t else original_size)
+                    if original_size < t:
+                        new_sz = next_power_of_2(original_size)
+                        threshold_trackers[t].add_object(address, new_sz)
+                        if new_sz != original_size:
+                            threshold_modified_counts[t] += 1
+                    else:
+                        threshold_trackers[t].add_object(address, original_size)
                 if single_size >= threshold:
                     large_objects_info[address] = {
                         'func': func_name, 'alloc_ip': alloc_ip, 'alloc_instr': instr_cnt,
@@ -238,7 +251,13 @@ def process_malloc_file(input_file, threshold):
                     tracker_original.update_object(address_old, address_new, original_size)
                     tracker_single.update_object(address_old, address_new, single_size)
                     for t in thresholds_list:
-                        threshold_trackers[t].update_object(address_old, address_new, next_power_of_2(original_size) if original_size < t else original_size)
+                        if original_size < t:
+                            new_sz = next_power_of_2(original_size)
+                            threshold_trackers[t].update_object(address_old, address_new, new_sz)
+                            if new_sz != original_size:
+                                threshold_modified_counts[t] += 1
+                        else:
+                            threshold_trackers[t].update_object(address_old, address_new, original_size)
                     old_info = large_objects_info.pop(address_old, {})
                     if single_size >= threshold:
                         large_objects_info[address_new] = {
@@ -268,7 +287,13 @@ def process_malloc_file(input_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_single.add_object(address, single_size)
                 for t in thresholds_list:
-                    threshold_trackers[t].add_object(address, next_power_of_2(original_size) if original_size < t else original_size)
+                    if original_size < t:
+                        new_sz = next_power_of_2(original_size)
+                        threshold_trackers[t].add_object(address, new_sz)
+                        if new_sz != original_size:
+                            threshold_modified_counts[t] += 1
+                    else:
+                        threshold_trackers[t].add_object(address, original_size)
                 if single_size >= threshold:
                     large_objects_info[address] = {
                         'func': func_name, 'alloc_ip': alloc_ip, 'alloc_instr': instr_cnt,
@@ -296,7 +321,13 @@ def process_malloc_file(input_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_single.add_object(address, single_size)
                 for t in thresholds_list:
-                    threshold_trackers[t].add_object(address, next_power_of_2(original_size) if original_size < t else original_size)
+                    if original_size < t:
+                        new_sz = next_power_of_2(original_size)
+                        threshold_trackers[t].add_object(address, new_sz)
+                        if new_sz != original_size:
+                            threshold_modified_counts[t] += 1
+                    else:
+                        threshold_trackers[t].add_object(address, original_size)
                 if single_size >= threshold:
                     large_objects_info[address] = {
                         'func': func_name, 'alloc_ip': alloc_ip, 'alloc_instr': instr_cnt,
@@ -324,7 +355,13 @@ def process_malloc_file(input_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_single.add_object(address, single_size)
                 for t in thresholds_list:
-                    threshold_trackers[t].add_object(address, next_power_of_2(original_size) if original_size < t else original_size)
+                    if original_size < t:
+                        new_sz = next_power_of_2(original_size)
+                        threshold_trackers[t].add_object(address, new_sz)
+                        if new_sz != original_size:
+                            threshold_modified_counts[t] += 1
+                    else:
+                        threshold_trackers[t].add_object(address, original_size)
                 continue
 
             # ---- app_mmap ----
@@ -347,7 +384,13 @@ def process_malloc_file(input_file, threshold):
                 tracker_original.add_object(address, original_size)
                 tracker_single.add_object(address, single_size)
                 for t in thresholds_list:
-                    threshold_trackers[t].add_object(address, next_power_of_2(original_size) if original_size < t else original_size)
+                    if original_size < t:
+                        new_sz = next_power_of_2(original_size)
+                        threshold_trackers[t].add_object(address, new_sz)
+                        if new_sz != original_size:
+                            threshold_modified_counts[t] += 1
+                    else:
+                        threshold_trackers[t].add_object(address, original_size)
                 if single_size >= threshold:
                     large_objects_info[address] = {
                         'func': func_name, 'alloc_ip': alloc_ip, 'alloc_instr': instr_cnt,
@@ -418,16 +461,19 @@ def process_malloc_file(input_file, threshold):
 
     # ---- Multi-threshold peak ----
     print(f"\n=== Multi-Threshold Peak Memory Comparison ===")
-    print(f"Original peak: {format_size(original_peak)} ({original_peak:,} bytes)\n")
-    hdr = f"{'Threshold':>10}  {'Modified Peak':>15}  {'Increase':>15}  {'Increase %':>11}"
-    sep = f"{'-'*10}  {'-'*15}  {'-'*15}  {'-'*11}"
+    print(f"Original peak: {format_size(original_peak)} ({original_peak:,} bytes)")
+    print(f"Total alloc calls: {total_count:,}\n")
+    hdr = f"{'Threshold':>10}  {'Modified Peak':>15}  {'Increase':>15}  {'Increase %':>11}  {'Mod Objects':>13}  {'Mod %':>8}"
+    sep = f"{'-'*10}  {'-'*15}  {'-'*15}  {'-'*11}  {'-'*13}  {'-'*8}"
     print(hdr)
     print(sep)
     for t in thresholds_list:
         mod_peak = threshold_trackers[t].max_memory
         increase = mod_peak - original_peak
         pct = (increase / original_peak * 100) if original_peak > 0 else 0
-        print(f"{t:>10,}  {format_size(mod_peak):>15}  {format_size(increase):>15}  {pct:>10.2f}%")
+        mod_cnt = threshold_modified_counts[t]
+        mod_pct = (mod_cnt / total_count * 100) if total_count > 0 else 0
+        print(f"{t:>10,}  {format_size(mod_peak):>15}  {format_size(increase):>15}  {pct:>10.2f}%  {mod_cnt:>13,}  {mod_pct:>7.2f}%")
     print(sep)
     single_peak = tracker_single.max_memory
     single_increase = single_peak - original_peak
