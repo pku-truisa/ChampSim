@@ -333,34 +333,18 @@ VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
   // NOTE: in_allocator_hook is cleared in MallocAfter
 }
 
-VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
-{
-  if (trace_limit_reached) return;
-  if (in_allocator_hook) return;
-  in_allocator_hook = true;
-
-  pending_alloc_size = size;
-  pending_alloc_type = 9; // 9: memalign
-  pending_alloc_ip = ip;
-
-  if (size < KnobMallocSizeThreshold.Value()) {
-    accumulate_little(9, size);
-  }
-  // NOTE: in_allocator_hook is cleared in MallocAfter
-}
-
 VOID MallocAfter(ADDRINT ret)
 {
   if (pending_alloc_type == 0) return;
 
   // Handle different allocation types that use MallocAfter as the After callback
   bool is_valid_type = (pending_alloc_type == 1 || pending_alloc_type == 5 || 
-                        pending_alloc_type == 6 || pending_alloc_type == 7 ||
-                        pending_alloc_type == 9);
+                        pending_alloc_type == 6 || pending_alloc_type == 7);
   
   if (!is_valid_type) {
     pending_alloc_size = 0;
     pending_alloc_type = 0;
+    in_allocator_hook = false;
     return;
   }
 
@@ -431,7 +415,10 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
 
 VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
 {
-  if (pending_alloc_type != 8) return;
+  if (pending_alloc_type != 8) {
+    in_allocator_hook = false;
+    return;
+  }
 
   // For posix_memalign, the return value is the error code (0 on success)
   // The actual pointer is stored in *memptr
@@ -595,14 +582,8 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
-  // Hook memalign for all images (traditional function)
-  rtn = RTN_FindByName(img, "memalign");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
+  // Note: memalign() in current glibc is implemented as a wrapper around aligned_alloc(),
+  // so we intentionally do NOT hook it. All memalign calls will be captured as aligned_alloc.
 
   // Hook posix_memalign for all images (POSIX standard)
   rtn = RTN_FindByName(img, "posix_memalign");
@@ -682,7 +663,7 @@ VOID Fini(INT32 code, VOID* v) {
     // Type=0 records: per-type small alloc stats
     // ip=alloc_type, arg1=count, arg2=raw_total, ret=aligned_total
     if (!little_stats.empty()) {
-      int type_order[] = {1, 3, 5, 6, 7, 8, 9};
+      int type_order[] = {1, 3, 5, 6, 7, 8};
       for (int t : type_order) {
         auto it = little_stats.find(t);
         if (it != little_stats.end()) {
