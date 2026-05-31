@@ -25,6 +25,7 @@
 #include <string.h>
 #include <string>
 #include <unordered_set>
+#include <map>
 
 #include "../../inc/trace_instruction.h"
 #include "pin.H"
@@ -46,16 +47,39 @@ INT64 trace_insts_left = 0;
 INT64 fast_forward_insts_left = 0;
 bool skip_dumping_instructions = false;
 
-std::ofstream malloc_outfile;
-trace_instr_format_t event_instr;
+// Binary malloc trace output
+std::ofstream malloc_binfile;
 std::unordered_set<ADDRINT> tracked_addresses;
 ADDRINT pending_alloc_size = 0;
 ADDRINT pending_alloc_memptr = 0; // for posix_memalign
+ADDRINT pending_realloc_old_ptr = 0; // for realloc old pointer
 int pending_alloc_type = 0; // 0: none, 1: malloc, 3: mmap, 5: calloc, 6: realloc, 7: aligned_alloc, 8: posix_memalign, 9: memalign
 bool trace_limit_reached = false;
+ADDRINT pending_alloc_ip = 0; // caller IP stored for After callbacks
 
 // Malloc hook to prevent malloc/free reentrancy
 bool in_allocator_hook = false;
+
+// Small allocation accumulator (size < k, not written to binary stream)
+struct LittleAllocAccum {
+  uint64_t count = 0;
+  uint64_t raw_total = 0;    // sum of original sizes
+  uint64_t aligned_total = 0; // sum of next_power_of_2(sizes)
+};
+std::map<int, LittleAllocAccum> little_stats; // key = alloc_type
+
+static uint64_t next_power_of_2_64(uint64_t n) {
+  if (n == 0) return 0;
+  n--;
+  n |= n >> 1;
+  n |= n >> 2;
+  n |= n >> 4;
+  n |= n >> 8;
+  n |= n >> 16;
+  n |= n >> 32;
+  n++;
+  return n;
+}
 
 // Prototype
 VOID insert_analysis_functions(INS ins);
@@ -69,9 +93,9 @@ KNOB<UINT64> KnobFastForward(KNOB_MODE_WRITEONCE, "pintool", "s", "0", "How many
 
 KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "0", "How many instructions to trace (0 for unlimited)");
 
-KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "malloc.trace", "specify file name for malloc tracer output");
+KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "malloc.bin", "specify file name for binary malloc trace output");
 
-KNOB<UINT64> KnobMallocSizeThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "0", "Minimum allocation size to trace (bytes, 0 to trace all)");
+KNOB<UINT64> KnobMallocSizeThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "64", "Minimum allocation size to trace to binary (bytes, objects smaller than this go to little_malloc.log)");
 
 KNOB<BOOL> KnobAllocOnly(KNOB_MODE_WRITEONCE, "pintool", "a", "0", "Only generate memory allocation trace, skip instruction trace");
 
@@ -88,8 +112,8 @@ INT32 Usage()
             << "Specify the output trace file with -o" << std::endl
             << "Specify the number of instructions to skip before tracing with -s" << std::endl
             << "Specify the number of instructions to trace with -t (0 for unlimited)" << std::endl
-            << "Specify the malloc text output file with -m" << std::endl
-            << "Specify minimum allocation size to trace with -k (0 to trace all)" << std::endl
+            << "Specify the binary malloc trace output file with -m (default: malloc.bin)" << std::endl
+            << "Specify minimum allocation size to trace with -k (default: 64)" << std::endl
             << "Use -a to only generate memory allocation trace (skip instruction trace)" << std::endl
             << std::endl;
 
@@ -132,12 +156,6 @@ void check_end_of_trace()
   // If trace_insts_left == 0 initially, it means unlimited tracing - don't decrement or exit
 }
 
-// Simple instruction counter for allocation-only mode
-void increment_instr_count()
-{
-  instrCount++;
-}
-
 template <typename Func>
 void for_ins_in_trace(const TRACE& trace, Func f)
 {
@@ -150,13 +168,9 @@ void for_ins_in_trace(const TRACE& trace, Func f)
 
 void insert_instrumentation(TRACE trace, void* v)
 {
-  // In allocation-only mode, skip all instruction-level instrumentation
-  // Only keep the counter for malloc trace's instrCount
+  // In allocation-only mode, skip all instruction-level instrumentation.
+  // Malloc hooks (ImageLoad) work independently via PIN's RTN instrumentation.
   if (KnobAllocOnly.Value()) {
-    // Just increment instruction counter without detailed analysis
-    for_ins_in_trace(trace, [](const INS& ins) {
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)increment_instr_count, IARG_END);
-    });
     return;
   }
   
@@ -169,6 +183,51 @@ void insert_instrumentation(TRACE trace, void* v)
       insert_analysis_functions(ins);
     });
   }
+}
+
+/* ===================================================================== */
+// Binary malloc trace writing
+/* ===================================================================== */
+
+const char* alloc_type_name(int t) {
+  switch (t) {
+    case 1: return "malloc";
+    case 2: return "free";
+    case 3: return "app_mmap";
+    case 4: return "app_munmap";
+    case 5: return "calloc";
+    case 6: return "realloc";
+    case 7: return "aligned_alloc";
+    case 8: return "posix_memalign";
+    case 9: return "memalign";
+    default: return "unknown";
+  }
+}
+
+void write_malloc_instr(unsigned long long ip, unsigned char type,
+                         unsigned long long arg1, unsigned long long arg2,
+                         unsigned long long ret)
+{
+  if (!trace_limit_reached && malloc_binfile.is_open()) {
+    malloc_instr rec;
+    rec.ip = ip;
+    rec.type = type;
+    rec.arg1 = arg1;
+    rec.arg2 = arg2;
+    rec.ret = ret;
+    for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
+    
+    typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
+    std::memcpy(buf, &rec, sizeof(malloc_instr));
+    malloc_binfile.write(buf, sizeof(malloc_instr));
+  }
+}
+
+void accumulate_little(int alloc_type, ADDRINT size) {
+  auto& acc = little_stats[alloc_type];
+  acc.count++;
+  acc.raw_total += size;
+  acc.aligned_total += next_power_of_2_64(size);
 }
 
 /* ===================================================================== */
@@ -207,15 +266,6 @@ void WriteToSet(T* begin, T* end, UINT32 r)
   *found_reg = r;
 }
 
-void WriteEventInstruction()
-{
-  if (!trace_limit_reached && outfile.is_open()) {
-    typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
-    std::memcpy(buf, &event_instr, sizeof(trace_instr_format_t));
-    outfile.write(buf, sizeof(trace_instr_format_t));
-  }
-}
-
 VOID MallocBefore(ADDRINT size, ADDRINT ip)
 {
   if (trace_limit_reached) return;
@@ -223,20 +273,15 @@ VOID MallocBefore(ADDRINT size, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
   pending_alloc_size = size;
   pending_alloc_type = 1; // 1: malloc
+  pending_alloc_ip = ip;
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 1;
-  event_instr.source_memory[0] = size;  // size argument
+  if (size < KnobMallocSizeThreshold.Value()) {
+    accumulate_little(1, size);
+  }
+
+  in_allocator_hook = false;
 }
 
 VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
@@ -246,20 +291,15 @@ VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
   in_allocator_hook = true;
 
   ADDRINT total_size = nmemb * size;
-  if (total_size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
   pending_alloc_size = total_size;
   pending_alloc_type = 5; // 5: calloc
+  pending_alloc_ip = ip;
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 5;
-  event_instr.source_memory[0] = total_size;  // total size (nmemb * size)
+  if (total_size < KnobMallocSizeThreshold.Value()) {
+    accumulate_little(5, total_size);
+  }
+
+  in_allocator_hook = false;
 }
 
 VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
@@ -268,21 +308,16 @@ VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
   pending_alloc_size = size;
   pending_alloc_type = 6; // 6: realloc
+  pending_alloc_ip = ip;
+  pending_realloc_old_ptr = ptr; // save old pointer for After callback
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 6;
-  event_instr.source_memory[0] = size;     // size argument (consistent with other alloc functions)
-  event_instr.source_memory[1] = ptr;      // old pointer address
+  if (size < KnobMallocSizeThreshold.Value()) {
+    accumulate_little(6, size);
+  }
+
+  in_allocator_hook = false;
 }
 
 VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
@@ -291,20 +326,15 @@ VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
   pending_alloc_size = size;
   pending_alloc_type = 7; // 7: aligned_alloc
+  pending_alloc_ip = ip;
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 7;
-  event_instr.source_memory[0] = size;  // size argument
+  if (size < KnobMallocSizeThreshold.Value()) {
+    accumulate_little(7, size);
+  }
+
+  in_allocator_hook = false;
 }
 
 VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
@@ -313,97 +343,57 @@ VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
   pending_alloc_size = size;
   pending_alloc_type = 9; // 9: memalign
+  pending_alloc_ip = ip;
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 9;
-  event_instr.source_memory[0] = size;  // size argument
+  if (size < KnobMallocSizeThreshold.Value()) {
+    accumulate_little(9, size);
+  }
+
+  in_allocator_hook = false;
 }
 
 VOID MallocAfter(ADDRINT ret)
 {
-  if (!in_allocator_hook) return;
-  
+  if (pending_alloc_type == 0) return;
+
   // Handle different allocation types that use MallocAfter as the After callback
   bool is_valid_type = (pending_alloc_type == 1 || pending_alloc_type == 5 || 
                         pending_alloc_type == 6 || pending_alloc_type == 7 ||
                         pending_alloc_type == 9);
   
   if (!is_valid_type) {
-    in_allocator_hook = false;
+    pending_alloc_size = 0;
+    pending_alloc_type = 0;
     return;
   }
 
-  const char* alloc_type_str = "";
-  switch (pending_alloc_type) {
-    case 1: alloc_type_str = "malloc"; break;
-    case 5: alloc_type_str = "calloc"; break;
-    case 6: alloc_type_str = "realloc"; break;
-    case 7: alloc_type_str = "aligned_alloc"; break;
-    case 9: alloc_type_str = "memalign"; break;
-  }
-  
-  if (malloc_outfile.is_open()) {
-    ADDRINT ip = event_instr.ip;
+  // Write big allocations (>= threshold) to binary trace
+  if (!trace_limit_reached && pending_alloc_size >= KnobMallocSizeThreshold.Value()) {
     if (pending_alloc_type == 6) {
-      // For realloc, show both old and new pointers
-      ADDRINT size = event_instr.source_memory[0];     // size argument
-      ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer address
+      // realloc: arg1=old_ptr, arg2=new_size, ret=new_ptr (or 0 on failure)
+      write_malloc_instr(pending_alloc_ip, 6, pending_realloc_old_ptr, pending_alloc_size, ret);
       if (ret != 0) {
-        malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << ip << std::dec << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=0x" << std::hex << ret << std::dec;
-        if (old_ptr == 0) {
-          // realloc(NULL, size) behaves like malloc
-          malloc_outfile << " [new]";
-        } else if (old_ptr == ret) {
-          malloc_outfile << " [in-place]";
-        } else {
-          malloc_outfile << " [moved]";
-        }
-      } else {
-        // realloc failed, old pointer is still valid
-        malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << ip << std::dec << " " << alloc_type_str << "(0x" << std::hex << old_ptr << ", " << std::dec << size << ")=NULL [failed]";
-      }
-      malloc_outfile << std::dec << std::endl;
-    } else {
-      // For other allocation functions
-      if (ret != 0) {
-        malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << ip << std::dec << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
-      } else {
-        malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << ip << std::dec << " " << alloc_type_str << "(" << std::dec << pending_alloc_size << ")=NULL [failed]" << std::endl;
-      }
-    }
-  }
-
-  // Only track successful allocations for instruction trace
-  if (!trace_limit_reached && ret != 0) {
-    event_instr.destination_memory[0] = ret;
-    WriteEventInstruction();
-    tracked_addresses.insert(ret);
-    
-    // For realloc with different pointers, remove old pointer from tracking
-    if (pending_alloc_type == 6) {
-      ADDRINT old_ptr = event_instr.source_memory[1];  // old pointer is now in source_memory[1]
-      if (old_ptr != 0 && old_ptr != ret) {
-        auto it = tracked_addresses.find(old_ptr);
-        if (it != tracked_addresses.end()) {
-          tracked_addresses.erase(it);
+        tracked_addresses.insert(ret);
+        // Remove old pointer from tracking if different
+        if (pending_realloc_old_ptr != 0 && pending_realloc_old_ptr != ret) {
+          auto it = tracked_addresses.find(pending_realloc_old_ptr);
+          if (it != tracked_addresses.end()) {
+            tracked_addresses.erase(it);
+          }
         }
       }
+    } else if (ret != 0) {
+      // Non-realloc: arg1=size, ret=allocated address
+      write_malloc_instr(pending_alloc_ip, (unsigned char)pending_alloc_type, pending_alloc_size, 0, ret);
+      tracked_addresses.insert(ret);
     }
   }
 
   pending_alloc_size = 0;
   pending_alloc_type = 0;
-  in_allocator_hook = false;
+  pending_realloc_old_ptr = 0;
 }
 
 VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
@@ -419,20 +409,9 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
     return;
   }
 
-  if (malloc_outfile.is_open()) {
-    malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << ip << std::dec << " free(0x" << std::hex << ptr << ")" << std::dec << std::endl;
-  }
-
-  // Only write to instruction trace if not reached limit
-  if (!trace_limit_reached) {
-    event_instr = {};
-    event_instr.ip = (unsigned long long int)ip;
-    event_instr.is_malloc = 2; // 2: free
-    event_instr.source_memory[0] = ptr;
-    WriteEventInstruction();
-
-    tracked_addresses.erase(it);
-  }
+  // Write to binary trace
+  write_malloc_instr((unsigned long long)ip, 2, (unsigned long long)ptr, 0, 0);
+  tracked_addresses.erase(it);
 
   in_allocator_hook = false;
 }
@@ -443,26 +422,21 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
-  if (size < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
   pending_alloc_size = size;
   pending_alloc_type = 8; // 8: posix_memalign
   pending_alloc_memptr = memptr; // save for After callback
+  pending_alloc_ip = ip;
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 8;
-  event_instr.source_memory[0] = size;  // size argument
+  if (size < KnobMallocSizeThreshold.Value()) {
+    accumulate_little(8, size);
+  }
+
+  in_allocator_hook = false;
 }
 
 VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
 {
-  if (!in_allocator_hook || pending_alloc_type != 8) return;
+  if (pending_alloc_type != 8) return;
 
   // For posix_memalign, the return value is the error code (0 on success)
   // The actual pointer is stored in *memptr
@@ -471,23 +445,15 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
     ADDRINT allocated_addr = 0;
     PIN_SafeCopy(&allocated_addr, (VOID*)pending_alloc_memptr, sizeof(ADDRINT));
 
-    if (allocated_addr != 0) {
-      if (malloc_outfile.is_open()) {
-        malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << event_instr.ip << std::dec << " posix_memalign(" << std::dec << pending_alloc_size << ")=0x" << std::hex << allocated_addr << std::dec << std::endl;
-      }
-
-      if (!trace_limit_reached) {
-        event_instr.destination_memory[0] = allocated_addr;
-        WriteEventInstruction();
-        tracked_addresses.insert(allocated_addr);
-      }
+    if (allocated_addr != 0 && pending_alloc_size >= KnobMallocSizeThreshold.Value()) {
+      write_malloc_instr(pending_alloc_ip, 8, pending_alloc_size, 0, allocated_addr);
+      tracked_addresses.insert(allocated_addr);
     }
   }
 
   pending_alloc_size = 0;
   pending_alloc_type = 0;
   pending_alloc_memptr = 0;
-  in_allocator_hook = false;
 }
 
 VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
@@ -496,44 +462,28 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
-  if (length < KnobMallocSizeThreshold.Value()) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    in_allocator_hook = false;
-    return;
-  }
-
   pending_alloc_size = length;
   pending_alloc_type = 3; // 3: mmap
+  pending_alloc_ip = ip;
 
-  event_instr = {};
-  event_instr.ip = (unsigned long long int)ip;
-  event_instr.is_malloc = 3;
-  event_instr.source_memory[0] = length;  // size argument (length for mmap)
+  if (length < KnobMallocSizeThreshold.Value()) {
+    accumulate_little(3, length);
+  }
+
+  in_allocator_hook = false;
 }
 
 VOID MmapAfter(ADDRINT ret)
 {
-  if (!in_allocator_hook || pending_alloc_type != 3) return;
+  if (pending_alloc_type != 3) return;
 
-  if (ret != 0 && ret != (ADDRINT)-1) {
-    if (malloc_outfile.is_open()) {
-      malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << event_instr.ip << std::dec << " app_mmap(" << std::dec << pending_alloc_size << ")=0x" << std::hex << ret << std::dec << std::endl;
-    }
-
-    // Only write to instruction trace if not reached limit
-    if (!trace_limit_reached) {
-      event_instr.destination_memory[0] = ret;
-//    event_instr.destination_memory[1] = ret + pending_alloc_size;
-
-      WriteEventInstruction();
-      tracked_addresses.insert(ret);
-    }
+  if (ret != 0 && ret != (ADDRINT)-1 && pending_alloc_size >= KnobMallocSizeThreshold.Value()) {
+    write_malloc_instr(pending_alloc_ip, 3, pending_alloc_size, 0, ret);
+    tracked_addresses.insert(ret);
   }
 
   pending_alloc_size = 0;
   pending_alloc_type = 0;
-  in_allocator_hook = false;
 }
 
 VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
@@ -549,22 +499,9 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
     return;
   }
 
-  if (malloc_outfile.is_open()) {
-    malloc_outfile << "instrCount:" << std::dec << instrCount << " ip:0x" << std::hex << ip << std::dec << " app_munmap(0x" << std::hex << addr << ", " << std::dec << length << ")" << std::dec << std::endl;
-  }
+  write_malloc_instr((unsigned long long)ip, 4, (unsigned long long)addr, (unsigned long long)length, 0);
+  tracked_addresses.erase(it);
 
-  // Only write to instruction trace if not reached limit
-  if (!trace_limit_reached) {
-    event_instr = {};
-    event_instr.ip = (unsigned long long int)ip;
-    event_instr.is_malloc = 4; // 4: munmap
-    event_instr.source_memory[0] = addr;
-    event_instr.source_memory[1] = length;
-    WriteEventInstruction();
-
-    tracked_addresses.erase(it);
-  }
-  
   in_allocator_hook = false;
 }
 
@@ -722,7 +659,55 @@ VOID Fini(INT32 code, VOID* v) {
   if (outfile.is_open()) {
     outfile.close();
   }
-  malloc_outfile.close();
+
+  // Write little_malloc.log
+  if (!little_stats.empty()) {
+    std::ofstream little_file("little_malloc.log");
+    if (little_file.is_open()) {
+      // Compute totals
+      uint64_t total_count = 0, total_raw = 0, total_aligned = 0;
+      for (const auto& kv : little_stats) {
+        total_count += kv.second.count;
+        total_raw += kv.second.raw_total;
+        total_aligned += kv.second.aligned_total;
+      }
+
+      little_file << "# Small allocation statistics (size < " << KnobMallocSizeThreshold.Value() << " bytes)\n";
+      little_file << "#\n";
+      little_file << "# Function        Count      Raw Total    Aligned Total  Increase    Increase %\n";
+      little_file << "# ---------------------------------------------------------------------------\n";
+
+      // Order by type for consistent output
+      int type_order[] = {1, 3, 5, 6, 7, 8, 9};
+      for (int t : type_order) {
+        auto it = little_stats.find(t);
+        if (it != little_stats.end()) {
+          uint64_t inc = it->second.aligned_total - it->second.raw_total;
+          double inc_pct = it->second.raw_total > 0 ? (100.0 * inc / it->second.raw_total) : 0.0;
+          char pct_buf[32];
+          snprintf(pct_buf, sizeof(pct_buf), "%.2f", inc_pct);
+          little_file << alloc_type_name(t) << " "
+                      << it->second.count << " "
+                      << it->second.raw_total << " "
+                      << it->second.aligned_total << " "
+                      << inc << " "
+                      << pct_buf << "%\n";
+        }
+      }
+
+      uint64_t total_inc = total_aligned - total_raw;
+      double total_inc_pct = total_raw > 0 ? (100.0 * total_inc / total_raw) : 0.0;
+      char total_pct_buf[32];
+      snprintf(total_pct_buf, sizeof(total_pct_buf), "%.2f", total_inc_pct);
+
+      little_file << "# ---------------------------------------------------------------------------\n";
+      little_file << "TOTAL " << total_count << " " << total_raw << " " << total_aligned << " "
+                  << total_inc << " " << total_pct_buf << "%\n";
+      little_file.close();
+    }
+  }
+
+  malloc_binfile.close();
 }
 
 /*!
@@ -752,9 +737,10 @@ int main(int argc, char* argv[])
     }
   }
 
-  malloc_outfile.open(KnobMallocOutputFile.Value().c_str(), std::ios_base::out);
-  if (!malloc_outfile) {
-    std::cout << "Couldn't open malloc trace file. Exiting." << std::endl;
+  // Open binary malloc trace output
+  malloc_binfile.open(KnobMallocOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
+  if (!malloc_binfile) {
+    std::cout << "Couldn't open binary malloc trace file. Exiting." << std::endl;
     exit(1);
   }
 

@@ -87,9 +87,24 @@ struct cloudsuite_instr {
   unsigned long long source_memory[NUM_INSTR_SOURCES];                 // input memory
 
   unsigned char asid[2];
-  
+
   unsigned char is_malloc; // Memory allocation event type identifier:
 };
+
+// compact binary malloc trace record (40 bytes)
+// type: 1=malloc, 2=free, 3=mmap, 4=munmap, 5=calloc, 6=realloc,
+//        7=aligned_alloc, 8=posix_memalign, 9=memalign
+struct malloc_instr {
+  unsigned long long ip;       // caller's return address
+  unsigned long long arg1;     // parameter 1 (alloc=size, free/munmap=ptr, realloc=old_ptr)
+  unsigned long long arg2;     // parameter 2 (realloc=size, munmap=length; 0 otherwise)
+  unsigned long long ret;      // return value (allocated address, 0=failure)
+  unsigned char type;          // allocation event type
+  unsigned char reserved[7];   // alignment padding (total = 40 bytes)
+};
+
+// Binary layout: ip(8) + arg1(8) + arg2(8) + ret(8) + type(1) + reserved(7) = 40 bytes
+static_assert(sizeof(malloc_instr) == 40, "malloc_instr must be exactly 40 bytes");
 // NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 
 #endif
