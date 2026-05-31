@@ -458,6 +458,12 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
   if (in_allocator_hook) return;
   in_allocator_hook = true;
 
+  // Only track anonymous mappings (MAP_ANONYMOUS)
+  if (!(flags & MAP_ANONYMOUS)) {
+    in_allocator_hook = false;
+    return;
+  }
+
   pending_alloc_size = length;
   pending_alloc_type = 3; // 3: mmap
   pending_alloc_ip = ip;
@@ -656,50 +662,43 @@ VOID Fini(INT32 code, VOID* v) {
     outfile.close();
   }
 
-  // Write little_malloc.log
-  if (!little_stats.empty()) {
-    std::ofstream little_file("little_malloc.log");
-    if (little_file.is_open()) {
-      // Compute totals
-      uint64_t total_count = 0, total_raw = 0, total_aligned = 0;
-      for (const auto& kv : little_stats) {
-        total_count += kv.second.count;
-        total_raw += kv.second.raw_total;
-        total_aligned += kv.second.aligned_total;
-      }
+  // Write header + little allocation stats as type=255/0 records embedded in malloc.bin
+  // Written directly to bypass write_malloc_instr's trace_limit_reached check
+  if (malloc_binfile.is_open()) {
+    // Header record: type=255, arg1=k_threshold
+    {
+      malloc_instr rec;
+      rec.ip = 0;
+      rec.type = 255;
+      rec.arg1 = KnobMallocSizeThreshold.Value();
+      rec.arg2 = 0;
+      rec.ret = 0;
+      for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
+      typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
+      std::memcpy(buf, &rec, sizeof(malloc_instr));
+      malloc_binfile.write(buf, sizeof(malloc_instr));
+    }
 
-      little_file << "# Small allocation statistics (size < " << KnobMallocSizeThreshold.Value() << " bytes)\n";
-      little_file << "#\n";
-      little_file << "# Function        Count      Raw Total    Aligned Total  Increase    Increase %\n";
-      little_file << "# ---------------------------------------------------------------------------\n";
-
-      // Order by type for consistent output
+    // Type=0 records: per-type small alloc stats
+    // ip=alloc_type, arg1=count, arg2=raw_total, ret=aligned_total
+    if (!little_stats.empty()) {
       int type_order[] = {1, 3, 5, 6, 7, 8, 9};
       for (int t : type_order) {
         auto it = little_stats.find(t);
         if (it != little_stats.end()) {
-          uint64_t inc = it->second.aligned_total - it->second.raw_total;
-          double inc_pct = it->second.raw_total > 0 ? (100.0 * inc / it->second.raw_total) : 0.0;
-          char pct_buf[32];
-          snprintf(pct_buf, sizeof(pct_buf), "%.2f", inc_pct);
-          little_file << alloc_type_name(t) << " "
-                      << it->second.count << " "
-                      << it->second.raw_total << " "
-                      << it->second.aligned_total << " "
-                      << inc << " "
-                      << pct_buf << "%\n";
+          malloc_instr rec;
+          rec.ip = t;                       // original alloc_type
+          rec.type = 0;                     // metadata marker
+          rec.arg1 = it->second.count;      // number of small allocs
+          rec.arg2 = it->second.raw_total;  // sum of original sizes
+          rec.ret = it->second.aligned_total; // sum of next_power_of_2(sizes)
+          for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
+
+          typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
+          std::memcpy(buf, &rec, sizeof(malloc_instr));
+          malloc_binfile.write(buf, sizeof(malloc_instr));
         }
       }
-
-      uint64_t total_inc = total_aligned - total_raw;
-      double total_inc_pct = total_raw > 0 ? (100.0 * total_inc / total_raw) : 0.0;
-      char total_pct_buf[32];
-      snprintf(total_pct_buf, sizeof(total_pct_buf), "%.2f", total_inc_pct);
-
-      little_file << "# ---------------------------------------------------------------------------\n";
-      little_file << "TOTAL " << total_count << " " << total_raw << " " << total_aligned << " "
-                  << total_inc << " " << total_pct_buf << "%\n";
-      little_file.close();
     }
   }
 

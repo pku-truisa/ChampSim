@@ -17,6 +17,7 @@ Usage:
 import struct
 import sys
 import os
+import lzma
 import argparse
 
 
@@ -173,9 +174,13 @@ def parse_little_malloc_log(log_path, k_threshold):
 
 
 def read_malloc_binary(infile_path):
-    """Generator that yields (seq_id, ip, type, arg1, arg2, ret) tuples from binary file."""
+    """Generator that yields (seq_id, ip, type, arg1, arg2, ret) tuples from binary file.
+       Type=0 records (embedded little-object stats) are returned as -type to signal
+       that they are metadata, not regular allocation events.
+       Supports .xz compressed files automatically."""
     seq_id = 0
-    with open(infile_path, 'rb') as f:
+    open_func = lzma.open if infile_path.endswith('.xz') else open
+    with open_func(infile_path, 'rb') as f:
         while True:
             chunk = f.read(MALLOC_INSTR_SIZE)
             if len(chunk) < MALLOC_INSTR_SIZE:
@@ -199,23 +204,15 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
     if base_name.endswith('.malloc'):
         base_name = base_name[:-7]
 
-    # Parse little_malloc.log
-    little_log_path = 'little_malloc.log'
-    # Also try alongside the input file
-    alt_little_log = os.path.join(os.path.dirname(input_file) or '.', 'little_malloc.log')
-    if not os.path.exists(little_log_path) and os.path.exists(alt_little_log):
-        little_log_path = alt_little_log
-
-    little_func_stats, little_raw_total, little_aligned_total, little_count = \
-        parse_little_malloc_log(little_log_path, k_threshold)
-
     func_stats = {
         'malloc': 0, 'calloc': 0, 'realloc': 0, 'aligned_alloc': 0,
         'memalign': 0, 'posix_memalign': 0, 'app_mmap': 0, 'free': 0, 'app_munmap': 0
     }
-    # Merge little obj counts
-    for k, v in little_func_stats.items():
-        func_stats[k] += v
+
+    # Little-object stats read from embedded type=0 records
+    little_raw_total = 0
+    little_aligned_total = 0
+    little_count = 0
 
     total_big_count = 0
     ip_info = {}
@@ -227,9 +224,24 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
         ip_info[s]['count'] += 1
         ip_info[s]['total_size'] += size
 
-    # Thresholds for 2^n analysis (128, 256, 512, 1024)
+    # Thresholds for 2^n analysis — start from next_power_of_2(k) read from header
+    # Default if no header found
+    auto_k = k_threshold
+
+    # Stream binary file (first pass to find header, then process)
+    # We read once; the header (type=255) is at the end, so we need two passes
+    # Simpler: read all records into a list, detect header, then process
+    all_records = list(read_malloc_binary(input_file))
+
+    # Find type=255 header (last among metadata, first in tail section)
+    for seq_id, ip, etype, arg1, arg2, ret in all_records:
+        if etype == 255:
+            auto_k = int(arg1)
+            break
+
     thresholds_list = []
-    t = 128
+    t = next_power_of_2(int(auto_k))
+    t <<= 1  # skip k itself, start from next power of 2
     while t <= threshold:
         thresholds_list.append(t)
         t <<= 1
@@ -243,11 +255,25 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
 
     large_objects_info = {}
 
-    # Stream binary file
+    # Process all records
     print("-" * 50)
     print("Processing binary malloc trace...")
 
-    for seq_id, ip, etype, arg1, arg2, ret in read_malloc_binary(input_file):
+    for seq_id, ip, etype, arg1, arg2, ret in all_records:
+        # type=0 records are embedded little-object stats
+        # ip=original alloc_type, arg1=count, arg2=raw_total, ret=aligned_total
+        if etype == 0:
+            orig_type = int(ip)
+            count = arg1
+            raw = arg2
+            aligned = ret
+            if orig_type in TYPE_MAP:
+                func_stats[TYPE_MAP[orig_type]] += count
+            little_count += count
+            little_raw_total += raw
+            little_aligned_total += aligned
+            continue
+
         func_name = TYPE_MAP.get(etype, 'unknown')
         ip_str = hex(ip) if ip else "0x0"
 
@@ -374,10 +400,16 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
     print(f"{'Total Dealloc':<20} {dealloc_total:>10,} {(dealloc_total/total_count*100) if total_count > 0 else 0:>11.2f}%")
     print()
 
+    little_increase = little_aligned_total - little_raw_total
+
     # ---- Multi-threshold peak ----
     print(f"\n=== Multi-Threshold Peak Memory Comparison ===")
     print(f"Original peak (big objects + little raw): {format_size(original_peak)} ({original_peak:,} bytes)")
     print(f"  (big peak: {format_size(tracker_original.max_memory)}, little raw: {format_size(little_raw_total)})")
+    if little_count > 0:
+        little_inc_pct = (little_increase / little_raw_total * 100) if little_raw_total > 0 else 0.0
+        print(f"  Little objects (< {int(auto_k)}): {little_count} allocs, raw={format_size(little_raw_total)}, "
+              f"aligned={format_size(little_aligned_total)}, increase={format_size(little_increase)} ({little_inc_pct:.2f}%)")
     print(f"Total alloc calls: {total_count:,}\n")
 
     hdr = f"{'Threshold':>10}  {'Aligned Peak':>15}  {'Increase':>15}  {'Increase %':>11}  {'Mod Objects':>13}"
@@ -385,7 +417,15 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
     print(hdr)
     print(sep)
 
-    # Compute aligned peaks adding little_aligned_total (already 2^n aligned)
+    # First row: k threshold — shows little-object alignment impact
+    # Aligned peak for k = big_peak_raw + little_aligned (all big objects at raw size, only little aligned)
+    k_peak = tracker_original.max_memory + little_aligned_total
+    k_increase = k_peak - original_peak  # = little_increase
+    k_pct = (k_increase / original_peak * 100) if original_peak > 0 else 0
+    print(f"{int(auto_k):>10,}  {format_size(k_peak):>15}  {format_size(k_increase):>15}  "
+          f"{k_pct:>10.2f}%  {little_count:>13,}")
+
+    # Subsequent rows: big-object thresholds (128, 256, 512, ...)
     for t in thresholds_list:
         mod_peak = threshold_trackers[t].max_memory + little_aligned_total
         increase = mod_peak - original_peak
