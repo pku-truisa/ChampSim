@@ -280,8 +280,7 @@ VOID MallocBefore(ADDRINT size, ADDRINT ip)
   if (size < KnobMallocSizeThreshold.Value()) {
     accumulate_little(1, size);
   }
-
-  in_allocator_hook = false;
+  // NOTE: in_allocator_hook is cleared in MallocAfter
 }
 
 VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
@@ -298,8 +297,7 @@ VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
   if (total_size < KnobMallocSizeThreshold.Value()) {
     accumulate_little(5, total_size);
   }
-
-  in_allocator_hook = false;
+  // NOTE: in_allocator_hook is cleared in MallocAfter
 }
 
 VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
@@ -316,8 +314,7 @@ VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
   if (size < KnobMallocSizeThreshold.Value()) {
     accumulate_little(6, size);
   }
-
-  in_allocator_hook = false;
+  // NOTE: in_allocator_hook is cleared in MallocAfter
 }
 
 VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
@@ -333,8 +330,7 @@ VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
   if (size < KnobMallocSizeThreshold.Value()) {
     accumulate_little(7, size);
   }
-
-  in_allocator_hook = false;
+  // NOTE: in_allocator_hook is cleared in MallocAfter
 }
 
 VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
@@ -350,8 +346,7 @@ VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
   if (size < KnobMallocSizeThreshold.Value()) {
     accumulate_little(9, size);
   }
-
-  in_allocator_hook = false;
+  // NOTE: in_allocator_hook is cleared in MallocAfter
 }
 
 VOID MallocAfter(ADDRINT ret)
@@ -394,6 +389,7 @@ VOID MallocAfter(ADDRINT ret)
   pending_alloc_size = 0;
   pending_alloc_type = 0;
   pending_realloc_old_ptr = 0;
+  in_allocator_hook = false;
 }
 
 VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
@@ -430,8 +426,7 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
   if (size < KnobMallocSizeThreshold.Value()) {
     accumulate_little(8, size);
   }
-
-  in_allocator_hook = false;
+  // NOTE: in_allocator_hook is cleared in PosixMemalignAfter
 }
 
 VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
@@ -454,6 +449,7 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
   pending_alloc_size = 0;
   pending_alloc_type = 0;
   pending_alloc_memptr = 0;
+  in_allocator_hook = false;
 }
 
 VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
@@ -469,8 +465,7 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
   if (length < KnobMallocSizeThreshold.Value()) {
     accumulate_little(3, length);
   }
-
-  in_allocator_hook = false;
+  // NOTE: in_allocator_hook is cleared in MmapAfter
 }
 
 VOID MmapAfter(ADDRINT ret)
@@ -484,6 +479,7 @@ VOID MmapAfter(ADDRINT ret)
 
   pending_alloc_size = 0;
   pending_alloc_type = 0;
+  in_allocator_hook = false;
 }
 
 VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
