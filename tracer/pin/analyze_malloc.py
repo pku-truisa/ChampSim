@@ -11,7 +11,7 @@ little_malloc.log, then produces:
 4. Large-object lifecycle table (objects.log)
 
 Usage:
-    python3 analyze_malloc.py -i <malloc.bin> [-s <threshold>]
+    python3 analyze_malloc.py -i <malloc.bin> [-s <threshold>] [-v]
 """
 
 import struct
@@ -411,7 +411,6 @@ def process_malloc_binary(input_file, threshold):
     if little_count > 0:
         little_inc_pct = (little_increase / little_raw_total * 100) if little_raw_total > 0 else 0.0
         print(f"  Little objects (< {k_threshold}): {little_count} allocs, raw={format_size(little_raw_total)}, "
-
               f"aligned={format_size(little_aligned_total)}, increase={format_size(little_increase)} ({little_inc_pct:.2f}%)")
     print(f"Total alloc calls: {total_count:,}\n")
 
@@ -426,7 +425,6 @@ def process_malloc_binary(input_file, threshold):
     k_increase = k_peak - original_peak  # = little_increase
     k_pct = (k_increase / original_peak * 100) if original_peak > 0 else 0
     print(f"{k_threshold:>10,}  {format_size(k_peak):>15}  {format_size(k_increase):>15}  "
-
           f"{k_pct:>10.2f}%  {little_count:>13,}")
 
     # Subsequent rows: big-object thresholds (128, 256, 512, ...)
@@ -457,39 +455,23 @@ def process_malloc_binary(input_file, threshold):
         max_func_len = max(len(i['func']) for _, i in large_objects_list)
         max_addr_len = max(len(hex(a)) for a, _ in large_objects_list)
         max_ip_len = max(len(i['alloc_ip']) for _, i in large_objects_list)
-        max_free_ip_len = max((len(i['free_ip']) if i['free_ip'] else 2) for _, i in large_objects_list)
         max_size_str_len = max(len(format_size(i['size'])) for _, i in large_objects_list)
         max_orig_size_str_len = max(len(format_size(i['original_size'])) for _, i in large_objects_list)
-        max_alloc_instr_len = max(len("{:,}".format(i['alloc_instr'])) for _, i in large_objects_list)
-        max_free_instr_len = max((len("{:,}".format(i['free_instr'])) if i['free_instr'] else 2) for _, i in large_objects_list)
-        max_life_str_len = max(
-            (len("{:,}".format(i['free_instr'] - i['alloc_instr'])) if i['free_instr'] else 3)
-            for _, i in large_objects_list
-        )
     else:
         max_func_len = max_addr_len = max_ip_len = 10
-        max_free_ip_len = 8
         max_size_str_len = max_orig_size_str_len = 8
-        max_alloc_instr_len = max_free_instr_len = max_life_str_len = 3
 
     func_w = max(max_func_len, len("Function"))
     addr_w = max(max_addr_len, len("Address"))
     ip_w = max(max_ip_len, len("Alloc IP"))
-    free_ip_w = max(max_free_ip_len, len("Free IP"))
-    alloc_instr_w = max(max_alloc_instr_len, len("Alloc Instr"))
-    free_instr_w = max(max_free_instr_len, len("Free Instr"))
-    life_w = max(max_life_str_len, len("Lifetime"))
     size_w = max(max_size_str_len, len("Mod Size"))
     orig_size_w = max(max_orig_size_str_len, len("Orig Size"))
     status_w = max(8, len("Status"))
 
     header = (f"{'Function':>{func_w}}  {'Address':>{addr_w}}  {'Alloc IP':>{ip_w}}  "
-              f"{'Alloc Instr':>{alloc_instr_w}}  {'Free IP':>{free_ip_w}}  "
-              f"{'Free Instr':>{free_instr_w}}  {'Lifetime':>{life_w}}  "
               f"{'Orig Size':>{orig_size_w}}  {'Mod Size':>{size_w}}  {'Status':>{status_w}}")
     separator = "-" * len(header)
 
-    total_lifetime = 0
     freed_count = 0
     with open(objects_log_file, 'w') as obj_file:
         obj_file.write(f"# Active/Large Memory Objects (modified size >= {threshold} bytes)\n")
@@ -497,25 +479,19 @@ def process_malloc_binary(input_file, threshold):
         obj_file.write(f"# Sorted by modified size (descending)\n#\n")
         obj_file.write(header + "\n" + separator + "\n")
         for addr, info in large_objects_list:
-            f = info['func']; aip = info['alloc_ip']; ai = info['alloc_instr']
-            ms = info['size']; orig_sz = info['original_size']; fi = info['free_instr']; fp = info['free_ip']
+            f = info['func']; aip = info['alloc_ip']
+            ms = info['size']; orig_sz = info['original_size']; fi = info['free_instr']
             addr_str = hex(addr)
             if fi is not None:
-                lifetime = fi - ai; status = "FREED"
-                total_lifetime += lifetime; freed_count += 1
+                status = "FREED"
+                freed_count += 1
             else:
-                lifetime = 0; status = "ACTIVE"; fp = "--"; fi = 0
-            lifetime_str = "{:,}".format(lifetime) if info['free_instr'] is not None else "N/A"
-            fp_str = fp if fp else "--"
-            fi_str = "{:,}".format(fi) if info['free_instr'] is not None else "--"
+                status = "ACTIVE"
             obj_file.write(
-                f"{f:>{func_w}}  {addr_str:>{addr_w}}  {aip:>{ip_w}}  {ai:>{alloc_instr_w},}  "
-                f"{fp_str:>{free_ip_w}}  {fi_str:>{free_instr_w}}  {lifetime_str:>{life_w}}  "
+                f"{f:>{func_w}}  {addr_str:>{addr_w}}  {aip:>{ip_w}}  "
                 f"{format_size(orig_sz):>{orig_size_w}}  {format_size(ms):>{size_w}}  {status:>{status_w}}\n")
         obj_file.write(separator + "\n")
-        avg_lifetime = total_lifetime // freed_count if freed_count > 0 else 0
-        obj_file.write(f"# Freed objects: {freed_count}, Average lifetime: {avg_lifetime:,} instructions\n")
-        obj_file.write(f"# Still active: {len(large_objects_list) - freed_count}\n")
+        obj_file.write(f"# Freed objects: {freed_count}, Still active: {len(large_objects_list) - freed_count}\n")
     print(f"\nLarge objects log saved to: {objects_log_file}")
     print(f"Total large objects (modified size >= {threshold} bytes): {len(large_objects_list):,}")
 
@@ -550,11 +526,33 @@ if __name__ == "__main__":
         description='Memory allocation trace file analyzer — binary version',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n  python3 analyze_malloc.py -i malloc.bin\n"
-               "  python3 analyze_malloc.py -i malloc.bin -s 1024")
+               "  python3 analyze_malloc.py -i malloc.bin -s 1024\n"
+               "  python3 analyze_malloc.py -i malloc.bin -v")
     parser.add_argument('-i', '--input', required=True, help='Input binary malloc trace file (malloc.bin)')
     parser.add_argument('-s', '--size', type=int, default=1024,
                         help='Max size threshold for power-of-2 adjustment (default: 1024)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Display the contents of the input file in a readable format')
     args = parser.parse_args()
+
+    if args.verbose:
+        print("Displaying file contents: {}".format(args.input))
+        print("-" * 50)
+        print("{:<8} {:<20} {:<6} {:<20} {:<20} {:<20}".format(
+            "Seq", "IP", "Type", "arg1", "arg2", "ret"))
+        print("-" * 50)
+        for seq_id, ip, etype, arg1, arg2, ret in read_malloc_binary(args.input):
+            func_name = TYPE_MAP.get(etype, 'unknown')
+            print("{:<8} {:<20} {:<6}({:<14}) {:<20} {:<20} {:<20}".format(
+                seq_id,
+                hex(ip) if ip else "0x0",
+                etype,
+                func_name,
+                hex(arg1) if arg1 else arg1,
+                hex(arg2) if arg2 else arg2,
+                hex(ret) if ret else ret))
+        print("-" * 50)
+        sys.exit(0)
 
     base_name = os.path.splitext(args.input)[0]
     if base_name.endswith('.malloc'):
