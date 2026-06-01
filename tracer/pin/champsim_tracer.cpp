@@ -95,7 +95,7 @@ KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "0", "How many in
 
 KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "malloc.bin", "specify file name for binary malloc trace output");
 
-KNOB<UINT64> KnobMallocSizeThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "64", "Minimum allocation size to trace to binary (bytes, objects smaller than this go to little_malloc.log)");
+KNOB<UINT64> KnobMallocSizeThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "256", "Minimum allocation size to trace to binary (bytes, objects smaller than this go to little_malloc.log)");
 
 KNOB<BOOL> KnobAllocOnly(KNOB_MODE_WRITEONCE, "pintool", "a", "0", "Only generate memory allocation trace, skip instruction trace");
 
@@ -643,23 +643,10 @@ VOID Fini(INT32 code, VOID* v) {
     outfile.close();
   }
 
-  // Write header + little allocation stats as type=255/0 records embedded in malloc.bin
+  // Write little allocation stats as type=0 records at end of malloc.bin
   // Written directly to bypass write_malloc_instr's trace_limit_reached check
+  // Note: type=255 header is now written at the beginning (in main())
   if (malloc_binfile.is_open()) {
-    // Header record: type=255, arg1=k_threshold
-    {
-      malloc_instr rec;
-      rec.ip = 0;
-      rec.type = 255;
-      rec.arg1 = KnobMallocSizeThreshold.Value();
-      rec.arg2 = 0;
-      rec.ret = 0;
-      for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
-      typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
-      std::memcpy(buf, &rec, sizeof(malloc_instr));
-      malloc_binfile.write(buf, sizeof(malloc_instr));
-    }
-
     // Type=0 records: per-type small alloc stats
     // ip=alloc_type, arg1=count, arg2=raw_total, ret=aligned_total
     if (!little_stats.empty()) {
@@ -718,6 +705,20 @@ int main(int argc, char* argv[])
   if (!malloc_binfile) {
     std::cout << "Couldn't open binary malloc trace file. Exiting." << std::endl;
     exit(1);
+  }
+
+  // Write header record (type=255) at the BEGINNING of the file so analyzers know k-threshold upfront
+  {
+    malloc_instr rec;
+    rec.ip = 0;
+    rec.type = 255;
+    rec.arg1 = KnobMallocSizeThreshold.Value();
+    rec.arg2 = 0;
+    rec.ret = 0;
+    for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
+    typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
+    std::memcpy(buf, &rec, sizeof(malloc_instr));
+    malloc_binfile.write(buf, sizeof(malloc_instr));
   }
 
   TRACE_AddInstrumentFunction(insert_instrumentation, 0);

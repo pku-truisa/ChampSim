@@ -11,7 +11,7 @@ little_malloc.log, then produces:
 4. Large-object lifecycle table (objects.log)
 
 Usage:
-    python3 analyze_malloc.py -i <malloc.bin> [-s <threshold>] [-k <little_threshold>]
+    python3 analyze_malloc.py -i <malloc.bin> [-s <threshold>]
 """
 
 import struct
@@ -196,8 +196,8 @@ def read_malloc_binary(infile_path):
             yield seq_id, ip, etype, arg1, arg2, ret
 
 
-def process_malloc_binary(input_file, threshold, k_threshold=64):
-    """Streaming analysis of binary malloc trace with little_malloc.log integration."""
+def process_malloc_binary(input_file, threshold):
+    """Streaming analysis of binary malloc trace."""
 
     # Determine base name for log files
     base_name = os.path.splitext(input_file)[0]  # strip .bin
@@ -224,23 +224,24 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
         ip_info[s]['count'] += 1
         ip_info[s]['total_size'] += size
 
-    # Thresholds for 2^n analysis — start from next_power_of_2(k) read from header
-    # Default if no header found
-    auto_k = k_threshold
+    # Read k from the type=255 header at the BEGINNING of the file
+    record_gen = read_malloc_binary(input_file)
 
-    # Stream binary file (first pass to find header, then process)
-    # We read once; the header (type=255) is at the end, so we need two passes
-    # Simpler: read all records into a list, detect header, then process
-    all_records = list(read_malloc_binary(input_file))
+    try:
+        _, _, first_etype, first_arg1, _, _ = next(record_gen)
+    except StopIteration:
+        print("ERROR: malloc.bin is empty or missing type=255 header")
+        return
 
-    # Find type=255 header (last among metadata, first in tail section)
-    for seq_id, ip, etype, arg1, arg2, ret in all_records:
-        if etype == 255:
-            auto_k = int(arg1)
-            break
+    if first_etype != 255:
+        print("ERROR: first record in malloc.bin is not type=255 header (found type={})".format(first_etype))
+        return
+
+    k_threshold = int(first_arg1)
+
 
     thresholds_list = []
-    t = next_power_of_2(int(auto_k))
+    t = next_power_of_2(k_threshold)
     t <<= 1  # skip k itself, start from next power of 2
     while t <= threshold:
         thresholds_list.append(t)
@@ -259,7 +260,8 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
     print("-" * 50)
     print("Processing binary malloc trace...")
 
-    for seq_id, ip, etype, arg1, arg2, ret in all_records:
+    for seq_id, ip, etype, arg1, arg2, ret in record_gen:
+
         # type=0 records are embedded little-object stats
         # ip=original alloc_type, arg1=count, arg2=raw_total, ret=aligned_total
         if etype == 0:
@@ -408,7 +410,8 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
     print(f"  (big peak: {format_size(tracker_original.max_memory)}, little raw: {format_size(little_raw_total)})")
     if little_count > 0:
         little_inc_pct = (little_increase / little_raw_total * 100) if little_raw_total > 0 else 0.0
-        print(f"  Little objects (< {int(auto_k)}): {little_count} allocs, raw={format_size(little_raw_total)}, "
+        print(f"  Little objects (< {k_threshold}): {little_count} allocs, raw={format_size(little_raw_total)}, "
+
               f"aligned={format_size(little_aligned_total)}, increase={format_size(little_increase)} ({little_inc_pct:.2f}%)")
     print(f"Total alloc calls: {total_count:,}\n")
 
@@ -422,7 +425,8 @@ def process_malloc_binary(input_file, threshold, k_threshold=64):
     k_peak = tracker_original.max_memory + little_aligned_total
     k_increase = k_peak - original_peak  # = little_increase
     k_pct = (k_increase / original_peak * 100) if original_peak > 0 else 0
-    print(f"{int(auto_k):>10,}  {format_size(k_peak):>15}  {format_size(k_increase):>15}  "
+    print(f"{k_threshold:>10,}  {format_size(k_peak):>15}  {format_size(k_increase):>15}  "
+
           f"{k_pct:>10.2f}%  {little_count:>13,}")
 
     # Subsequent rows: big-object thresholds (128, 256, 512, ...)
@@ -546,12 +550,10 @@ if __name__ == "__main__":
         description='Memory allocation trace file analyzer — binary version',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n  python3 analyze_malloc.py -i malloc.bin\n"
-               "  python3 analyze_malloc.py -i malloc.bin -s 1024 -k 64")
+               "  python3 analyze_malloc.py -i malloc.bin -s 1024")
     parser.add_argument('-i', '--input', required=True, help='Input binary malloc trace file (malloc.bin)')
     parser.add_argument('-s', '--size', type=int, default=1024,
                         help='Max size threshold for power-of-2 adjustment (default: 1024)')
-    parser.add_argument('-k', '--little-threshold', type=int, default=64,
-                        help='Threshold used when generating little_malloc.log (default: 64)')
     args = parser.parse_args()
 
     base_name = os.path.splitext(args.input)[0]
@@ -565,8 +567,7 @@ if __name__ == "__main__":
     print("Starting to process binary memory allocation trace...")
     print(f"Input file: {args.input}")
     print(f"Size threshold: {args.size} bytes")
-    print(f"Little object threshold (k): {args.little_threshold} bytes")
     print("-" * 50)
-    process_malloc_binary(args.input, args.size, args.little_threshold)
+    process_malloc_binary(args.input, args.size)
 
     result_log.close()
