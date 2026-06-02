@@ -411,7 +411,10 @@ VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
 // --- FREE ---
 VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
 {
-  if (ptr == 0) return;
+  if (ptr == 0) {
+    if (allocator_hook_depth > 0) { allocator_hook_depth++; }
+    return;
+  }
 
   if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
   allocator_hook_depth = 1;
@@ -440,6 +443,50 @@ VOID FreeAfter()
   if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
   if (allocator_hook_depth == 0) return;
   allocator_hook_depth = 0;
+}
+
+// --- MEMALIGN ---
+VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
+{
+  if (trace_limit_reached) return;
+
+  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
+  allocator_hook_depth = 1;
+
+  pending_alloc_size = size;
+  pending_alloc_type = 9; // 9: memalign
+  pending_alloc_ip = ip;
+}
+
+VOID MemalignAfter(ADDRINT ret)
+{
+  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
+  if (allocator_hook_depth == 0) return;
+  allocator_hook_depth = 0;
+
+  if (pending_alloc_type != 9) {
+    pending_alloc_size = 0;
+    return;
+  }
+
+  if (ret != 0) {
+    UINT64 k = KnobMallocSizeThreshold.Value();
+    if (pending_alloc_size >= k) {
+      write_malloc_instr(pending_alloc_ip, 9, pending_alloc_size, 0, ret);
+      pending_instr_malloc.type = 9;
+      pending_instr_malloc.arg1 = pending_alloc_size;
+      pending_instr_malloc.arg2 = 0;
+      pending_instr_malloc.ret = ret;
+      tracked_addresses.insert(ret);
+    } else {
+      little_alloc_count++;
+      little_alloc_total += next_power_of_2(pending_alloc_size);
+      little_tracked.insert(ret);
+    }
+  }
+
+  pending_alloc_size = 0;
+  pending_alloc_type = 0;
 }
 
 // --- POSIX_MEMALIGN ---
@@ -490,6 +537,8 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
 {
   if (trace_limit_reached) return;
 
+  // If this is a nested internal mmap (e.g. inside glibc's malloc/realloc),
+  // only track depth without overwriting the outer pending alloc state.
   if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
   allocator_hook_depth = 1;
 
@@ -506,6 +555,8 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
 
 VOID MmapAfter(ADDRINT ret)
 {
+  // Nested internal mmap: just decrement depth, don't write record.
+  // The outer malloc/calloc/realloc call will write the correct record.
   if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
   if (allocator_hook_depth == 0) return;
   allocator_hook_depth = 0;
@@ -527,8 +578,13 @@ VOID MmapAfter(ADDRINT ret)
 // --- MUNMAP ---
 VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
 {
-  if (addr == 0 || addr == (ADDRINT)-1) return;
-  
+  if (addr == 0 || addr == (ADDRINT)-1) {
+    if (allocator_hook_depth > 0) { allocator_hook_depth++; }
+    return;
+  }
+
+  // Nested internal munmap (e.g. inside glibc's realloc shrink):
+  // only track depth without overwriting pending state.
   if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
   allocator_hook_depth = 1;
 
@@ -616,7 +672,7 @@ VOID ImageLoad(IMG img, VOID* v)
 
   // Only instrument images that actually define these symbols (libc, ld-linux, etc.)
   bool has_symbols = false;
-  const char* func_names[] = {"malloc", "calloc", "realloc", "free", "mmap", "munmap", "aligned_alloc", "posix_memalign"};
+  const char* func_names[] = {"malloc", "calloc", "realloc", "free", "mmap", "munmap", "aligned_alloc", "posix_memalign", "memalign"};
   for (const char* name : func_names) {
     RTN test_rtn = RTN_FindByName(img, name);
     if (RTN_Valid(test_rtn)) {
@@ -674,6 +730,15 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_RETURN_IP, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // Hook memalign
+  rtn = RTN_FindByName(img, "memalign");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
 

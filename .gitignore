@@ -33,3 +33,5 @@ compile_commands.json
 tracer/pin/champsim.trace
 tracer/pin/malloc.trace
 tracer/pin/test_malloc
+tracer/pin-object/obj-intel64/object_tracer.so
+tracer/pin-object/obj-intel64/object_tracer.so

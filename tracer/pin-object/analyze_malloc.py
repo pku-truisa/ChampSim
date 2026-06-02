@@ -5,7 +5,7 @@ Memory Allocation Trace File Analyzer — binary version
 Reads the binary malloc.bin (40-byte malloc_instr records), then produces:
 
 1. Single-pass streaming analysis of active memory with true dynamic peak
-2. Multi-threshold peak memory comparison across powers of 2 (128, 256, 512, 1024)
+2. Multi-threshold peak memory comparison across powers of 2 (8, 16, 32, 64, 128, 256, 512, 1024)
 3. Per-IP allocation summary (ips.log)
 4. Large-object lifecycle table (objects.log)
 
@@ -170,7 +170,7 @@ def process_malloc_binary(input_file, threshold):
     normal_records = list(read_malloc_binary(input_file))
 
     thresholds_list = []
-    t = next_power_of_2(128)
+    t = next_power_of_2(16)
     while t <= threshold:
         thresholds_list.append(t)
         t <<= 1
@@ -179,12 +179,10 @@ def process_malloc_binary(input_file, threshold):
     threshold_trackers = {t: MemoryTracker() for t in thresholds_list}
     threshold_modified_counts = {t: 0 for t in thresholds_list}
     tracker_single = threshold_trackers.get(threshold, MemoryTracker())
-    if threshold in thresholds_list:
-        thresholds_list.remove(threshold)
 
-    # Dedicated tracker for the effective k threshold (128).
-    # Objects < 128 are stored at aligned size, objects >= 128 at original size.
-    k_threshold = 128
+    # Dedicated tracker for the effective k threshold (8).
+    # Objects < 8 are stored at aligned size, objects >= 8 at original size.
+    k_threshold = 8
     tracker_k = MemoryTracker()
 
     # Per-object modification tracking: maps address -> set of thresholds
@@ -230,6 +228,8 @@ def process_malloc_binary(input_file, threshold):
                 tracker_k.add_object(address, original_size)
 
             for t in thresholds_list:
+                if t == threshold:
+                    continue  # tracker_single already handles this threshold
                 if original_size < t:
                     new_sz = next_power_of_2(original_size)
                     threshold_trackers[t].add_object(address, new_sz)
@@ -273,6 +273,8 @@ def process_malloc_binary(input_file, threshold):
                 object_modified_at[address_new] = set()
 
                 for t in thresholds_list:
+                    if t == threshold:
+                        continue  # tracker_single already handled at line 261
                     if original_size < t:
                         new_sz = next_power_of_2(original_size)
                         threshold_trackers[t].update_object(old_ptr, address_new, new_sz)
