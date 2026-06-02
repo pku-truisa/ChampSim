@@ -2,10 +2,9 @@
 """
 Memory Allocation Trace File Analyzer — binary version
 
-Reads the binary malloc.bin (40-byte malloc_instr records) and optionally
-little_malloc.log, then produces:
+Reads the binary malloc.bin (40-byte malloc_instr records), then produces:
 
-1. Single-pass streaming analysis of big-object active memory
+1. Single-pass streaming analysis of active memory with true dynamic peak
 2. Multi-threshold peak memory comparison across powers of 2 (128, 256, 512, 1024)
 3. Per-IP allocation summary (ips.log)
 4. Large-object lifecycle table (objects.log)
@@ -104,6 +103,7 @@ class MemoryTracker:
             self.current_memory -= size
 
     def reduce_object(self, address, length):
+        """Partially or fully remove an object (used by munmap with length)."""
         if address in self.active_objects:
             current_size = self.active_objects[address]
             if length >= current_size:
@@ -123,60 +123,8 @@ class MemoryTracker:
         return self.current_memory / (1024 * 1024)
 
 
-def parse_little_malloc_log(log_path, k_threshold):
-    """
-    Parse little_malloc.log and return:
-      - func_stats dict (function name -> count)
-      - little_raw_total (sum of original sizes)
-      - little_aligned_total (sum of aligned sizes)
-      - ip_info dict (placeholder, IP not tracked in little log)
-    """
-    func_stats = {
-        'malloc': 0, 'calloc': 0, 'realloc': 0, 'aligned_alloc': 0,
-        'memalign': 0, 'posix_memalign': 0, 'app_mmap': 0, 'free': 0, 'app_munmap': 0
-    }
-    little_raw = 0
-    little_aligned = 0
-    little_count = 0
-
-    if not os.path.exists(log_path):
-        print(f"Note: {log_path} not found, proceeding with big-object data only.")
-        return func_stats, 0, 0, 0
-
-    with open(log_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            func_name = parts[0]
-            if func_name == 'TOTAL':
-                continue
-            try:
-                count = int(parts[1])
-                raw = int(parts[2])
-                aligned = int(parts[3])
-            except (ValueError, IndexError):
-                continue
-
-            if func_name in func_stats:
-                func_stats[func_name] += count
-            little_raw += raw
-            little_aligned += aligned
-            little_count += count
-
-    print(f"Loaded little_malloc.log: {little_count} small objects (size < {k_threshold}), "
-          f"raw={format_size(little_raw)}, aligned={format_size(little_aligned)}")
-
-    return func_stats, little_raw, little_aligned, little_count
-
-
 def read_malloc_binary(infile_path):
     """Generator that yields (seq_id, ip, type, arg1, arg2, ret) tuples from binary file.
-       Type=0 records (embedded little-object stats) are returned as -type to signal
-       that they are metadata, not regular allocation events.
        Supports .xz compressed files automatically."""
     seq_id = 0
     open_func = lzma.open if infile_path.endswith('.xz') else open
@@ -185,13 +133,12 @@ def read_malloc_binary(infile_path):
             chunk = f.read(MALLOC_INSTR_SIZE)
             if len(chunk) < MALLOC_INSTR_SIZE:
                 break
-            # unpack: 4*uint64 + 8*uint8
             fields = struct.unpack(MALLOC_INSTR_FMT, chunk)
             ip = fields[0]
             arg1 = fields[1]
             arg2 = fields[2]
             ret = fields[3]
-            etype = fields[4]  # type is the first byte after the 4 uint64s
+            etype = fields[4]
             seq_id += 1
             yield seq_id, ip, etype, arg1, arg2, ret
 
@@ -209,11 +156,6 @@ def process_malloc_binary(input_file, threshold):
         'memalign': 0, 'posix_memalign': 0, 'app_mmap': 0, 'free': 0, 'app_munmap': 0
     }
 
-    # Little-object stats read from embedded type=0 records
-    little_raw_total = 0
-    little_aligned_total = 0
-    little_count = 0
-
     total_big_count = 0
     ip_info = {}
 
@@ -224,25 +166,11 @@ def process_malloc_binary(input_file, threshold):
         ip_info[s]['count'] += 1
         ip_info[s]['total_size'] += size
 
-    # Read k from the type=255 header at the BEGINNING of the file
-    record_gen = read_malloc_binary(input_file)
-
-    try:
-        _, _, first_etype, first_arg1, _, _ = next(record_gen)
-    except StopIteration:
-        print("ERROR: malloc.bin is empty or missing type=255 header")
-        return
-
-    if first_etype != 255:
-        print("ERROR: first record in malloc.bin is not type=255 header (found type={})".format(first_etype))
-        return
-
-    k_threshold = int(first_arg1)
-
+    # Read all records (no header/tail in object_tracer format)
+    normal_records = list(read_malloc_binary(input_file))
 
     thresholds_list = []
-    t = next_power_of_2(k_threshold)
-    t <<= 1  # skip k itself, start from next power of 2
+    t = next_power_of_2(128)
     while t <= threshold:
         thresholds_list.append(t)
         t <<= 1
@@ -254,27 +182,24 @@ def process_malloc_binary(input_file, threshold):
     if threshold in thresholds_list:
         thresholds_list.remove(threshold)
 
+    # Dedicated tracker for the effective k threshold (128).
+    # Objects < 128 are stored at aligned size, objects >= 128 at original size.
+    k_threshold = 128
+    tracker_k = MemoryTracker()
+
+    # Per-object modification tracking: maps address -> set of thresholds
+    # at which this object has already been counted as "modified".
+    # FIX: prevents realloc from incrementing threshold_modified_counts
+    # multiple times for the same object.
+    object_modified_at = {}
+
     large_objects_info = {}
 
     # Process all records
     print("-" * 50)
     print("Processing binary malloc trace...")
 
-    for seq_id, ip, etype, arg1, arg2, ret in record_gen:
-
-        # type=0 records are embedded little-object stats
-        # ip=original alloc_type, arg1=count, arg2=raw_total, ret=aligned_total
-        if etype == 0:
-            orig_type = int(ip)
-            count = arg1
-            raw = arg2
-            aligned = ret
-            if orig_type in TYPE_MAP:
-                func_stats[TYPE_MAP[orig_type]] += count
-            little_count += count
-            little_raw_total += raw
-            little_aligned_total += aligned
-            continue
+    for seq_id, ip, etype, arg1, arg2, ret in normal_records:
 
         func_name = TYPE_MAP.get(etype, 'unknown')
         ip_str = hex(ip) if ip else "0x0"
@@ -295,11 +220,21 @@ def process_malloc_binary(input_file, threshold):
             tracker_original.add_object(address, original_size)
             tracker_single.add_object(address, single_size)
 
+            # Initialize modification tracking for this object
+            object_modified_at[address] = set()
+
+            # k-threshold tracker: objects < k use aligned size, >= k use raw size
+            if original_size < k_threshold:
+                tracker_k.add_object(address, next_power_of_2(original_size))
+            else:
+                tracker_k.add_object(address, original_size)
+
             for t in thresholds_list:
                 if original_size < t:
                     new_sz = next_power_of_2(original_size)
                     threshold_trackers[t].add_object(address, new_sz)
                     threshold_modified_counts[t] += 1
+                    object_modified_at[address].add(t)
                 else:
                     threshold_trackers[t].add_object(address, original_size)
 
@@ -327,13 +262,30 @@ def process_malloc_binary(input_file, threshold):
                 tracker_original.update_object(old_ptr, address_new, original_size)
                 tracker_single.update_object(old_ptr, address_new, single_size)
 
+                # k-threshold tracker: objects < k use aligned size, >= k use raw size
+                if original_size < k_threshold:
+                    tracker_k.update_object(old_ptr, address_new, next_power_of_2(original_size))
+                else:
+                    tracker_k.update_object(old_ptr, address_new, original_size)
+
+                # Inherit old modification set, create new one for new address
+                old_modified_set = object_modified_at.pop(old_ptr, set())
+                object_modified_at[address_new] = set()
+
                 for t in thresholds_list:
                     if original_size < t:
                         new_sz = next_power_of_2(original_size)
                         threshold_trackers[t].update_object(old_ptr, address_new, new_sz)
-                        threshold_modified_counts[t] += 1
+                        # Only count if this object hasn't already been counted at this threshold
+                        if t not in old_modified_set:
+                            threshold_modified_counts[t] += 1
+                            object_modified_at[address_new].add(t)
+                        else:
+                            object_modified_at[address_new].add(t)
                     else:
                         threshold_trackers[t].update_object(old_ptr, address_new, original_size)
+                        # If the object grows above threshold, it's no longer "modified" at this t
+                        # Keep the historical marks that still apply
 
                 old_info = large_objects_info.pop(old_ptr, {})
                 if single_size >= threshold:
@@ -349,8 +301,11 @@ def process_malloc_binary(input_file, threshold):
             address = arg1
             tracker_original.remove_object(address)
             tracker_single.remove_object(address)
+            tracker_k.remove_object(address)
             for t in thresholds_list:
                 threshold_trackers[t].remove_object(address)
+            if address in object_modified_at:
+                del object_modified_at[address]
             if address in large_objects_info:
                 large_objects_info[address]['free_instr'] = seq_id
                 large_objects_info[address]['free_ip'] = ip_str
@@ -362,21 +317,29 @@ def process_malloc_binary(input_file, threshold):
             length = arg2
             tracker_original.reduce_object(address, length)
             tracker_single.reduce_object(address, length)
+            tracker_k.reduce_object(address, length)
             for t in thresholds_list:
                 threshold_trackers[t].reduce_object(address, length)
+            # Mark large object as freed only if it's completely removed from tracking
             if address in large_objects_info:
                 if address not in tracker_original.active_objects:
                     large_objects_info[address]['free_instr'] = seq_id
                     large_objects_info[address]['free_ip'] = ip_str
+                if address in object_modified_at and address not in tracker_original.active_objects:
+                    del object_modified_at[address]
 
-    total_count = total_big_count + little_count
+    total_count = total_big_count
 
     # ---- Statistics ----
-    original_peak = tracker_original.max_memory + little_raw_total
+    # Original peak: dynamic max from time-ordered tracking of all objects.
+    # k-aligned peak: tracker_k handles alignment for objects < 128.
+    original_peak = tracker_original.max_memory
+    k_aligned_peak_raw = tracker_k.max_memory
+    k_aligned_peak = k_aligned_peak_raw
+
     print(f"\nProcessing complete!")
-    print(f"Total {total_count:,} memory allocation calls found")
-    print(f"  Big objects (>= {k_threshold} bytes): {total_big_count:,}")
-    print(f"  Little objects (< {k_threshold} bytes): {little_count:,}")
+    print(f"Total {total_count:,} allocation calls in trace")
+    print(f"  Effective k-threshold: {k_threshold} bytes")
     print(f"Using threshold {threshold}: adjusted big objects < threshold to next power of 2")
     print(f"\n=== Function Call Statistics ===")
     print(f"{'Function':<20} {'Count':>10} {'Percentage':>12}")
@@ -402,16 +365,12 @@ def process_malloc_binary(input_file, threshold):
     print(f"{'Total Dealloc':<20} {dealloc_total:>10,} {(dealloc_total/total_count*100) if total_count > 0 else 0:>11.2f}%")
     print()
 
-    little_increase = little_aligned_total - little_raw_total
-
     # ---- Multi-threshold peak ----
+    # FIX: All peaks computed purely from dynamic time-ordered tracking.
+    # Each threshold tracker maintains its own active_objects with the appropriate
+    # aligned or original sizes for objects crossing that threshold.
     print(f"\n=== Multi-Threshold Peak Memory Comparison ===")
-    print(f"Original peak (big objects + little raw): {format_size(original_peak)} ({original_peak:,} bytes)")
-    print(f"  (big peak: {format_size(tracker_original.max_memory)}, little raw: {format_size(little_raw_total)})")
-    if little_count > 0:
-        little_inc_pct = (little_increase / little_raw_total * 100) if little_raw_total > 0 else 0.0
-        print(f"  Little objects (< {k_threshold}): {little_count} allocs, raw={format_size(little_raw_total)}, "
-              f"aligned={format_size(little_aligned_total)}, increase={format_size(little_increase)} ({little_inc_pct:.2f}%)")
+    print(f"Original peak (all objects at raw size): {format_size(original_peak)} ({original_peak:,} bytes)")
     print(f"Total alloc calls: {total_count:,}\n")
 
     hdr = f"{'Threshold':>10}  {'Aligned Peak':>15}  {'Increase':>15}  {'Increase %':>11}  {'Mod Objects':>13}"
@@ -419,24 +378,23 @@ def process_malloc_binary(input_file, threshold):
     print(hdr)
     print(sep)
 
-    # First row: k threshold — shows little-object alignment impact
-    # Aligned peak for k = big_peak_raw + little_aligned (all big objects at raw size, only little aligned)
-    k_peak = tracker_original.max_memory + little_aligned_total
-    k_increase = k_peak - original_peak  # = little_increase
-    k_pct = (k_increase / original_peak * 100) if original_peak > 0 else 0
-    print(f"{k_threshold:>10,}  {format_size(k_peak):>15}  {format_size(k_increase):>15}  "
-          f"{k_pct:>10.2f}%  {little_count:>13,}")
+    # First row: k threshold (actual threshold from file header).
+    # k_aligned_peak includes: large objects at aligned sizes (tracker_k) + little objects aligned total.
+    k_increase = k_aligned_peak - original_peak
+    k_pct = (k_increase / original_peak * 100) if original_peak > 0 else 0.0
+    print(f"{k_threshold:>10,}  {format_size(k_aligned_peak):>15}  {format_size(k_increase):>15}  "
+          f"{k_pct:>10.2f}%  N/A           ")
 
-    # Subsequent rows: big-object thresholds (128, 256, 512, ...)
-    for t in thresholds_list:
-        mod_peak = threshold_trackers[t].max_memory + little_aligned_total
+    # Subsequent rows: power-of-2 thresholds (2*k, 4*k, ...)
+    for t in sorted(thresholds_list):
+        mod_peak = threshold_trackers[t].max_memory
         increase = mod_peak - original_peak
         pct = (increase / original_peak * 100) if original_peak > 0 else 0
         mod_cnt = threshold_modified_counts[t]
         print(f"{t:>10,}  {format_size(mod_peak):>15}  {format_size(increase):>15}  {pct:>10.2f}%  {mod_cnt:>13,}")
     print(sep)
 
-    single_peak = tracker_single.max_memory + little_aligned_total
+    single_peak = tracker_single.max_memory
     single_increase = single_peak - original_peak
     single_pct = (single_increase / original_peak * 100) if original_peak > 0 else 0
     print(f"\nUsing -s {threshold}:")
@@ -500,7 +458,6 @@ def process_malloc_binary(input_file, threshold):
     if ip_info:
         ip_list = [(ip, i['func'], i['count'], i['total_size']) for ip, i in ip_info.items()]
         ip_list.sort(key=lambda x: x[2], reverse=True)  # sort by count descending
-        # Compute average sizes
         ip_list_with_avg = [(ip, func, cnt, total, total // cnt if cnt > 0 else 0) for ip, func, cnt, total in ip_list]
 
         ip_col_w = max(max(len(ip) for ip, _, _, _, _ in ip_list_with_avg), len("IP"))
@@ -511,7 +468,7 @@ def process_malloc_binary(input_file, threshold):
         ips_header = f"{'IP':>{ip_col_w}}  {'Function':>{func_w2}}  {'Count':>{count_w2}}  {'Avg Size':>{avg_w2}}  {'Total Size':>{total_w2}}"
         ips_sep = "-" * len(ips_header)
         with open(ips_log_file, 'w') as ips_file:
-            ips_file.write(f"# Per-IP Allocation Summary (big objects only, >= {k_threshold} bytes)\n")
+            ips_file.write(f"# Per-IP Allocation Summary (all objects)\n")
             ips_file.write(f"# Total unique IPs: {len(ip_list)}\n")
             ips_file.write(f"# Sorted by count (descending)\n#\n")
             ips_file.write(ips_header + "\n" + ips_sep + "\n")
