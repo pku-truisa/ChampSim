@@ -8,10 +8,12 @@ bin/
 
 **/*.o
 **/*.d
+**/*.so
 
 test/000-test-main
 
 tracer/pin/obj-intel64/
+tracer/pin-object/obj-intel64/
 
 vcpkg_installed/
 
@@ -30,8 +32,3 @@ compile_commands.json
 
 .vscode/
 **/.DS_Store
-tracer/pin/champsim.trace
-tracer/pin/malloc.trace
-tracer/pin/test_malloc
-tracer/pin-object/obj-intel64/object_tracer.so
-tracer/pin-object/obj-intel64/object_tracer.so
