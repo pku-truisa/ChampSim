@@ -162,11 +162,12 @@ def process_malloc_binary(filename):
         
         print("\n=== Peak Memory Usage Summary ===")
         print(f"Original Physical Peak: {format_size(original_peak_size)}")
-        print("\n Threshold   Aligned Peak     Increase %   Objects < Thresh")
-        print("-" * 68)
+        print("\n Threshold   Aligned Increase     Increase %   Objects < Thresh")
+        print("-" * 75)
         for t in thresholds:
-            inc_pct = ((peak_sizes[t] - original_peak_size) / original_peak_size * 100) if original_peak_size > 0 else 0
-            print(f"{t:>9}  {format_size(peak_sizes[t]):>15}  {inc_pct:>9.2f}%  {threshold_object_counts[t]:>16,}")
+            increase = peak_sizes[t] - original_peak_size
+            inc_pct = (increase / original_peak_size * 100) if original_peak_size > 0 else 0
+            print(f"{t:>9}  {format_size(increase):>19}  {inc_pct:>9.2f}%  {threshold_object_counts[t]:>16,}")
             
     # 恢复系统的标准输出流
     sys.stdout = sys.__stdout__

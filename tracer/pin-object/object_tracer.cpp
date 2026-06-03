@@ -19,21 +19,21 @@
  *  events to a binary trace file (malloc.bin). It does not generate any
  *  instruction-level trace — it focuses solely on heap/anon-mmap activity.
  *
- *  Hooked functions: malloc, calloc, realloc, posix_memalign,
- *  free, mmap (anonymous only), munmap.
+ *  Hooked functions: malloc, calloc, realloc, free, mmap (anonymous only),
+ *  munmap.
  *
- *  aligned_alloc and memalign are NOT hooked. In glibc >= 2.16 they are
- *  thin wrappers around malloc (for small allocations) or mmap (for large
- *  ones via sysmalloc). Their IPOINT_AFTER callbacks cannot fire reliably
- *  due to tail-call optimization. The underlying malloc/mmap hooks capture
- *  these allocations with correct sizes and addresses, just recorded as
- *  type=malloc or type=mmap instead of type=aligned_alloc.
+ *  NOT hooked: aligned_alloc, memalign, posix_memalign.
+ *  In glibc >= 2.16 these are thin wrappers that tail-call into internal
+ *  functions (__libc_malloc, mmap via sysmalloc). Their IPOINT_AFTER
+ *  callbacks cannot fire reliably, which would corrupt the depth counter.
+ *  The underlying malloc/mmap hooks still capture these allocations with
+ *  correct sizes and addresses (recorded as type=malloc or type=mmap).
  *
  *  Key design: A depth counter (allocator_hook_depth) handles glibc's internal
- *  nested allocation calls (e.g. mmap inside malloc for large allocations).
- *  The inner call increments depth and returns silently; only the outermost
- *  user-level call writes the record. No manual "heal" mechanism is needed
- *  because every Before/After pair correctly manages depth.
+ *  nested allocation calls (e.g. mmap inside malloc via sysmalloc for large
+ *  allocations). The inner call increments depth and returns silently; only
+ *  the outermost user-level call writes the record. Every hooked function
+ *  has a matching Before/After pair, so depth never gets stuck.
  */
 
 #include <fstream>
@@ -68,12 +68,13 @@ std::ofstream malloc_binfile;
 std::unordered_set<ADDRINT> tracked_addresses;
 
 ADDRINT pending_alloc_size = 0;
-ADDRINT pending_alloc_memptr = 0;
 ADDRINT pending_realloc_old_ptr = 0;
 int pending_alloc_type = 0;
 ADDRINT pending_alloc_ip = 0;
 
 // Depth counter for allocator reentrancy protection.
+// Every hooked function has a Before/After pair that correctly
+// manages depth, so it never gets stuck.
 INT32 allocator_hook_depth = 0;
 
 /* ===================================================================== */
@@ -134,9 +135,8 @@ VOID MallocAfter(ADDRINT ret)
   if (allocator_hook_depth == 0) return;
   allocator_hook_depth = 0;
 
-  bool is_valid_type = (pending_alloc_type == 1 || pending_alloc_type == 5 ||
-                        pending_alloc_type == 6);
-  if (!is_valid_type) {
+  // 1=malloc, 5=calloc, 6=realloc
+  if (pending_alloc_type != 1 && pending_alloc_type != 5 && pending_alloc_type != 6) {
     pending_alloc_size = 0;
     pending_alloc_type = 0;
     pending_realloc_old_ptr = 0;
@@ -206,43 +206,6 @@ VOID FreeAfter()
   allocator_hook_depth = 0;
 }
 
-// --- POSIX_MEMALIGN ---
-VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
-{
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-  pending_alloc_size = size;
-  pending_alloc_type = 8;
-  pending_alloc_memptr = memptr;
-  pending_alloc_ip = ip;
-}
-
-VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
-{
-  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
-  if (allocator_hook_depth == 0) return;
-  allocator_hook_depth = 0;
-
-  if (pending_alloc_type != 8) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
-    pending_alloc_memptr = 0;
-    return;
-  }
-
-  if (ret == 0 && pending_alloc_memptr != 0) {
-    ADDRINT allocated_addr = 0;
-    PIN_SafeCopy(&allocated_addr, (VOID*)pending_alloc_memptr, sizeof(ADDRINT));
-    if (allocated_addr != 0) {
-      write_malloc_instr(pending_alloc_ip, 8, pending_alloc_size, 0, allocated_addr);
-      tracked_addresses.insert(allocated_addr);
-    }
-  }
-  pending_alloc_size = 0;
-  pending_alloc_type = 0;
-  pending_alloc_memptr = 0;
-}
-
 // --- MMAP ---
 VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
 {
@@ -302,7 +265,7 @@ VOID MunmapAfter()
 }
 
 /* ===================================================================== */
-// ImageLoad
+// ImageLoad — only hook functions with reliable Before/After
 /* ===================================================================== */
 VOID ImageLoad(IMG img, VOID* v)
 {
@@ -343,17 +306,6 @@ VOID ImageLoad(IMG img, VOID* v)
     instrumented = true;
   }
 
-  // posix_memalign
-  rtn = RTN_FindByName(img, "posix_memalign");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_RETURN_IP, IARG_END);
-    RTN_Close(rtn);
-    instrumented = true;
-  }
-
   // free
   rtn = RTN_FindByName(img, "free");
   if (RTN_Valid(rtn)) {
@@ -385,6 +337,10 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
     instrumented = true;
   }
+
+  // NOTE: aligned_alloc, memalign, posix_memalign deliberately omitted.
+  // Their IPOINT_AFTER callbacks don't fire reliably due to glibc tail-call
+  // optimization. The underlying malloc/mmap hooks capture the allocation.
 
   if (instrumented)
     std::cout << "[Object Tracer] Instrumenting: " << IMG_Name(img) << std::endl;

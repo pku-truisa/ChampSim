@@ -32,3 +32,4 @@ compile_commands.json
 
 .vscode/
 **/.DS_Store
+tracer/pin-object/obj-intel64/object_tracer.so
