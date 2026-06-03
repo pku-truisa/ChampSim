@@ -84,40 +84,30 @@ For **deallocation** events (types 2, 4):
 
 ## Analyzing Memory Allocation Traces
 
-The `analyze_malloc.py` tool can be used to analyze the binary malloc trace. It provides:
+The `little_object_analyzer.py` tool provides streaming, low-memory-footprint analysis of the binary malloc trace. It supports:
 
-1. **Function call statistics** — count and percentage of each allocation type
-2. **Active memory tracking** — peak memory usage over time
-3. **Multi-threshold peak comparison** — compares original vs. power-of-2-aligned sizes
-4. **Per-IP allocation summary** (`ips.log`) — which call sites allocate the most
-5. **Large-object lifecycle table** (`objects.log`) — lifetime and status of large objects
+1. **Function call statistics** — count of each allocation and deallocation type
+2. **Active memory tracking** — peak memory usage over time, both original and power-of-2-aligned
+3. **Multi-threshold peak comparison** — compares aligned peaks at [8, 16, 32, 64, 128, 256, 512, 1024] byte thresholds
+4. **Per-IP allocation summary** (`ips.log`) — which call sites allocate the most, sorted by total bytes
 
 ### Usage
 
 ```bash
-# Basic analysis
-python3 analyze_malloc.py -i malloc.bin
-
-# Specify analysis threshold for power-of-2 alignment
-python3 analyze_malloc.py -i malloc.bin -s 2048
-
-# Verbose: dump all records in readable format
-python3 analyze_malloc.py -i malloc.bin -v
+# Basic analysis (supports both .bin and .bin.xz input)
+python3 little_object_analyzer.py -i malloc.bin
 ```
 
 ### Parameters
 
-- `-i, --input`: Input binary malloc trace file (required)
-- `-s, --size`: Max size threshold for power-of-2 adjustment (default: 1024). Sizes smaller than this value are adjusted to the nearest power of 2 in peak memory calculations.
-- `-v, --verbose`: Display all records in a human-readable table
+- `-i, --input`: Input binary malloc trace file (required). Supports `.xz` compressed files.
 
 ### Output Files
 
 | File               | Description                                           |
 |--------------------|-------------------------------------------------------|
 | `*.result.log`     | Full analysis report (console output mirror)          |
-| `*.objects.log`    | Large object lifecycle table                          |
-| `*.ips.log`        | Per-call-site (IP) allocation summary                 |
+| `*.ips.log`        | Per-call-site (IP) allocation summary (CSV format)    |
 
 ## Differences from champsim_tracer
 

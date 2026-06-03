@@ -95,8 +95,7 @@ void write_malloc_instr(unsigned long long ip, unsigned char type,
     rec.arg1 = arg1;
     rec.arg2 = arg2;
     rec.ret = ret;
-    for (int i = 0; i < 7; i++)
-      rec.reserved[i] = 0;
+    std::memset(rec.reserved, 0, sizeof(rec.reserved));
     typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
     std::memcpy(buf, &rec, sizeof(malloc_instr));
     malloc_binfile.write(buf, sizeof(malloc_instr));
@@ -371,18 +370,8 @@ VOID ImageLoad(IMG img, VOID* v)
 {
   if (!IMG_Valid(img)) return;
 
-  bool has_symbols = false;
-  const char* func_names[] = {"malloc", "calloc", "realloc", "free", "mmap", "munmap",
-                              "aligned_alloc", "posix_memalign", "memalign"};
-  for (const char* name : func_names) {
-    RTN test_rtn = RTN_FindByName(img, name);
-    if (RTN_Valid(test_rtn)) { has_symbols = true; break; }
-  }
-  if (!has_symbols) return;
-
-  std::cout << "[Object Tracer] Instrumenting: " << IMG_Name(img) << std::endl;
-
   RTN rtn;
+  bool instrumented = false;
 
   // malloc
   rtn = RTN_FindByName(img, "malloc");
@@ -391,6 +380,7 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
 
   // calloc
@@ -401,6 +391,7 @@ VOID ImageLoad(IMG img, VOID* v)
                    IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
 
   // realloc
@@ -411,6 +402,7 @@ VOID ImageLoad(IMG img, VOID* v)
                    IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
 
   // aligned_alloc
@@ -425,6 +417,7 @@ VOID ImageLoad(IMG img, VOID* v)
                    IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
 
   // posix_memalign
@@ -435,6 +428,7 @@ VOID ImageLoad(IMG img, VOID* v)
                    IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_RETURN_IP, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
 
   // memalign (only if not aliased with aligned_alloc)
@@ -447,6 +441,7 @@ VOID ImageLoad(IMG img, VOID* v)
                      IARG_RETURN_IP, IARG_END);
       RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
       RTN_Close(rtn);
+      instrumented = true;
     }
   }
 
@@ -457,6 +452,7 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
 
   // mmap
@@ -467,6 +463,7 @@ VOID ImageLoad(IMG img, VOID* v)
                    IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
 
   // munmap
@@ -477,7 +474,11 @@ VOID ImageLoad(IMG img, VOID* v)
                    IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
     RTN_Close(rtn);
+    instrumented = true;
   }
+
+  if (instrumented)
+    std::cout << "[Object Tracer] Instrumenting: " << IMG_Name(img) << std::endl;
 }
 
 /* ===================================================================== */
