@@ -119,6 +119,20 @@ def generate_synthetic_trace(filepath):
         # free(0x9000) -> now at current = 2084-128 = 1956
         write_record(f, 0x40E000, 2, 0x9000, 0, 0)     # type=2
 
+        #
+        # Phase 9: Orphan free / munmap — verify unconditional write (object_tracer.cpp fix)
+        # These simulate __libc_malloc-escaped allocations that get freed later.
+        # The tracer now unconditionally writes free/munmap events (no tracked_addresses pruning).
+        # The analyzer must handle these gracefully: count them in func_stats but skip
+        # active_heap modifications since the ptr was never registered.
+        #
+
+        # orphan free(0xDEAD) — ptr never allocated
+        write_record(f, 0x40F000, 2, 0xDEAD, 0, 0)     # type=2, orphan free
+
+        # orphan munmap(0xBEEF, 8192) — addr never mmap'd
+        write_record(f, 0x410000, 4, 0xBEEF, 8192, 0)  # type=4, orphan munmap
+
 
 def run_analyzer(input_path):
     """Run little_object_analyzer.py and capture its output files."""
@@ -167,6 +181,31 @@ def parse_result_log(result_path):
         }
     stats['thresholds'] = threshold_data
 
+    # Parse Breakdown by Type table
+    breakdown = {}
+    in_breakdown = False
+    for line in text.splitlines():
+        if '--- Breakdown by Type ---' in line:
+            in_breakdown = True
+            continue
+        if in_breakdown:
+            if line.startswith('===') or line.strip() == '':
+                if breakdown:
+                    in_breakdown = False
+                continue
+            if line.startswith('Type') or line.startswith('---'):
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    code = int(parts[-2])
+                    count = int(parts[-1].replace(',', ''))
+                    name = ' '.join(parts[:-2])
+                    breakdown[name] = {'code': code, 'count': count}
+                except (ValueError, IndexError):
+                    pass
+    stats['breakdown'] = breakdown
+
     return stats
 
 def main():
@@ -213,8 +252,8 @@ def main():
     check(stats.get('total_alloc') == expected_allocs,
           f"Total Alloc calls = {stats.get('total_alloc')} (expected {expected_allocs})")
 
-    # 4 frees: 1 free (phase1) + 1 munmap + 2 free (phase8) = 4
-    expected_frees = 4
+    # 6 frees: 1 free (phase1) + 1 munmap + 2 free (phase8) + 1 orphan free + 1 orphan munmap = 6
+    expected_frees = 6
     check(stats.get('total_free') == expected_frees,
           f"Total Free calls = {stats.get('total_free')} (expected {expected_frees})")
 
@@ -325,6 +364,63 @@ def main():
     if 128 in thresholds:
         check(thresholds[128]['objects'] == 2,
               f"Objects < 128 = {thresholds[128]['objects']} (expected 2)")
+
+    # --- New tests for object_tracer.cpp fixes ---
+
+    # Test 1: Orphan free/munmap — verify analyzer handles them gracefully
+    # Added 2 orphan events (1 free, 1 munmap) → total free calls = 4 + 2 = 6
+    # But active_heap unchanged (orphan ptrs never registered)
+    expected_allocs_v2 = 10  # unchanged
+    check(stats.get('total_alloc') == expected_allocs_v2,
+          f"Total Alloc calls (with orphans) = {stats.get('total_alloc')} (expected {expected_allocs_v2})")
+    check(stats.get('total_free') == 6,
+          f"Total Free calls (with orphans) = {stats.get('total_free')} (expected 6)")
+    check(stats.get('active_remaining') == 4,
+          f"Active remaining (with orphans) = {stats.get('active_remaining')} (expected 4, orphans don't affect heap)")
+
+    # Test 2: Peak unchanged by orphans (orphan free/munmap should not affect peak)
+    check(abs(observed_peak_bytes - expected_peak) < tolerance,
+          f"Peak memory (with orphans) = {observed_peak_bytes:.1f} bytes (expected ~{expected_peak} bytes)")
+
+    # Test 3: Breakdown by Type — verify each category count
+    breakdown = stats.get('breakdown', {})
+    check(len(breakdown) >= 8, f"Breakdown has >= 8 type entries (got {len(breakdown)})")
+
+    # malloc: 3 (phase1) + 1 (after free) = 4
+    check(breakdown.get('malloc', {}).get('count') == 4,
+          f"Breakdown malloc count = {breakdown.get('malloc', {}).get('count')} (expected 4)")
+
+    # calloc: 1
+    check(breakdown.get('calloc', {}).get('count') == 1,
+          f"Breakdown calloc count = {breakdown.get('calloc', {}).get('count')} (expected 1)")
+
+    # realloc: 1 (type=6, moved)
+    check(breakdown.get('realloc', {}).get('count') == 1,
+          f"Breakdown realloc count = {breakdown.get('realloc', {}).get('count')} (expected 1)")
+
+    # realloc_inplace: 1 (type=16)
+    check(breakdown.get('realloc_inplace', {}).get('count') == 1,
+          f"Breakdown realloc_inplace count = {breakdown.get('realloc_inplace', {}).get('count')} (expected 1)")
+
+    # posix_memalign: 1
+    check(breakdown.get('posix_memalign', {}).get('count') == 1,
+          f"Breakdown posix_memalign count = {breakdown.get('posix_memalign', {}).get('count')} (expected 1)")
+
+    # fortran_alloc: 1
+    check(breakdown.get('fortran_alloc', {}).get('count') == 1,
+          f"Breakdown fortran_alloc count = {breakdown.get('fortran_alloc', {}).get('count')} (expected 1)")
+
+    # mmap: 1
+    check(breakdown.get('mmap', {}).get('count') == 1,
+          f"Breakdown mmap count = {breakdown.get('mmap', {}).get('count')} (expected 1)")
+
+    # free: 3 (phase1+phase8) + 1 orphan = 4
+    check(breakdown.get('free', {}).get('count') == 4,
+          f"Breakdown free count = {breakdown.get('free', {}).get('count')} (expected 4)")
+
+    # munmap: 1 (phase3) + 1 orphan = 2
+    check(breakdown.get('munmap', {}).get('count') == 2,
+          f"Breakdown munmap count = {breakdown.get('munmap', {}).get('count')} (expected 2)")
 
     print("\n" + "=" * 70)
     print(f"Results: {PASS} passed, {FAIL} failed out of {PASS+FAIL} tests")
