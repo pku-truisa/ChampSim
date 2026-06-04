@@ -21,10 +21,9 @@
 
 #include <fstream>
 #include <iostream>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <string>
-#include <unordered_set>
 
 #include "../../inc/trace_instruction.h"
 #include "pin.H"
@@ -39,22 +38,17 @@ using trace_instr_format_t = input_instr;
 // Global variables
 /* ================================================================== */
 
-UINT64 instrCount = 0;
 std::ofstream outfile;
 trace_instr_format_t curr_instr;
 INT64 trace_insts_left = 0;
 INT64 fast_forward_insts_left = 0;
 bool skip_dumping_instructions = false;
 
-// Binary malloc trace output
-std::ofstream malloc_binfile;
-std::unordered_set<ADDRINT> tracked_addresses;
 ADDRINT pending_alloc_size = 0;
 ADDRINT pending_alloc_memptr = 0; // for posix_memalign
 ADDRINT pending_realloc_old_ptr = 0; // for realloc old pointer
 int pending_alloc_type = 0; // 0: none, 1: malloc, 3: mmap, 5: calloc, 6: realloc, 7: aligned_alloc, 8: posix_memalign, 9: memalign
 bool trace_limit_reached = false;
-ADDRINT pending_alloc_ip = 0; // caller IP stored for After callbacks
 
 // Depth counter for allocator reentrancy protection (fixes realloc nesting defects)
 // Replaces the faulty boolean in_allocator_hook that could be prematurely cleared
@@ -63,20 +57,6 @@ INT32 allocator_hook_depth = 0;
 
 // Prototype
 VOID insert_analysis_functions(INS ins);
-
-// Helper: round up to next power of 2
-inline UINT64 next_power_of_2(UINT64 n) {
-  if (n <= 1) return 1;
-  UINT64 p = 1;
-  while (p < n) p <<= 1;
-  return p;
-}
-
-// Little-object tracking (< k threshold, not written to malloc.bin)
-UINT64 little_alloc_count = 0;
-UINT64 little_alloc_total = 0;
-UINT64 little_free_count = 0;
-std::unordered_set<ADDRINT> little_tracked;
 
 // Pending malloc event to be embedded into the next instruction's trace record.
 // Set by malloc/free/realloc/mmap/munmap After callbacks, consumed by ResetCurrentInstruction.
@@ -96,12 +76,6 @@ KNOB<UINT64> KnobFastForward(KNOB_MODE_WRITEONCE, "pintool", "s", "0", "How many
 
 KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "0", "How many instructions to trace (0 for unlimited)");
 
-KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "malloc.bin", "specify file name for binary malloc trace output");
-
-KNOB<UINT64> KnobMallocSizeThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "256", "Minimum allocation size to trace to binary (bytes, objects smaller than this go to little_malloc.log)");
-
-KNOB<BOOL> KnobAllocOnly(KNOB_MODE_WRITEONCE, "pintool", "a", "0", "Only generate memory allocation trace, skip instruction trace");
-
 /* ===================================================================== */
 // Utilities
 /* ===================================================================== */
@@ -115,9 +89,6 @@ INT32 Usage()
             << "Specify the output trace file with -o" << std::endl
             << "Specify the number of instructions to skip before tracing with -s" << std::endl
             << "Specify the number of instructions to trace with -t (0 for unlimited)" << std::endl
-            << "Specify the binary malloc trace output file with -m (default: malloc.bin)" << std::endl
-            << "Specify minimum allocation size to trace with -k (default: 64)" << std::endl
-            << "Use -a to only generate memory allocation trace (skip instruction trace)" << std::endl
             << std::endl;
 
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
@@ -171,12 +142,6 @@ void for_ins_in_trace(const TRACE& trace, Func f)
 
 void insert_instrumentation(TRACE trace, void* v)
 {
-  // In allocation-only mode, skip all instruction-level instrumentation.
-  // Malloc hooks (ImageLoad) work independently via PIN's RTN instrumentation.
-  if (KnobAllocOnly.Value()) {
-    return;
-  }
-  
   if (fast_forward_insts_left > 500) {
     TRACE_InsertCall(trace, IPOINT_BEFORE, (AFUNPTR)fast_forward_trace, IARG_UINT32, TRACE_NumIns(trace), IARG_END);
   } else {
@@ -185,44 +150,6 @@ void insert_instrumentation(TRACE trace, void* v)
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
       insert_analysis_functions(ins);
     });
-  }
-}
-
-/* ===================================================================== */
-// Binary malloc trace writing
-/* ===================================================================== */
-
-const char* alloc_type_name(int t) {
-  switch (t) {
-    case 1: return "malloc";
-    case 2: return "free";
-    case 3: return "app_mmap";
-    case 4: return "app_munmap";
-    case 5: return "calloc";
-    case 6: return "realloc";
-    case 7: return "aligned_alloc";
-    case 8: return "posix_memalign";
-    case 9: return "memalign";
-    default: return "unknown";
-  }
-}
-
-void write_malloc_instr(unsigned long long ip, unsigned char type,
-                         unsigned long long arg1, unsigned long long arg2,
-                         unsigned long long ret)
-{
-  if (!trace_limit_reached && malloc_binfile.is_open()) {
-    malloc_instr rec;
-    rec.ip = ip;
-    rec.type = type;
-    rec.arg1 = arg1;
-    rec.arg2 = arg2;
-    rec.ret = ret;
-    for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
-    
-    typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
-    std::memcpy(buf, &rec, sizeof(malloc_instr));
-    malloc_binfile.write(buf, sizeof(malloc_instr));
   }
 }
 
@@ -249,11 +176,6 @@ void ResetCurrentInstruction(VOID* ip)
 
 void WriteCurrentInstruction()
 {
-  if (KnobAllocOnly.Value()) {
-    // In allocation-only mode, skip writing instruction trace
-    return;
-  }
-  
   typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
   std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
   outfile.write(buf, sizeof(trace_instr_format_t));
@@ -280,10 +202,14 @@ void WriteToSet(T* begin, T* end, UINT32 r)
 // instead of a boolean reentrancy lock. This correctly handles nested
 // internal malloc/free/mmap/munmap calls within glibc's realloc, etc.
 // Only the outermost user-level call writes records.
+//
+// Allocation events are embedded in-band into the instruction trace via
+// pending_instr_malloc. Each allocation is paired with the next retiring
+// instruction's trace record.
 // =========================================================================
 
 // --- MALLOC ---
-VOID MallocBefore(ADDRINT size, ADDRINT ip)
+VOID MallocBefore(ADDRINT size)
 {
   if (trace_limit_reached) return;
 
@@ -292,7 +218,6 @@ VOID MallocBefore(ADDRINT size, ADDRINT ip)
 
   pending_alloc_size = size;
   pending_alloc_type = 1; // 1: malloc
-  pending_alloc_ip = ip;
 }
 
 VOID MallocAfter(ADDRINT ret)
@@ -314,52 +239,18 @@ VOID MallocAfter(ADDRINT ret)
 
   if (pending_alloc_type == 6) {
     // realloc: arg1=old_ptr, arg2=new_size, ret=new_ptr (or 0 on failure)
-    UINT64 k = KnobMallocSizeThreshold.Value();
-    if (pending_alloc_size >= k) {
-      // Large realloc: write to malloc.bin and embed in instruction trace
-      write_malloc_instr(pending_alloc_ip, 6, pending_realloc_old_ptr, pending_alloc_size, ret);
+    if (ret != 0) {
       pending_instr_malloc.type = 6;
       pending_instr_malloc.arg1 = pending_realloc_old_ptr;
       pending_instr_malloc.arg2 = pending_alloc_size;
       pending_instr_malloc.ret = ret;
-    } else {
-      // Small realloc: count as little allocation (aligned size)
-      little_alloc_count++;
-      little_alloc_total += next_power_of_2(pending_alloc_size);
-    }
-    if (ret != 0) {
-      tracked_addresses.insert(ret);
-      // Handle old pointer: remove from tracked_addresses or little_tracked
-      if (pending_realloc_old_ptr != 0 && pending_realloc_old_ptr != ret) {
-        auto it_big = tracked_addresses.find(pending_realloc_old_ptr);
-        if (it_big != tracked_addresses.end()) {
-          tracked_addresses.erase(it_big);
-        } else {
-          auto it_little = little_tracked.find(pending_realloc_old_ptr);
-          if (it_little != little_tracked.end()) {
-            little_tracked.erase(it_little);
-            little_free_count++;
-          }
-        }
-      }
     }
   } else if (ret != 0) {
     // malloc/calloc/aligned_alloc: arg1=size, ret=allocated address
-    UINT64 k = KnobMallocSizeThreshold.Value();
-    if (pending_alloc_size >= k) {
-      // Large allocation: write to malloc.bin and embed in instruction trace
-      write_malloc_instr(pending_alloc_ip, (unsigned char)pending_alloc_type, pending_alloc_size, 0, ret);
-      pending_instr_malloc.type = (unsigned char)pending_alloc_type;
-      pending_instr_malloc.arg1 = pending_alloc_size;
-      pending_instr_malloc.arg2 = 0;
-      pending_instr_malloc.ret = ret;
-      tracked_addresses.insert(ret);
-    } else {
-      // Small allocation: count as little (aligned size), track for free matching
-      little_alloc_count++;
-      little_alloc_total += next_power_of_2(pending_alloc_size);
-      little_tracked.insert(ret);
-    }
+    pending_instr_malloc.type = (unsigned char)pending_alloc_type;
+    pending_instr_malloc.arg1 = pending_alloc_size;
+    pending_instr_malloc.arg2 = 0;
+    pending_instr_malloc.ret = ret;
   }
 
   pending_alloc_size = 0;
@@ -368,7 +259,7 @@ VOID MallocAfter(ADDRINT ret)
 }
 
 // --- CALLOC ---
-VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
+VOID CallocBefore(ADDRINT nmemb, ADDRINT size)
 {
   if (trace_limit_reached) return;
 
@@ -378,11 +269,10 @@ VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ip)
   ADDRINT total_size = nmemb * size;
   pending_alloc_size = total_size;
   pending_alloc_type = 5; // 5: calloc
-  pending_alloc_ip = ip;
 }
 
 // --- REALLOC ---
-VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
+VOID ReallocBefore(ADDRINT ptr, ADDRINT size)
 {
   if (trace_limit_reached) return;
 
@@ -391,12 +281,11 @@ VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ip)
 
   pending_alloc_size = size;
   pending_alloc_type = 6; // 6: realloc
-  pending_alloc_ip = ip;
   pending_realloc_old_ptr = ptr; // save old pointer for After callback
 }
 
 // --- ALIGNED_ALLOC ---
-VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
+VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size)
 {
   if (trace_limit_reached) return;
 
@@ -405,11 +294,10 @@ VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
 
   pending_alloc_size = size;
   pending_alloc_type = 7; // 7: aligned_alloc
-  pending_alloc_ip = ip;
 }
 
 // --- FREE ---
-VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
+VOID FreeBefore(ADDRINT ptr)
 {
   if (ptr == 0) {
     if (allocator_hook_depth > 0) { allocator_hook_depth++; }
@@ -419,23 +307,10 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
   if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
   allocator_hook_depth = 1;
 
-  auto it = tracked_addresses.find(ptr);
-  if (it != tracked_addresses.end()) {
-    write_malloc_instr((unsigned long long)ip, 2, (unsigned long long)ptr, 0, 0);
-    pending_instr_malloc.type = 2;
-    pending_instr_malloc.arg1 = (unsigned long long)ptr;
-    pending_instr_malloc.arg2 = 0;
-    pending_instr_malloc.ret = 0;
-    tracked_addresses.erase(it);
-  } else {
-    // Check if this was a little-object allocation
-    auto it_little = little_tracked.find(ptr);
-    if (it_little != little_tracked.end()) {
-      little_tracked.erase(it_little);
-      little_free_count++;
-    }
-  }
-  // Objects not in either set are silently ignored (static memory, etc.)
+  pending_instr_malloc.type = 2;
+  pending_instr_malloc.arg1 = (unsigned long long)ptr;
+  pending_instr_malloc.arg2 = 0;
+  pending_instr_malloc.ret = 0;
 }
 
 VOID FreeAfter()
@@ -446,7 +321,7 @@ VOID FreeAfter()
 }
 
 // --- MEMALIGN ---
-VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
+VOID MemalignBefore(ADDRINT alignment, ADDRINT size)
 {
   if (trace_limit_reached) return;
 
@@ -455,7 +330,6 @@ VOID MemalignBefore(ADDRINT alignment, ADDRINT size, ADDRINT ip)
 
   pending_alloc_size = size;
   pending_alloc_type = 9; // 9: memalign
-  pending_alloc_ip = ip;
 }
 
 VOID MemalignAfter(ADDRINT ret)
@@ -470,19 +344,10 @@ VOID MemalignAfter(ADDRINT ret)
   }
 
   if (ret != 0) {
-    UINT64 k = KnobMallocSizeThreshold.Value();
-    if (pending_alloc_size >= k) {
-      write_malloc_instr(pending_alloc_ip, 9, pending_alloc_size, 0, ret);
-      pending_instr_malloc.type = 9;
-      pending_instr_malloc.arg1 = pending_alloc_size;
-      pending_instr_malloc.arg2 = 0;
-      pending_instr_malloc.ret = ret;
-      tracked_addresses.insert(ret);
-    } else {
-      little_alloc_count++;
-      little_alloc_total += next_power_of_2(pending_alloc_size);
-      little_tracked.insert(ret);
-    }
+    pending_instr_malloc.type = 9;
+    pending_instr_malloc.arg1 = pending_alloc_size;
+    pending_instr_malloc.arg2 = 0;
+    pending_instr_malloc.ret = ret;
   }
 
   pending_alloc_size = 0;
@@ -490,7 +355,7 @@ VOID MemalignAfter(ADDRINT ret)
 }
 
 // --- POSIX_MEMALIGN ---
-VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
+VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size)
 {
   if (trace_limit_reached) return;
 
@@ -500,10 +365,9 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size, ADDRINT ip)
   pending_alloc_size = size;
   pending_alloc_type = 8; // 8: posix_memalign
   pending_alloc_memptr = memptr; // save for After callback
-  pending_alloc_ip = ip;
 }
 
-VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
+VOID PosixMemalignAfter(ADDRINT ret)
 {
   if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
   if (allocator_hook_depth == 0) return;
@@ -519,11 +383,13 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
   // The actual pointer is stored in *memptr
   if (ret == 0 && pending_alloc_memptr != 0) {
     ADDRINT allocated_addr = 0;
-    PIN_SafeCopy(&allocated_addr, (VOID*)pending_alloc_memptr, sizeof(ADDRINT));
+    size_t copied = PIN_SafeCopy(&allocated_addr, (VOID*)pending_alloc_memptr, sizeof(ADDRINT));
 
-    if (allocated_addr != 0) {
-      write_malloc_instr(pending_alloc_ip, 8, pending_alloc_size, 0, allocated_addr);
-      tracked_addresses.insert(allocated_addr);
+    if (copied == sizeof(ADDRINT) && allocated_addr != 0) {
+      pending_instr_malloc.type = 8;
+      pending_instr_malloc.arg1 = pending_alloc_size;
+      pending_instr_malloc.arg2 = 0;
+      pending_instr_malloc.ret = allocated_addr;
     }
   }
 
@@ -533,7 +399,7 @@ VOID PosixMemalignAfter(ADDRINT ret, ADDRINT ip)
 }
 
 // --- MMAP ---
-VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
+VOID MmapBefore(ADDRINT length, ADDRINT flags)
 {
   if (trace_limit_reached) return;
 
@@ -550,7 +416,6 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
 
   pending_alloc_size = length;
   pending_alloc_type = 3; // 3: mmap
-  pending_alloc_ip = ip;
 }
 
 VOID MmapAfter(ADDRINT ret)
@@ -567,8 +432,10 @@ VOID MmapAfter(ADDRINT ret)
   }
 
   if (ret != 0 && ret != (ADDRINT)-1) {
-    write_malloc_instr(pending_alloc_ip, 3, pending_alloc_size, 0, ret);
-    tracked_addresses.insert(ret);
+    pending_instr_malloc.type = 3;
+    pending_instr_malloc.arg1 = pending_alloc_size;
+    pending_instr_malloc.arg2 = 0;
+    pending_instr_malloc.ret = ret;
   }
 
   pending_alloc_size = 0;
@@ -576,7 +443,7 @@ VOID MmapAfter(ADDRINT ret)
 }
 
 // --- MUNMAP ---
-VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
+VOID MunmapBefore(ADDRINT addr, ADDRINT length)
 {
   if (addr == 0 || addr == (ADDRINT)-1) {
     if (allocator_hook_depth > 0) { allocator_hook_depth++; }
@@ -588,11 +455,10 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
   if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
   allocator_hook_depth = 1;
 
-  auto it = tracked_addresses.find(addr);
-  if (it != tracked_addresses.end()) {
-    write_malloc_instr((unsigned long long)ip, 4, (unsigned long long)addr, (unsigned long long)length, 0);
-    tracked_addresses.erase(it);
-  }
+  pending_instr_malloc.type = 4;
+  pending_instr_malloc.arg1 = (unsigned long long)addr;
+  pending_instr_malloc.arg2 = (unsigned long long)length;
+  pending_instr_malloc.ret = 0;
 }
 
 VOID MunmapAfter()
@@ -692,7 +558,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "malloc");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
@@ -701,7 +567,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "calloc");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
@@ -710,7 +576,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "realloc");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
@@ -719,7 +585,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "aligned_alloc");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AlignedAllocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AlignedAllocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
@@ -728,8 +594,8 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "posix_memalign");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
 
@@ -737,7 +603,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "memalign");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
@@ -746,7 +612,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "free");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
     RTN_Close(rtn);
   }
@@ -755,7 +621,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "mmap");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
@@ -764,7 +630,7 @@ VOID ImageLoad(IMG img, VOID* v)
   rtn = RTN_FindByName(img, "munmap");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
     RTN_Close(rtn);
   }
@@ -781,32 +647,7 @@ VOID Fini(INT32 code, VOID* v) {
   if (outfile.is_open()) {
     outfile.close();
   }
-
-  // Write type=0 little-object summary record at END of file
-  // arg1 = count of small allocations (< k)
-  // arg2 = total aligned bytes (sum of next_power_of_2(size))
-  // ret  = count of small frees
-  {
-    malloc_instr rec;
-    rec.ip = 0;
-    rec.type = 0;
-    rec.arg1 = little_alloc_count;
-    rec.arg2 = little_alloc_total;
-    rec.ret = little_free_count;
-    for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
-    typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
-    std::memcpy(buf, &rec, sizeof(malloc_instr));
-    malloc_binfile.write(buf, sizeof(malloc_instr));
-  }
-
-  malloc_binfile.close();
-  std::cout << "[ChampSim Tracer] Binary malloc trace saved." << std::endl;
-  std::cout << "  Large objects (>= " << KnobMallocSizeThreshold.Value() << " B) tracked at exit: "
-            << tracked_addresses.size() << std::endl;
-  std::cout << "  Little objects (< " << KnobMallocSizeThreshold.Value() << " B): "
-            << little_alloc_count << " allocs (aligned total: " << little_alloc_total
-            << " B), " << little_free_count << " frees, "
-            << little_tracked.size() << " still active" << std::endl;
+  std::cout << "[ChampSim Tracer] Trace saved." << std::endl;
 }
 
 /*!
@@ -827,34 +668,10 @@ int main(int argc, char* argv[])
   trace_insts_left = KnobTraceLen.Value();
   fast_forward_insts_left = KnobFastForward.Value();
 
-  // Only open instruction trace file if not in allocation-only mode
-  if (!KnobAllocOnly.Value()) {
-    outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
-    if (!outfile) {
-      std::cout << "Couldn't open output trace file. Exiting." << std::endl;
-      exit(1);
-    }
-  }
-
-  // Open binary malloc trace output
-  malloc_binfile.open(KnobMallocOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
-  if (!malloc_binfile) {
-    std::cout << "Couldn't open binary malloc trace file. Exiting." << std::endl;
+  outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
+  if (!outfile) {
+    std::cout << "Couldn't open output trace file. Exiting." << std::endl;
     exit(1);
-  }
-
-  // Write header record (type=255) at the BEGINNING of the file so analyzers know k-threshold upfront
-  {
-    malloc_instr rec;
-    rec.ip = 0;
-    rec.type = 255;
-    rec.arg1 = KnobMallocSizeThreshold.Value();
-    rec.arg2 = 0;
-    rec.ret = 0;
-    for (int i = 0; i < 7; i++) rec.reserved[i] = 0;
-    typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
-    std::memcpy(buf, &rec, sizeof(malloc_instr));
-    malloc_binfile.write(buf, sizeof(malloc_instr));
   }
 
   TRACE_AddInstrumentFunction(insert_instrumentation, 0);
