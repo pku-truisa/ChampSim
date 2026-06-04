@@ -353,16 +353,24 @@ def main():
     thresholds = stats.get('thresholds', {})
     check(len(thresholds) > 0, f"Threshold data parsed: {len(thresholds)} thresholds")
 
-    # Objects < 8: there should be 0 (all sizes >= 50)
+    # Threshold objects column is now incremental (delta from previous threshold).
+    # Cumulative: <8:0, <16:0, <32:0, <64:1, <128:2, <256:4, <512:8, <1024:9
+    # Incremental: 0,0,0,1,1,2,4,1
     if 8 in thresholds:
         check(thresholds[8]['objects'] == 0,
-              f"Objects < 8 = {thresholds[8]['objects']} (expected 0)")
-
-    # All sizes:  50,100,200,256,300,400,500,800,4096,128
-    # < 128: 50,100 → 2
+              f"Objects (interval) < 8 = {thresholds[8]['objects']} (expected 0)")
     if 128 in thresholds:
-        check(thresholds[128]['objects'] == 2,
-              f"Objects < 128 = {thresholds[128]['objects']} (expected 2)")
+        check(thresholds[128]['objects'] == 1,
+              f"Objects (interval) < 128 = {thresholds[128]['objects']} (expected 1)")
+    if 256 in thresholds:
+        check(thresholds[256]['objects'] == 2,
+              f"Objects (interval) < 256 = {thresholds[256]['objects']} (expected 2)")
+    if 512 in thresholds:
+        check(thresholds[512]['objects'] == 4,
+              f"Objects (interval) < 512 = {thresholds[512]['objects']} (expected 4)")
+    if 1024 in thresholds:
+        check(thresholds[1024]['objects'] == 1,
+              f"Objects (interval) < 1024 = {thresholds[1024]['objects']} (expected 1)")
 
     # --- New tests for object_tracer.cpp fixes ---
 
