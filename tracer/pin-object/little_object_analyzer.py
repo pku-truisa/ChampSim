@@ -160,7 +160,18 @@ def process_malloc_binary(filename):
         print(f"Total Alloc calls: {total_alloc}")
         print(f"Total Free calls:  {total_dealloc}")
         print(f"Active objects remaining in memory: {len(active_heap)}")
-        
+
+        print("\n--- Breakdown by Type ---")
+        breakdown_order = [('malloc', 1), ('calloc', 5), ('realloc', 6), ('realloc_inplace', 16),
+                           ('posix_memalign', 8), ('fortran_alloc', 10), ('mmap', 3),
+                           ('free', 2), ('munmap', 4)]
+        print(f"{'Type':<18} {'Code':>4}  {'Count':>14}")
+        print("-" * 38)
+        for name, code in breakdown_order:
+            count = func_stats.get(name, 0)
+            if count > 0 or name in ('malloc','free','mmap','munmap'):
+                print(f"{name:<18} {code:>4}  {count:>14,}")
+
         print("\n=== Peak Memory Usage Summary ===")
         print(f"Original Physical Peak: {format_size(original_peak_size)}")
         print("\n Threshold   Aligned Increase     Increase %   Objects < Thresh")

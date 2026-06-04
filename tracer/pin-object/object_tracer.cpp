@@ -265,12 +265,13 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
   // alloc_depth is already >0 and FreeBefore only bumps it.
   if (ts->alloc_depth > 0) { ts->alloc_depth++; return; }
 
-  auto it = tracked_addresses.find(ptr);
-  if (it == tracked_addresses.end()) return;
-
   ts->alloc_depth = 1;
   write_malloc_instr((unsigned long long)ip, 2, (unsigned long long)ptr, 0, 0);
-  tracked_addresses.erase(it);
+
+  auto it = tracked_addresses.find(ptr);
+  if (it != tracked_addresses.end()) {
+    tracked_addresses.erase(it);
+  }
 }
 
 VOID FreeAfter()
@@ -286,6 +287,11 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
 {
   ThreadState* ts = get_tls();
   if (ts->mmap_depth > 0) { ts->mmap_depth++; return; }
+
+  // Ignore mmap calls originating outside the user binary (e.g., Pin's own JIT code cache)
+  if (g_user_low != 0 && !(ip >= g_user_low && ip < g_user_high)) {
+    return;
+  }
 
   ts->mmap_depth = 1;
 
@@ -323,13 +329,19 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
   if (addr == 0 || addr == (ADDRINT)-1) return;
   if (ts->mmap_depth > 0) { ts->mmap_depth++; return; }
 
+  // Ignore munmap calls originating outside the user binary
+  if (g_user_low != 0 && !(ip >= g_user_low && ip < g_user_high)) {
+    return;
+  }
+
   ts->mmap_depth = 1;
   ts->mmap_pending_type = 4;
   ts->mmap_pending_ip = ip;
 
+  write_malloc_instr((unsigned long long)ip, 4, (unsigned long long)addr, (unsigned long long)length, 0);
+
   auto it = tracked_addresses.find(addr);
   if (it != tracked_addresses.end()) {
-    write_malloc_instr((unsigned long long)ip, 4, (unsigned long long)addr, (unsigned long long)length, 0);
     tracked_addresses.erase(it);
   }
 }
