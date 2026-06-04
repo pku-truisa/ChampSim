@@ -106,7 +106,7 @@ def process_malloc_binary(filename):
                 
             if ret != 0:
                 # 发生 realloc 覆盖时，前置清理旧指针占用的内存
-                if etype == 6 and arg1 != 0 and arg1 in active_heap:
+                if etype in (6, 16) and arg1 != 0 and arg1 in active_heap:
                     old_sz, _ = active_heap.pop(arg1)
                     original_current_size -= old_sz
                     for t in thresholds:

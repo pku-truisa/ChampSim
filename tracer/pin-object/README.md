@@ -2,7 +2,9 @@
 
 The included PIN tool `object_tracer.cpp` records all memory allocation and deallocation events to a binary trace file (`malloc.bin`). It does **not** generate any instruction-level trace — it focuses solely on heap and anonymous mmap activity.
 
-It has been tested (April 2022) using PIN 3.22.
+It has been tested with PIN 3.22 through PIN 3.31.
+
+See [test/README.md](test/README.md) for the test suite documentation.
 
 ## Download and install PIN
 
@@ -43,17 +45,19 @@ The default is malloc.bin.
 
 The tracer hooks the following functions in all loaded shared libraries:
 
-| Function          | Type | Description                              |
-|-------------------|------|------------------------------------------|
-| `malloc`          | 1    | Standard memory allocation               |
-| `free`            | 2    | Memory deallocation                      |
-| `mmap`            | 3    | Anonymous memory mapping                 |
-| `munmap`          | 4    | Unmap memory region                      |
-| `calloc`          | 5    | Allocate and zero-initialize array       |
-| `realloc`         | 6    | Reallocate memory block                  |
-| `aligned_alloc`   | 7    | Aligned memory allocation (C11)          |
-| `posix_memalign`  | 8    | POSIX aligned allocation                 |
-| `memalign`        | 9    | Traditional aligned allocation           |
+| Function                 | Type | Description                              |
+|--------------------------|------|------------------------------------------|
+| `malloc`                 | 1    | Standard memory allocation               |
+| `free`                   | 2    | Memory deallocation                      |
+| `mmap`                   | 3    | Anonymous memory mapping                 |
+| `munmap`                 | 4    | Unmap memory region                      |
+| `calloc`                 | 5    | Allocate and zero-initialize array       |
+| `realloc` (搬迁)          | 6    | Reallocate to a new address              |
+| `posix_memalign`         | 8    | POSIX aligned allocation                 |
+| `fortran_alloc`          | 10   | Fortran ALLOCATE (gfortran)              |
+| `realloc` (原地)          | 16   | Realloc expanding/shrinking in-place     |
+
+> **Note:** `aligned_alloc` (C11), `memalign`, and `valloc` in glibc are thin wrappers that internally call `malloc` or `mmap`.  The tracer captures them correctly through the standard `malloc`/`mmap` hooks as **type=1** or **type=3**, rather than instrumenting them directly (to avoid tail-call deadlocks).  Similarly, C++ `operator new`/`operator new[]` and `operator delete`/`operator delete[]` are tracked through `_Znwm`/`_Znam` and `_ZdlPv`/`_ZdaPv` hooks, mapped to type=1 and type=2 respectively.
 
 All events are recorded to a single binary file. Free/munmap events are only recorded for addresses that were previously tracked from an allocation/mmap call.
 
@@ -72,15 +76,21 @@ struct malloc_instr {
 };  // total: 40 bytes
 ```
 
-For **allocation** events (types 1, 3, 5, 6, 7, 8, 9):
-- `arg1`: size (or old pointer for realloc)
-- `arg2`: additional argument (new size for realloc; 0 otherwise)
-- `ret`:  allocated address (0 on failure)
+### Field semantics by event type
 
-For **deallocation** events (types 2, 4):
-- `arg1`: pointer/address to free/unmap
-- `arg2`: length (for munmap only; 0 for free)
-- `ret`:  0
+| Type | Event               | `arg1`                    | `arg2`                    | `ret`               |
+|------|---------------------|---------------------------|---------------------------|---------------------|
+| 1    | malloc              | size                      | 0                         | allocated address   |
+| 2    | free                | pointer to free           | 0                         | 0                   |
+| 3    | mmap                | length                    | 0                         | mapped address      |
+| 4    | munmap              | address to unmap          | length                    | 0                   |
+| 5    | calloc              | nmemb × size              | 0                         | allocated address   |
+| 6    | realloc (搬迁)       | old pointer               | new size                  | new address         |
+| 8    | posix_memalign      | size                      | alignment                 | aligned address     |
+| 10   | fortran_alloc       | size                      | 0                         | allocated address   |
+| 16   | realloc (原地)       | old pointer (= ret)       | new size                  | old address (same)  |
+
+> **realloc 类型区分:** 当 `realloc` 返回的地址与旧指针不同时为 **type=6**（搬迁），相同时为 **type=16**（原地扩展/缩减）。两者均使用 `arg2` 存储新大小。
 
 ## Analyzing Memory Allocation Traces
 
@@ -109,12 +119,36 @@ python3 little_object_analyzer.py -i malloc.bin
 | `*.result.log`     | Full analysis report (console output mirror)          |
 | `*.ips.log`        | Per-call-site (IP) allocation summary (CSV format)    |
 
+## Testing
+
+The `test/` directory contains comprehensive test suites. See [test/README.md](test/README.md) for details.
+
+### Quick synthetic test (no PIN required)
+
+```bash
+python3 test/test_analyzer_synthetic.py
+```
+
+### End-to-end tests (PIN required)
+
+```bash
+# Build test programs
+cd test
+g++ -o test_malloc test_malloc.cpp
+g++ -o test_analyzer test_analyzer.cpp
+gfortran -o test_fortran test_fortran.f90
+cd ..
+
+# Run each test
+pin -t obj-intel64/object_tracer.so -m test/malloc.bin -- test/test_malloc
+python3 little_object_analyzer.py -i test/malloc.bin
+```
+
 ## Differences from champsim_tracer
 
 `object_tracer` is a stripped-down, standalone version of the `-a` (alloc-only) mode from `champsim_tracer.cpp`:
 
 - **No instruction trace** — no `-o`, `-s`, `-t` options
 - **No size threshold (`-k`)** — all allocation events are recorded without filtering
-- **No little-object tracking** — no separate summary for small allocations
 - **No header/tail records** — the binary file consists purely of allocation/deallocation events
 - **Self-contained** — the `malloc_instr` struct is defined directly in the source, no dependency on `inc/trace_instruction.h`
