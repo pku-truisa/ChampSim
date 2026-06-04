@@ -32,4 +32,12 @@ compile_commands.json
 
 .vscode/
 **/.DS_Store
-tracer/pin-object/obj-intel64/object_tracer.so
+
+tracer/pin-object/test/test_analyzer
+tracer/pin-object/test/test_fortran
+tracer/pin-object/test/test_malloc
+
+*.log
+.gitignore
+
+malloc_bin

@@ -40,7 +40,8 @@ def format_size(size):
 TYPE_MAP = {
     1: 'malloc', 2: 'free', 3: 'mmap', 4: 'munmap',
     5: 'calloc', 6: 'realloc', 7: 'aligned_alloc',
-    8: 'posix_memalign', 9: 'memalign'
+    8: 'posix_memalign', 9: 'memalign', 10: 'fortran_alloc',
+    11: 'valloc', 12: '__libc_memalign', 16: 'realloc_inplace'
 }
 
 def read_malloc_binary(filename):
@@ -98,10 +99,10 @@ def process_malloc_binary(filename):
     for ip, etype, arg1, arg2, ret in record_gen:
         func_name = TYPE_MAP.get(etype, 'unknown')
         
-        if etype in (1, 3, 5, 6, 7, 8, 9):  # 分配类行为
+        if etype in (1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 16):  # 分配类行为
             func_stats[func_name] += 1
             
-            size = arg2 if etype == 6 else arg1 # realloc 尺寸在 arg2
+            size = arg2 if etype in (6, 16) else arg1 # realloc/realloc_inplace: size in arg2
                 
             if ret != 0:
                 # 发生 realloc 覆盖时，前置清理旧指针占用的内存
@@ -151,7 +152,7 @@ def process_malloc_binary(filename):
     with open(base_name + ".result.log", "w") as log_out:
         sys.stdout = Tee(sys.stdout, log_out)
         
-        alloc_types = ['malloc', 'calloc', 'realloc', 'mmap', 'aligned_alloc', 'posix_memalign', 'memalign']
+        alloc_types = ['malloc', 'calloc', 'realloc', 'mmap', 'aligned_alloc', 'posix_memalign', 'memalign', 'fortran_alloc', 'valloc', '__libc_memalign', 'realloc_inplace']
         free_types = ['free', 'munmap']
         total_alloc = sum(func_stats[t] for t in alloc_types)
         total_dealloc = sum(func_stats[t] for t in free_types)
