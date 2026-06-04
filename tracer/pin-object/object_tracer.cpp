@@ -15,21 +15,21 @@
  */
 
 /*! @file
- * Advanced Object Tracer v4 — stack-based pending, no depth counters.
+ * Advanced Object Tracer v5 — depth counter with saturation, thread-safe.
  *
  * Design notes:
- *  - Each callback family uses a fixed-size ring stack: BEFORE pushes args,
- *    AFTER pops and writes.  No paired-depth tracking needed.
- *  - If Pin drops an AFTER callback (tail-call, JIT edge), at most one
- *    stack slot is leaked; subsequent pairs continue to work correctly.
- *  - free/munmap write immediately (they don't depend on AFTER).
- *  - aligned_alloc(3), memalign(3), and valloc(3) in glibc are thin wrappers
- *    that internally call malloc/mmap.  Our standard malloc/mmap hooks
- *    already capture these with correct sizes and addresses.  We do NOT
- *    explicitly instrument these symbols to avoid tail-call deadlocks.
- *  - posix_memalign(3) returns int status (not void*), and writes the
- *    real aligned address to *memptr.  We hook it specially with
- *    PIN_SafeCopy to extract the true address.
+ *  - Only the outermost caller (depth==0→1) records.  Inner nesting
+ *    (depth 2..MAX_DEPTH) is silently counted and filtered in the AFTER
+ *    callback.  Beyond MAX_DEPTH, the counter saturates to prevent
+ *    permanent lock-up from lost AFTER callbacks.
+ *  - PIN_LOCK protects tracked_addresses and malloc_binfile writes
+ *    from OpenMP races.
+ *  - free/munmap are only recorded when the pointer exists in
+ *    tracked_addresses, suppressing glibc-internal free noise.
+ *  - aligned_alloc(3), memalign(3), and valloc(3) are thin wrappers
+ *    that internally call malloc/mmap — NOT instrumented.
+ *  - posix_memalign(3) returns int status and writes the real address
+ *    to *memptr; hooked specially with PIN_SafeCopy.
  */
 
 #include <fstream>
@@ -60,30 +60,40 @@ static_assert(sizeof(malloc_instr) == 32, "malloc_instr must be exactly 32 bytes
 #endif
 
 /* ===================================================================== */
-// Global state & Thread-local status
+// Global state
 /* ===================================================================== */
 std::ofstream malloc_binfile;
 std::unordered_set<ADDRINT> tracked_addresses;
+static PIN_LOCK malloc_lock;
 
-// Single pending slot held between BEFORE and AFTER.
+// Maximum nesting depth before saturation.
+// After saturating, further nested BEFORE callbacks are silently ignored
+// and the matching AFTER callbacks decrement the overflow counter.
+// This prevents permanent lock-up when AFTER callbacks are lost.
+constexpr int MAX_DEPTH = 16;
+
+// Staged parameters held between outermost BEFORE and AFTER.
 struct PendingAlloc {
-  ADDRINT size       = 0;   // arg1 (size or old_ptr for realloc)
-  ADDRINT arg2       = 0;   // arg2 (alignment or new_size for realloc)
-  int     type       = 0;   // allocation type code
-  ADDRINT posix_memptr = 0; // memptr for posix_memalign
+  ADDRINT size          = 0;
+  ADDRINT arg2          = 0;   // alignment (posix_memalign) or new_size (realloc)
+  int     type          = 0;
+  ADDRINT posix_memptr  = 0;
 };
-
-// Fixed-size stack so that nested BEFORE/AFTER pairs don't lose outer frames.
-constexpr int ALLOC_STACK_SIZE = 16;
-constexpr int MMAP_STACK_SIZE  = 8;
 
 struct ThreadState {
-  PendingAlloc alloc_stack[ALLOC_STACK_SIZE];
-  int          alloc_sp = 0;       // next write index; 0 = empty
+  PendingAlloc pending;
+  int alloc_depth         = 0;  // 0 = idle, 1 = outermost, 2..MAX_DEPTH = nested
+  int alloc_overflow      = 0;  // counts lost AFTER frames beyond MAX_DEPTH
+  int alloc_stuck_counter = 0;  // auto-reset when depth stays non-zero too long
 
-  PendingAlloc mmap_stack[MMAP_STACK_SIZE];
-  int          mmap_sp = 0;
+  // mmap has its own independent depth tracking
+  ADDRINT mmap_pending_size  = 0;
+  int     mmap_depth         = 0;
+  int     mmap_overflow      = 0;
+  int     mmap_stuck_counter = 0;
 };
+
+constexpr int MAX_STUCK = 2;  // auto-reset threshold: force-reset after 2 stuck BEFORE calls
 
 static TLS_KEY tls_key;
 
@@ -109,15 +119,15 @@ KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "mal
 /* ===================================================================== */
 INT32 Usage()
 {
-  std::cerr << "Object Tracer v4 — records malloc/free/mmap/munmap/posix_memalign/Fortran" << std::endl
-            << "Usage: pin -t object_tracer_gemini.so -m malloc.bin -- <program>" << std::endl;
+  std::cerr << "Object Tracer v5 — depth counter with saturation, thread-safe" << std::endl
+            << "Usage: pin -t object_tracer.so -m malloc.bin -- <program>" << std::endl;
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
   return -1;
 }
 
-void write_malloc_instr(unsigned char type,
-                        unsigned long long arg1, unsigned long long arg2,
-                        unsigned long long ret)
+void write_malloc_instr_locked(unsigned char type,
+                               unsigned long long arg1, unsigned long long arg2,
+                               unsigned long long ret)
 {
   if (malloc_binfile.is_open()) {
     malloc_instr rec;
@@ -130,170 +140,213 @@ void write_malloc_instr(unsigned char type,
 }
 
 /* ===================================================================== */
-// Callback implementations — stack-based, no depth counters
+// Callback implementations — depth counter with saturation, thread-safe
 /* ===================================================================== */
+
+// --- Helper: outermost BEFORE for depth-protected alloc family ---
+static bool depth_outermost_before(ThreadState* ts, int alloc_type,
+                                   ADDRINT size, ADDRINT arg2 = 0)
+{
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) {
+      ts->alloc_depth++;      // nested — count but don't stage
+    } else {
+      ts->alloc_overflow++;   // push overflow to keep AFTER pairing
+    }
+    return false;             // not outermost
+  }
+  // Outermost: stage parameters
+  ts->alloc_depth = 1;
+  ts->pending = PendingAlloc{size, arg2, alloc_type, 0};
+  return true;
+}
+
+// --- Stuck-depth auto-reset ---
+static void try_auto_reset_depth(ThreadState* ts)
+{
+  if (ts->alloc_depth == 0) {
+    ts->alloc_stuck_counter = 0;
+    return;
+  }
+  ts->alloc_stuck_counter++;
+  if (ts->alloc_stuck_counter >= MAX_STUCK) {
+    // Depth permanently stuck (glibc init loss) — force reset
+    ts->alloc_depth = 0;
+    ts->alloc_overflow = 0;
+    ts->alloc_stuck_counter = 0;
+  }
+}
 
 // --- MALLOC / C++ new (type=1) ---
 VOID AllocBefore(ADDRINT size)
 {
   ThreadState* ts = get_tls();
-  auto& slot = ts->alloc_stack[ts->alloc_sp % ALLOC_STACK_SIZE];
-  slot.size       = size;
-  slot.arg2       = 0;
-  slot.type       = 1;
-  slot.posix_memptr = 0;
-  ts->alloc_sp++;
+  try_auto_reset_depth(ts);
+  depth_outermost_before(ts, 1, size);
 }
 
 // --- CALLOC (type=5) ---
 VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size)
 {
   ThreadState* ts = get_tls();
-  auto& slot = ts->alloc_stack[ts->alloc_sp % ALLOC_STACK_SIZE];
-  slot.size       = nmemb * elem_size;
-  slot.arg2       = 0;
-  slot.type       = 5;
-  slot.posix_memptr = 0;
-  ts->alloc_sp++;
+  try_auto_reset_depth(ts);
+  depth_outermost_before(ts, 5, nmemb * elem_size);
 }
 
 // --- REALLOC (type=6 or 16) ---
 VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size)
 {
   ThreadState* ts = get_tls();
-  auto& slot = ts->alloc_stack[ts->alloc_sp % ALLOC_STACK_SIZE];
-  slot.size       = old_ptr;    // arg1 = old_ptr for realloc
-  slot.arg2       = new_size;   // arg2 = new_size for realloc
-  slot.type       = 6;
-  slot.posix_memptr = 0;
-  ts->alloc_sp++;
+  try_auto_reset_depth(ts);
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
+    else ts->alloc_overflow++;
+    return;
+  }
+  ts->alloc_depth = 1;
+  ts->pending = PendingAlloc{old_ptr, new_size, 6, 0};
 }
 
 // --- FORTRAN alloc (type=10) ---
 VOID FortranAllocBefore(ADDRINT size)
 {
   ThreadState* ts = get_tls();
-  auto& slot = ts->alloc_stack[ts->alloc_sp % ALLOC_STACK_SIZE];
-  slot.size       = size;
-  slot.arg2       = 0;
-  slot.type       = 10;
-  slot.posix_memptr = 0;
-  ts->alloc_sp++;
+  try_auto_reset_depth(ts);
+  depth_outermost_before(ts, 10, size);
 }
 
-// --- UNIFIED AFTER (malloc / calloc / realloc / Fortran / C++ new) ---
-// Pops the top stack frame and writes a record.  If sp==0 (no BEFORE matched),
-// it's a no-op — harmless.
+// --- UNIFIED AFTER (all alloc families) ---
 VOID AllocAfter(ADDRINT ret)
 {
   ThreadState* ts = get_tls();
-  if (ts->alloc_sp == 0) return;
+  if (ts->alloc_overflow > 0) { ts->alloc_overflow--; return; }
+  if (ts->alloc_depth == 0) return;
+  if (ts->alloc_depth > 1) { ts->alloc_depth--; return; }
 
-  ts->alloc_sp--;
-  const auto& slot = ts->alloc_stack[ts->alloc_sp % ALLOC_STACK_SIZE];
+  // depth == 1: outermost — write record
+  ts->alloc_depth = 0;
 
-  if (slot.type == 6) {
-    // realloc: arg1=old_ptr, arg2=new_size
-    ADDRINT old_ptr  = slot.size;
-    ADDRINT new_size = slot.arg2;
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+
+  if (ts->pending.type == 6) {
+    ADDRINT old_ptr  = ts->pending.size;   // staged in size slot
+    ADDRINT new_size = ts->pending.arg2;
     unsigned char final_type = 6;
     if (ret == old_ptr && ret != 0) final_type = 16;
-    write_malloc_instr(final_type, old_ptr, new_size, ret);
+    write_malloc_instr_locked(final_type, old_ptr, new_size, ret);
     if (old_ptr != 0) tracked_addresses.erase(old_ptr);
     if (ret != 0 && ret != (ADDRINT)-1) tracked_addresses.insert(ret);
   } else {
     if (ret != 0 && ret != (ADDRINT)-1) {
-      write_malloc_instr((unsigned char)slot.type, slot.size, 0, ret);
+      write_malloc_instr_locked((unsigned char)ts->pending.type,
+                                ts->pending.size, ts->pending.arg2, ret);
       tracked_addresses.insert(ret);
     }
   }
+
+  PIN_ReleaseLock(&malloc_lock);
 }
 
-// --- POSIX_MEMALIGN (type=8) ---
+// --- POSIX_MEMALIGN (type=8) — uses depth counter, but BEFORE always stages ---
 VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size)
 {
   ThreadState* ts = get_tls();
-  auto& slot = ts->alloc_stack[ts->alloc_sp % ALLOC_STACK_SIZE];
-  slot.size       = size;
-  slot.arg2       = alignment;
-  slot.type       = 8;
-  slot.posix_memptr = memptr;
-  ts->alloc_sp++;
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
+    else ts->alloc_overflow++;
+    return;
+  }
+  ts->alloc_depth = 1;
+  ts->pending = PendingAlloc{size, alignment, 8, memptr};
 }
 
 VOID PosixMemalignAfter(ADDRINT status)
 {
   ThreadState* ts = get_tls();
-  if (ts->alloc_sp == 0) return;
+  if (ts->alloc_overflow > 0) { ts->alloc_overflow--; return; }
+  if (ts->alloc_depth == 0) return;
+  if (ts->alloc_depth > 1) { ts->alloc_depth--; return; }
 
-  ts->alloc_sp--;
-  const auto& slot = ts->alloc_stack[ts->alloc_sp % ALLOC_STACK_SIZE];
+  ts->alloc_depth = 0;
 
-  if (status == 0 && slot.posix_memptr != 0) {
+  if (status == 0 && ts->pending.posix_memptr != 0) {
     ADDRINT real_addr = 0;
-    PIN_SafeCopy(&real_addr, (void*)slot.posix_memptr, sizeof(ADDRINT));
+    PIN_SafeCopy(&real_addr, (void*)ts->pending.posix_memptr, sizeof(ADDRINT));
     if (real_addr != 0 && real_addr != (ADDRINT)-1) {
-      write_malloc_instr(8, slot.size, slot.arg2, real_addr);
+      PIN_GetLock(&malloc_lock, PIN_ThreadId());
+      write_malloc_instr_locked(8, ts->pending.size, ts->pending.arg2, real_addr);
       tracked_addresses.insert(real_addr);
+      PIN_ReleaseLock(&malloc_lock);
     }
   }
 }
 
-// --- FREE (type=2) — unconditional write, no stack needed ---
+// --- FREE (type=2) — only write if tracked (suppresses glibc-internal free) ---
 VOID FreeBefore(ADDRINT ptr)
 {
   if (ptr == 0) return;
-  write_malloc_instr(2, (unsigned long long)ptr, 0, 0);
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
   auto it = tracked_addresses.find(ptr);
   if (it != tracked_addresses.end()) {
+    write_malloc_instr_locked(2, (unsigned long long)ptr, 0, 0);
     tracked_addresses.erase(it);
   }
+  PIN_ReleaseLock(&malloc_lock);
 }
 
-// FreeAfter is a no-op in the stack model.
-VOID FreeAfter() { /* nothing to do */ }
+VOID FreeAfter() { /* no-op */ }
 
-// --- MMAP (independent stack) ---
+// --- MMAP (independent depth + saturation) ---
 VOID MmapBefore(ADDRINT length, ADDRINT flags)
 {
   if (!(flags & MAP_ANONYMOUS)) return;
 
   ThreadState* ts = get_tls();
-  auto& slot = ts->mmap_stack[ts->mmap_sp % MMAP_STACK_SIZE];
-  slot.size       = length;
-  slot.arg2       = 0;
-  slot.type       = 3;
-  slot.posix_memptr = 0;
-  ts->mmap_sp++;
+  if (ts->mmap_depth > 0) {
+    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
+    else ts->mmap_overflow++;
+    return;
+  }
+  ts->mmap_depth = 1;
+  ts->mmap_pending_size = length;
 }
 
 VOID MmapAfter(ADDRINT ret)
 {
   ThreadState* ts = get_tls();
-  if (ts->mmap_sp == 0) return;
+  if (ts->mmap_overflow > 0) { ts->mmap_overflow--; return; }
+  if (ts->mmap_depth == 0) return;
+  if (ts->mmap_depth > 1) { ts->mmap_depth--; return; }
 
-  ts->mmap_sp--;
-  const auto& slot = ts->mmap_stack[ts->mmap_sp % MMAP_STACK_SIZE];
+  ts->mmap_depth = 0;
 
   if (ret != 0 && ret != (ADDRINT)-1) {
-    write_malloc_instr(3, slot.size, 0, ret);
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    write_malloc_instr_locked(3, ts->mmap_pending_size, 0, ret);
     tracked_addresses.insert(ret);
+    PIN_ReleaseLock(&malloc_lock);
   }
 }
 
-// --- MUNMAP (type=4) — unconditional write ---
+// --- MUNMAP (type=4) — only write if tracked ---
 VOID MunmapBefore(ADDRINT addr, ADDRINT length)
 {
   if (addr == 0 || addr == (ADDRINT)-1) return;
-  write_malloc_instr(4, (unsigned long long)addr, (unsigned long long)length, 0);
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
   auto it = tracked_addresses.find(addr);
   if (it != tracked_addresses.end()) {
+    write_malloc_instr_locked(4, (unsigned long long)addr, (unsigned long long)length, 0);
     tracked_addresses.erase(it);
   }
+  PIN_ReleaseLock(&malloc_lock);
 }
 
-// MunmapAfter is a no-op.
-VOID MunmapAfter() { /* nothing to do */ }
+VOID MunmapAfter() { /* no-op */ }
+
+// Forward declaration — used in ImageLoad's main() hook
+VOID ResetDepthOnMain();
 
 /* ===================================================================== */
 // ImageLoad
@@ -318,9 +371,9 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
-  // --- malloc-like (type=1): malloc, __libc_malloc, C++ new, jemalloc ---
+  // --- malloc-like (type=1) ---
   const std::vector<std::string> mallocSyms = {
-    "malloc", "__libc_malloc",
+    "malloc",
     "mi_malloc", "je_malloc", "tc_malloc",
     "_Znwm", "_Znam"
   };
@@ -329,8 +382,7 @@ VOID ImageLoad(IMG img, VOID* v)
     if (!RTN_Valid(rtn)) continue;
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -338,7 +390,7 @@ VOID ImageLoad(IMG img, VOID* v)
 
   // --- calloc (type=5) ---
   const std::vector<std::string> callocSyms = {
-    "calloc", "__libc_calloc",
+    "calloc",
     "mi_calloc", "je_calloc", "tc_calloc"
   };
   for (const auto& sym : callocSyms) {
@@ -347,8 +399,7 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -356,7 +407,7 @@ VOID ImageLoad(IMG img, VOID* v)
 
   // --- realloc (type=6) ---
   const std::vector<std::string> reallocSyms = {
-    "realloc", "__libc_realloc",
+    "realloc",
     "mi_realloc", "je_realloc", "tc_realloc"
   };
   for (const auto& sym : reallocSyms) {
@@ -365,8 +416,7 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -376,15 +426,16 @@ VOID ImageLoad(IMG img, VOID* v)
   const std::vector<std::string> fortranAllocSyms = {
     "for_alloc_allocatable", "for_allocate", "CFI_allocate",
     "_gfortran_internal_malloc",
-    "_gfortran_allocate", "_gfortran_allocate_array"
+    "_gfortran_allocate", "_gfortran_allocate_array",
+    "f90_alloc", "f90_alloc04",
+    "_f90_malloc", "pgf90_alloc"
   };
   for (const auto& sym : fortranAllocSyms) {
     rtn = RTN_FindByName(img, sym.c_str());
     if (!RTN_Valid(rtn)) continue;
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FortranAllocBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -392,10 +443,11 @@ VOID ImageLoad(IMG img, VOID* v)
 
   // --- Free ---
   const std::vector<std::string> freeSyms = {
-    "free", "__libc_free",
+    "free",
     "mi_free", "je_free", "tc_free",
     "for_deallocate", "_gfortran_internal_free", "CFI_deallocate",
     "_gfortran_deallocate",
+    "f90_free", "_f90_free",
     "_ZdlPv", "_ZdaPv"
   };
   for (const auto& sym : freeSyms) {
@@ -421,6 +473,16 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
+  // --- Reset depth at entry points (glibc init may have leaked depth) ---
+  for (const char* entry : {"main", "MAIN__", "main_"}) {
+    rtn = RTN_FindByName(img, entry);
+    if (RTN_Valid(rtn)) {
+      RTN_Open(rtn);
+      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ResetDepthOnMain, IARG_END);
+      RTN_Close(rtn);
+    }
+  }
+
   // --- munmap ---
   rtn = RTN_FindByName(img, "munmap");
   if (RTN_Valid(rtn)) {
@@ -433,14 +495,24 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
-  std::cout << "[Object Tracer v4] Instrumented: " << IMG_Name(img) << std::endl;
+  std::cout << "[Object Tracer v5] Instrumented: " << IMG_Name(img) << std::endl;
+}
+
+// --- Reset depth counters at program entry (after glibc init) ---
+VOID ResetDepthOnMain()
+{
+  ThreadState* ts = get_tls();
+  ts->alloc_depth = 0;
+  ts->alloc_overflow = 0;
+  ts->mmap_depth = 0;
+  ts->mmap_overflow = 0;
 }
 
 /* ===================================================================== */
 VOID Fini(INT32 code, VOID* v)
 {
   malloc_binfile.close();
-  std::cout << "[Object Tracer v4] Trace saved. Active: " << tracked_addresses.size() << std::endl;
+  std::cout << "[Object Tracer v5] Trace saved. Active: " << tracked_addresses.size() << std::endl;
 }
 
 int main(int argc, char* argv[])
@@ -449,6 +521,7 @@ int main(int argc, char* argv[])
   if (PIN_Init(argc, argv))
     return Usage();
 
+  PIN_InitLock(&malloc_lock);
   tls_key = PIN_CreateThreadDataKey(ThreadCleanup);
 
   malloc_binfile.open(KnobMallocOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
