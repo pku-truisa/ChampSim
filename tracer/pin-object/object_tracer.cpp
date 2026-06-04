@@ -36,15 +36,13 @@
 #include <algorithm>
 #include <unordered_set>
 #include <vector>
-#include <string>
 
 #include "pin.H"
 
 /* ===================================================================== */
-// Binary malloc trace record (40 bytes)
+// Binary malloc trace record (32 bytes)
 /* ===================================================================== */
 struct malloc_instr {
-  unsigned long long ip;       // caller's return address
   unsigned long long arg1;     // parameter 1 (Size or Ptr)
   unsigned long long arg2;     // parameter 2 (Alignment or extra)
   unsigned long long ret;      // return value (Allocated Addr)
@@ -53,7 +51,7 @@ struct malloc_instr {
                                // 10=fortran_alloc, 16=realloc_inplace
   unsigned char reserved[7];
 };
-static_assert(sizeof(malloc_instr) == 40, "malloc_instr must be exactly 40 bytes");
+static_assert(sizeof(malloc_instr) == 32, "malloc_instr must be exactly 32 bytes");
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS 0x20
@@ -72,25 +70,16 @@ struct ThreadState {
   ADDRINT pending_alloc_alignment = 0;
   ADDRINT pending_posix_memptr = 0;
   int     pending_alloc_type = 0;
-  ADDRINT pending_alloc_ip = 0;
   INT32   alloc_depth = 0;
 
   // mmap/munmap path (independent, avoids overwriting malloc pending state)
   ADDRINT mmap_pending_size = 0;
   ADDRINT mmap_pending_length = 0;   // for munmap
   int     mmap_pending_type = 0;     // 3=mmap, 4=munmap
-  ADDRINT mmap_pending_ip = 0;
   INT32   mmap_depth = 0;
 };
 
 static TLS_KEY tls_key;
-
-// Cached address range of the main executable (set once at ImageLoad time).
-// Used to detect stale alloc_depth from runtime initialization:
-// if alloc_depth > 0 but the current IP is in the user binary,
-// the depth was corrupted by leaked runtime init calls — force-reset.
-static ADDRINT g_user_low = 0;
-static ADDRINT g_user_high = 0;
 
 static void ThreadCleanup(void* p) { delete static_cast<ThreadState*>(p); }
 
@@ -120,13 +109,13 @@ INT32 Usage()
   return -1;
 }
 
-void write_malloc_instr(unsigned long long ip, unsigned char type,
+void write_malloc_instr(unsigned char type,
                         unsigned long long arg1, unsigned long long arg2,
                         unsigned long long ret)
 {
   if (malloc_binfile.is_open()) {
     malloc_instr rec;
-    rec.ip = ip; rec.type = type; rec.arg1 = arg1; rec.arg2 = arg2; rec.ret = ret;
+    rec.type = type; rec.arg1 = arg1; rec.arg2 = arg2; rec.ret = ret;
     std::memset(rec.reserved, 0, sizeof(rec.reserved));
     typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
     std::memcpy(buf, &rec, sizeof(malloc_instr));
@@ -138,56 +127,53 @@ void write_malloc_instr(unsigned long long ip, unsigned char type,
 // Callback implementations
 /* ===================================================================== */
 
-// --- MALLOC / allocator variants / Fortran ---
-VOID AllocBefore(ADDRINT size, ADDRINT ip, const char* sym_name)
-{
-  ThreadState* ts = get_tls();
-  // If depth is non-zero but the allocation originates from the user binary
-  // (not libc/libgfortran), the depth was leaked by lost AFTER callbacks
-  // during runtime initialization.  Force-reset to capture user allocations.
-  if (ts->alloc_depth > 0) {
-    if (g_user_low != 0 && ip >= g_user_low && ip < g_user_high) {
-      ts->alloc_depth = 0; // force reset — stale depth from runtime init
-    } else {
-      ts->alloc_depth++;
-      return;
-    }
-  }
-
-  ts->alloc_depth = 1;
-  ts->pending_alloc_size = size;
-  ts->pending_alloc_ip = ip;
-  ts->pending_alloc_alignment = 0;
-
-  std::string name(sym_name);
-  if (name.find("for_alloc") != std::string::npos ||
-      name.find("gfortran")  != std::string::npos ||
-      name.find("CFI_alloc") != std::string::npos) {
-    ts->pending_alloc_type = 10;
-  } else {
-    ts->pending_alloc_type = 1;
-  }
-}
-
-// --- CALLOC / REALLOC ---
-VOID AllocBeforeExtended(ADDRINT arg1, ADDRINT arg2, ADDRINT ip, const char* sym_name)
+// --- MALLOC / C++ new (type=1) ---
+VOID AllocBefore(ADDRINT size)
 {
   ThreadState* ts = get_tls();
   if (ts->alloc_depth > 0) { ts->alloc_depth++; return; }
 
   ts->alloc_depth = 1;
-  ts->pending_alloc_ip = ip;
+  ts->pending_alloc_size = size;
   ts->pending_alloc_alignment = 0;
+  ts->pending_alloc_type = 1;
+}
 
-  std::string name(sym_name);
-  if (name.find("calloc") != std::string::npos) {
-    ts->pending_alloc_size = arg1 * arg2;
-    ts->pending_alloc_type = 5;
-  } else if (name.find("realloc") != std::string::npos) {
-    ts->pending_realloc_old_ptr = arg1;
-    ts->pending_alloc_size = arg2;
-    ts->pending_alloc_type = 6;
-  }
+// --- CALLOC (type=5) ---
+VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size)
+{
+  ThreadState* ts = get_tls();
+  if (ts->alloc_depth > 0) { ts->alloc_depth++; return; }
+
+  ts->alloc_depth = 1;
+  ts->pending_alloc_alignment = 0;
+  ts->pending_alloc_size = nmemb * elem_size;
+  ts->pending_alloc_type = 5;
+}
+
+// --- REALLOC (type=6 or 16) ---
+VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size)
+{
+  ThreadState* ts = get_tls();
+  if (ts->alloc_depth > 0) { ts->alloc_depth++; return; }
+
+  ts->alloc_depth = 1;
+  ts->pending_alloc_alignment = 0;
+  ts->pending_realloc_old_ptr = old_ptr;
+  ts->pending_alloc_size = new_size;
+  ts->pending_alloc_type = 6;
+}
+
+// --- FORTRAN alloc (type=10) ---
+VOID FortranAllocBefore(ADDRINT size)
+{
+  ThreadState* ts = get_tls();
+  if (ts->alloc_depth > 0) { ts->alloc_depth++; return; }
+
+  ts->alloc_depth = 1;
+  ts->pending_alloc_size = size;
+  ts->pending_alloc_alignment = 0;
+  ts->pending_alloc_type = 10;
 }
 
 // --- UNIFIED AFTER (malloc / calloc / realloc / Fortran / C++ new) ---
@@ -205,13 +191,13 @@ VOID AllocAfter(ADDRINT ret)
   if (ts->pending_alloc_type == 6) {
     unsigned char final_type = 6;
     if (ret == ts->pending_realloc_old_ptr && ret != 0) final_type = 16;
-    write_malloc_instr(ts->pending_alloc_ip, final_type,
+    write_malloc_instr(final_type,
                        ts->pending_realloc_old_ptr, ts->pending_alloc_size, ret);
     if (ts->pending_realloc_old_ptr != 0) tracked_addresses.erase(ts->pending_realloc_old_ptr);
     if (ret != 0 && ret != (ADDRINT)-1) tracked_addresses.insert(ret);
   } else {
     if (ret != 0 && ret != (ADDRINT)-1) {
-      write_malloc_instr(ts->pending_alloc_ip, (unsigned char)ts->pending_alloc_type,
+      write_malloc_instr((unsigned char)ts->pending_alloc_type,
                          ts->pending_alloc_size, 0, ret);
       tracked_addresses.insert(ret);
     }
@@ -222,7 +208,7 @@ VOID AllocAfter(ADDRINT ret)
 }
 
 // --- POSIX_MEMALIGN (type=8) ---
-VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size, ADDRINT ip)
+VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size)
 {
   ThreadState* ts = get_tls();
   if (ts->alloc_depth > 0) { ts->alloc_depth++; return; }
@@ -232,7 +218,6 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size, ADDRIN
   ts->pending_alloc_alignment = alignment;
   ts->pending_posix_memptr = memptr;
   ts->pending_alloc_type = 8;
-  ts->pending_alloc_ip = ip;
 }
 
 VOID PosixMemalignAfter(ADDRINT status)
@@ -247,7 +232,7 @@ VOID PosixMemalignAfter(ADDRINT status)
     ADDRINT real_addr = 0;
     PIN_SafeCopy(&real_addr, (void*)ts->pending_posix_memptr, sizeof(ADDRINT));
     if (real_addr != 0 && real_addr != (ADDRINT)-1) {
-      write_malloc_instr(ts->pending_alloc_ip, 8,
+      write_malloc_instr(8,
                          ts->pending_alloc_size, ts->pending_alloc_alignment, real_addr);
       tracked_addresses.insert(real_addr);
     }
@@ -257,7 +242,7 @@ VOID PosixMemalignAfter(ADDRINT status)
 }
 
 // --- FREE ---
-VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
+VOID FreeBefore(ADDRINT ptr)
 {
   ThreadState* ts = get_tls();
   if (ptr == 0) return;
@@ -266,7 +251,7 @@ VOID FreeBefore(ADDRINT ptr, ADDRINT ip)
   if (ts->alloc_depth > 0) { ts->alloc_depth++; return; }
 
   ts->alloc_depth = 1;
-  write_malloc_instr((unsigned long long)ip, 2, (unsigned long long)ptr, 0, 0);
+  write_malloc_instr(2, (unsigned long long)ptr, 0, 0);
 
   auto it = tracked_addresses.find(ptr);
   if (it != tracked_addresses.end()) {
@@ -283,15 +268,10 @@ VOID FreeAfter()
 }
 
 // --- MMAP (independent depth + pending fields to avoid polluting alloc path) ---
-VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
+VOID MmapBefore(ADDRINT length, ADDRINT flags)
 {
   ThreadState* ts = get_tls();
   if (ts->mmap_depth > 0) { ts->mmap_depth++; return; }
-
-  // Ignore mmap calls originating outside the user binary (e.g., Pin's own JIT code cache)
-  if (g_user_low != 0 && !(ip >= g_user_low && ip < g_user_high)) {
-    return;
-  }
 
   ts->mmap_depth = 1;
 
@@ -301,7 +281,6 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT ip)
   }
   ts->mmap_pending_size = length;
   ts->mmap_pending_type = 3;
-  ts->mmap_pending_ip = ip;
 }
 
 VOID MmapAfter(ADDRINT ret)
@@ -315,7 +294,7 @@ VOID MmapAfter(ADDRINT ret)
   if (ts->mmap_pending_type != 3) return;
 
   if (ret != 0 && ret != (ADDRINT)-1) {
-    write_malloc_instr(ts->mmap_pending_ip, 3, ts->mmap_pending_size, 0, ret);
+    write_malloc_instr(3, ts->mmap_pending_size, 0, ret);
     tracked_addresses.insert(ret);
   }
   ts->mmap_pending_size = 0;
@@ -323,22 +302,16 @@ VOID MmapAfter(ADDRINT ret)
 }
 
 // --- MUNMAP (independent depth + pending fields) ---
-VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT ip)
+VOID MunmapBefore(ADDRINT addr, ADDRINT length)
 {
   ThreadState* ts = get_tls();
   if (addr == 0 || addr == (ADDRINT)-1) return;
   if (ts->mmap_depth > 0) { ts->mmap_depth++; return; }
 
-  // Ignore munmap calls originating outside the user binary
-  if (g_user_low != 0 && !(ip >= g_user_low && ip < g_user_high)) {
-    return;
-  }
-
   ts->mmap_depth = 1;
   ts->mmap_pending_type = 4;
-  ts->mmap_pending_ip = ip;
 
-  write_malloc_instr((unsigned long long)ip, 4, (unsigned long long)addr, (unsigned long long)length, 0);
+  write_malloc_instr(4, (unsigned long long)addr, (unsigned long long)length, 0);
 
   auto it = tracked_addresses.find(addr);
   if (it != tracked_addresses.end()) {
@@ -362,12 +335,6 @@ VOID ImageLoad(IMG img, VOID* v)
 {
   if (!IMG_Valid(img)) return;
 
-  // Cache the main executable's address range for stale-depth detection
-  if (IMG_IsMainExecutable(img)) {
-    g_user_low = IMG_LowAddress(img);
-    g_user_high = IMG_HighAddress(img);
-  }
-
   RTN rtn;
 
   // --- posix_memalign (type=8) ---
@@ -378,37 +345,76 @@ VOID ImageLoad(IMG img, VOID* v)
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
-                   IARG_RETURN_IP, IARG_END);
+                   IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
 
-  // --- Standard allocations ---
-  const std::vector<std::string> allocSyms = {
-    "malloc", "calloc", "realloc",
-    "for_alloc_allocatable", "for_allocate", "CFI_allocate",
-    "_gfortran_internal_malloc",
+  // --- malloc-like (type=1): malloc, C++ new, jemalloc variants ---
+  const std::vector<std::string> mallocSyms = {
+    "malloc",
     "mi_malloc", "je_malloc", "tc_malloc",
-    "mi_calloc", "je_calloc", "tc_calloc",
-    "mi_realloc", "je_realloc", "tc_realloc",
     "_Znwm", "_Znam"
   };
-  for (const auto& sym : allocSyms) {
+  for (const auto& sym : mallocSyms) {
     rtn = RTN_FindByName(img, sym.c_str());
     if (!RTN_Valid(rtn)) continue;
     RTN_Open(rtn);
-    if (sym.find("calloc") != std::string::npos ||
-        sym.find("realloc") != std::string::npos) {
-      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBeforeExtended,
-                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                     IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                     IARG_RETURN_IP, IARG_PTR, sym.c_str(), IARG_END);
-    } else {
-      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
-                     IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                     IARG_RETURN_IP, IARG_PTR, sym.c_str(), IARG_END);
-    }
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // --- calloc (type=5) ---
+  const std::vector<std::string> callocSyms = {
+    "calloc", "mi_calloc", "je_calloc", "tc_calloc"
+  };
+  for (const auto& sym : callocSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // --- realloc (type=6) ---
+  const std::vector<std::string> reallocSyms = {
+    "realloc", "mi_realloc", "je_realloc", "tc_realloc"
+  };
+  for (const auto& sym : reallocSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // --- Fortran alloc (type=10) ---
+  const std::vector<std::string> fortranAllocSyms = {
+    "for_alloc_allocatable", "for_allocate", "CFI_allocate",
+    "_gfortran_internal_malloc"
+  };
+  for (const auto& sym : fortranAllocSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FortranAllocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -425,7 +431,7 @@ VOID ImageLoad(IMG img, VOID* v)
     if (!RTN_Valid(rtn)) continue;
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_RETURN_IP, IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
     RTN_Close(rtn);
   }
@@ -437,7 +443,7 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
-                   IARG_RETURN_IP, IARG_END);
+                   IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -450,7 +456,7 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_RETURN_IP, IARG_END);
+                   IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
     RTN_Close(rtn);
   }

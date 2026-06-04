@@ -49,13 +49,13 @@ def read_malloc_binary(filename):
     is_xz = filename.endswith('.xz')
     open_func = lzma.open if is_xz else open
     
-    # 40字节的固定的结构体格式
-    fmt = "<QQQQB7s"
+    # 32字节的固定的结构体格式 (ip removed from the binary record)
+    fmt = "<QQQB7s"
     struct_size = struct.calcsize(fmt)
     
     with open_func(filename, "rb") as f:
-        # 约 2.5MB 的读取缓冲区以加速 I/O (40 bytes * 64K records)
-        chunk_size = 40 * 1024 * 64
+        # 约 2.0MB 的读取缓冲区以加速 I/O (32 bytes * 64K records)
+        chunk_size = 32 * 1024 * 64
         while True:
             chunk = f.read(chunk_size)
             if not chunk:
@@ -67,8 +67,8 @@ def read_malloc_binary(filename):
                 if len(record) < struct_size:
                     break
 
-                ip, arg1, arg2, ret, etype, _ = struct.unpack(fmt, record)
-                yield ip, etype, arg1, arg2, ret
+                arg1, arg2, ret, etype, _ = struct.unpack(fmt, record)
+                yield etype, arg1, arg2, ret
                 offset += struct_size
 
 def process_malloc_binary(filename):
@@ -76,8 +76,8 @@ def process_malloc_binary(filename):
     func_stats = {k: 0 for k in TYPE_MAP.values()}
     
     # 核心精简状态账本：只保留 ACTIVE 对象。
-    # 结构: ptr -> (allocated_size, ip)
-    # 释放后立刻 pop，内存中永远只保留当前的“活对象”
+    # 结构: ptr -> allocated_size
+    # 释放后立刻 pop，内存中永远只保留当前的"活对象"
     active_heap = {}
     
     # 各阈值的水位线控制 (仅维护当前的整型大小，杜绝维护历史对象多级字典)
@@ -89,14 +89,11 @@ def process_malloc_binary(filename):
     original_current_size = 0
     original_peak_size = 0
     
-    # 轻量化的 IP 汇总表 (由一亿减小到几千，安全无虞)
-    ip_stats = {} 
-    
     print("Streaming processing data to minimize memory footprint...")
     
     record_gen = read_malloc_binary(filename)
     
-    for ip, etype, arg1, arg2, ret in record_gen:
+    for etype, arg1, arg2, ret in record_gen:
         func_name = TYPE_MAP.get(etype, 'unknown')
         
         if etype in (1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 16):  # 分配类行为
@@ -107,14 +104,14 @@ def process_malloc_binary(filename):
             if ret != 0:
                 # 发生 realloc 覆盖时，前置清理旧指针占用的内存
                 if etype in (6, 16) and arg1 != 0 and arg1 in active_heap:
-                    old_sz, _ = active_heap.pop(arg1)
+                    old_sz = active_heap.pop(arg1)
                     original_current_size -= old_sz
                     for t in thresholds:
                         old_aligned = next_power_of_2(old_sz) if old_sz < t else old_sz
                         current_sizes[t] -= old_aligned
                 
                 # 记录新对象
-                active_heap[ret] = (size, ip)
+                active_heap[ret] = size
                 original_current_size += size
                 if original_current_size > original_peak_size:
                     original_peak_size = original_current_size
@@ -126,19 +123,13 @@ def process_malloc_binary(filename):
                     current_sizes[t] += aligned_sz
                     if current_sizes[t] > peak_sizes[t]:
                         peak_sizes[t] = current_sizes[t]
-                        
-                # 增量记录 IP
-                if ip not in ip_stats:
-                    ip_stats[ip] = {'count': 0, 'size': 0}
-                ip_stats[ip]['count'] += 1
-                ip_stats[ip]['size'] += size
 
         elif etype in (2, 4):  # 释放类行为 (free, munmap)
             func_stats[func_name] += 1
             
             ptr = arg1
             if ptr in active_heap:
-                old_sz, _ = active_heap.pop(ptr) # ★关键：立刻从内存哈希表中弹出销毁！
+                old_sz = active_heap.pop(ptr) # ★关键：立刻从内存哈希表中弹出销毁！
                 original_current_size -= old_sz
                 
                 for t in thresholds:
@@ -184,12 +175,6 @@ def process_malloc_binary(filename):
     # 恢复系统的标准输出流
     sys.stdout = sys.__stdout__
     
-    # 异步写入轻量级全局 ip 表
-    with open(base_name + ".ips.log", "w") as ip_out:
-        ip_out.write("IP,Count,Total_Allocated_Bytes\n")
-        for ip, stats in sorted(ip_stats.items(), key=lambda x: x[1]['size'], reverse=True):
-            ip_out.write(f"{hex(ip)},{stats['count']},{stats['size']}\n")
-            
     print(f"Analysis successfully done. Output logs saved to base: {base_name}")
 
 if __name__ == '__main__':

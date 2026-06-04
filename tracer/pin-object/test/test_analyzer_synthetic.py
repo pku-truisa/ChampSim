@@ -30,10 +30,10 @@ def check(condition, msg):
         FAIL += 1
         print(f"  ❌ FAIL: {msg}")
 
-def write_record(f, ip, etype, arg1, arg2, ret):
-    """Write a single 40-byte malloc record."""
-    fmt = "<QQQQB7s"
-    f.write(struct.pack(fmt, ip, arg1, arg2, ret, etype, b'\x00'*7))
+def write_record(f, etype, arg1, arg2, ret):
+    """Write a single 32-byte malloc record (v2: ip removed)."""
+    fmt = "<QQQB7s"
+    f.write(struct.pack(fmt, arg1, arg2, ret, etype, b'\x00'*7))
 
 def generate_synthetic_trace(filepath):
     """Generate a synthetic malloc.bin with carefully crafted allocation patterns."""
@@ -42,37 +42,37 @@ def generate_synthetic_trace(filepath):
         # Phase 1: Basic malloc/free — verify original_peak and current_sizes
         #
         # malloc(100) → addr 0x1000
-        write_record(f, 0x401000, 1, 100, 0, 0x1000)   # type=1, malloc(100)
+        write_record(f, 1, 100, 0, 0x1000)   # type=1, malloc(100)
         # malloc(200) → addr 0x2000
-        write_record(f, 0x402000, 1, 200, 0, 0x2000)   # type=1, malloc(200)
+        write_record(f, 1, 200, 0, 0x2000)   # type=1, malloc(200)
         # malloc(50) → addr 0x3000
-        write_record(f, 0x403000, 1, 50, 0, 0x3000)    # type=1, malloc(50)
+        write_record(f, 1, 50, 0, 0x3000)    # type=1, malloc(50)
         # At this point: current_size = 100+200+50 = 350, peak=350
 
         # free(0x1000) — 100 bytes
-        write_record(f, 0x404000, 2, 0x1000, 0, 0)     # type=2, free
+        write_record(f, 2, 0x1000, 0, 0)     # type=2, free
         # Now: current_size = 250, peak=350 (unchanged)
 
         # malloc(300) → addr 0x4000 (new peak!)
-        write_record(f, 0x405000, 1, 300, 0, 0x4000)   # type=1, malloc(300)
+        write_record(f, 1, 300, 0, 0x4000)   # type=1, malloc(300)
         # Now: current_size = 250+300 = 550, peak=550
 
         #
         # Phase 2: calloc — verify type=5
         #
         # calloc(10, 40=400 bytes) → addr 0x5000
-        write_record(f, 0x406000, 5, 400, 0, 0x5000)   # type=5, calloc
+        write_record(f, 5, 400, 0, 0x5000)   # type=5, calloc
         # Now: current_size = 550+400 = 950, peak=950
 
         #
         # Phase 3: mmap/munmap — verify type=3/4
         #
         # mmap(4096) → addr 0x6000
-        write_record(f, 0x407000, 3, 4096, 0, 0x6000)  # type=3, mmap
+        write_record(f, 3, 4096, 0, 0x6000)  # type=3, mmap
         # Now: current_size = 950+4096 = 5046, peak=5046
 
         # munmap(0x6000, 4096)
-        write_record(f, 0x408000, 4, 0x6000, 4096, 0)  # type=4, munmap
+        write_record(f, 4, 0x6000, 4096, 0)  # type=4, munmap
         # Now: current_size = 950, peak=5046 (unchanged)
 
         #
@@ -80,7 +80,7 @@ def generate_synthetic_trace(filepath):
         #
         # realloc(0x2000, 500) → addr 0x7000 (moved → type=6)
         # 0x2000 had 200 bytes, new is 500 bytes
-        write_record(f, 0x409000, 6, 0x2000, 500, 0x7000)  # type=6, realloc(old=0x2000, new=500)
+        write_record(f, 6, 0x2000, 500, 0x7000)  # type=6, realloc(old=0x2000, new=500)
         # Before fix: current_size = 950 - 200 + 500 = 1250 (CORRECT: old popped, new added)
         # But old 0x2000 was in active_heap with size=200
         # Now active_heap has 0x7000 with size=500
@@ -90,7 +90,7 @@ def generate_synthetic_trace(filepath):
         #
         # realloc(0x4000, 800) → addr 0x4000 (same addr → type=16, in-place)
         # 0x4000 had 300 bytes, new is 800 bytes
-        write_record(f, 0x40A000, 16, 0x4000, 800, 0x4000)  # type=16, realloc_inplace
+        write_record(f, 16, 0x4000, 800, 0x4000)  # type=16, realloc_inplace
         # Before fix: old_sz was NOT popped (etype=16 not in condition),
         #   so original_current_size = 1250 + 800 = 2050 (WRONG: double counted 300)
         # After fix: old_sz IS popped,
@@ -100,24 +100,24 @@ def generate_synthetic_trace(filepath):
         # Phase 6: posix_memalign — verify type=8
         #
         # posix_memalign(64, 256) → addr 0x8000
-        write_record(f, 0x40B000, 8, 256, 64, 0x8000)  # type=8, size=256, alignment=64
+        write_record(f, 8, 256, 64, 0x8000)  # type=8, size=256, alignment=64
         # Current: 1750+256 = 2006, peak was 5046 (unchanged)
 
         #
         # Phase 7: Fortran alloc — verify type=10
         #
         # fortran_alloc(128) → addr 0x9000
-        write_record(f, 0x40C000, 10, 128, 0, 0x9000)  # type=10, fortran_alloc
+        write_record(f, 10, 128, 0, 0x9000)  # type=10, fortran_alloc
         # Current: 2006+128 = 2134
 
         #
         # Phase 8: Free some more
         #
         # free(0x3000) -> now at current = 2134-50 = 2084
-        write_record(f, 0x40D000, 2, 0x3000, 0, 0)     # type=2
+        write_record(f, 2, 0x3000, 0, 0)     # type=2
 
         # free(0x9000) -> now at current = 2084-128 = 1956
-        write_record(f, 0x40E000, 2, 0x9000, 0, 0)     # type=2
+        write_record(f, 2, 0x9000, 0, 0)     # type=2
 
         #
         # Phase 9: Orphan free / munmap — verify unconditional write (object_tracer.cpp fix)
@@ -128,10 +128,10 @@ def generate_synthetic_trace(filepath):
         #
 
         # orphan free(0xDEAD) — ptr never allocated
-        write_record(f, 0x40F000, 2, 0xDEAD, 0, 0)     # type=2, orphan free
+        write_record(f, 2, 0xDEAD, 0, 0)     # type=2, orphan free
 
         # orphan munmap(0xBEEF, 8192) — addr never mmap'd
-        write_record(f, 0x410000, 4, 0xBEEF, 8192, 0)  # type=4, orphan munmap
+        write_record(f, 4, 0xBEEF, 8192, 0)  # type=4, orphan munmap
 
 
 def run_analyzer(input_path):
@@ -222,7 +222,7 @@ def main():
     generate_synthetic_trace(trace_path)
     file_size = os.path.getsize(trace_path)
     check(file_size > 0, f"Synthetic trace created ({file_size} bytes)")
-    check(file_size % 40 == 0, f"File size is multiple of 40 bytes ({file_size // 40} records)")
+    check(file_size % 32 == 0, f"File size is multiple of 32 bytes ({file_size // 32} records)")
 
     # Run analyzer
     print("\n--- Running analyzer ---")
@@ -235,10 +235,9 @@ def main():
     if base.endswith('.malloc'):
         base = base[:-7]
     result_log = base + ".result.log"
-    ips_log = base + ".ips.log"
 
     check(os.path.exists(result_log), f"result.log exists: {result_log}")
-    check(os.path.exists(ips_log), f"ips.log exists: {ips_log}")
+    check(not os.path.exists(base + ".ips.log"), f"ips.log should NOT exist (ip removed from v2 format)")
 
     # Parse results
     print("\n--- Parsing results ---")
@@ -434,7 +433,7 @@ def main():
     print("=" * 70)
 
     # Cleanup
-    for f in [trace_path, result_log, ips_log]:
+    for f in [trace_path, result_log]:
         if os.path.exists(f):
             os.remove(f)
             print(f"Cleaned up: {os.path.basename(f)}")
