@@ -6,6 +6,7 @@
 import struct
 import sys
 import os
+import glob
 import lzma
 import argparse
 
@@ -81,13 +82,19 @@ def process_malloc_binary(filename):
     active_heap = {}
     
     # 各阈值的水位线控制 (仅维护当前的整型大小，杜绝维护历史对象多级字典)
-    thresholds = [8, 16, 32, 64, 128, 256, 512, 1024]
+    thresholds = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
     current_sizes = {t: 0 for t in thresholds}
     peak_sizes = {t: 0 for t in thresholds}
+    peak_moment_sizes = {t: 0 for t in thresholds}  # original_peak 时刻的 aligned size 快照
     threshold_object_counts = {t: 0 for t in thresholds}
     
     original_current_size = 0
     original_peak_size = 0
+
+    # 记录所有 >=32KB 的大对象 (ptr -> (size, alloc_type))
+    all_large_objects = []  # 所有曾分配过的大对象，每项 (ptr, size, alloc_type)
+    # 峰值时刻的大对象快照
+    peak_large_objects = {}
     
     print("Streaming processing data to minimize memory footprint...")
     
@@ -113,9 +120,9 @@ def process_malloc_binary(filename):
                 # 记录新对象
                 active_heap[ret] = size
                 original_current_size += size
-                if original_current_size > original_peak_size:
-                    original_peak_size = original_current_size
-                    
+                if size >= 32768:
+                    all_large_objects.append((ret, size, func_name))
+
                 for t in thresholds:
                     if size < t:
                         threshold_object_counts[t] += 1
@@ -123,6 +130,12 @@ def process_malloc_binary(filename):
                     current_sizes[t] += aligned_sz
                     if current_sizes[t] > peak_sizes[t]:
                         peak_sizes[t] = current_sizes[t]
+
+                if original_current_size > original_peak_size:
+                    original_peak_size = original_current_size
+                    # 峰值时刻，保存 aligned sizes 和大对象快照
+                    peak_moment_sizes = dict(current_sizes)
+                    peak_large_objects = dict((p, (s, t)) for p, s, t in all_large_objects if p in active_heap)
 
         elif etype in (2, 4):  # 释放类行为 (free, munmap)
             func_stats[func_name] += 1
@@ -165,23 +178,50 @@ def process_malloc_binary(filename):
 
         print("\n=== Peak Memory Usage Summary ===")
         print(f"Original Physical Peak: {format_size(original_peak_size)}")
-        print("\n Threshold   Aligned Increase     Increase %   Objects (interval)")
-        print("-" * 75)
+        print("\n Threshold   Aligned Increase               Increase %   Objects (interval)   % of Total Objs")
+        print("-" * 100)
         prev = 0
         for t in thresholds:
-            increase = peak_sizes[t] - original_peak_size
+            increase = peak_moment_sizes[t] - original_peak_size
             inc_pct = (increase / original_peak_size * 100) if original_peak_size > 0 else 0
             delta = threshold_object_counts[t] - prev
-            print(f"{t:>9}  {format_size(increase):>19}  {inc_pct:>9.2f}%  {delta:>16,}")
+            obj_pct = (threshold_object_counts[t] / total_alloc * 100) if total_alloc > 0 else 0
+            print(f"{t:>9}  {increase:>27,}  {inc_pct:>9.2f}%  {delta:>16,}  {obj_pct:>15.2f}%")
             prev = threshold_object_counts[t]
-            
-    # 恢复系统的标准输出流
-    sys.stdout = sys.__stdout__
-    
-    print(f"Analysis successfully done. Output logs saved to base: {base_name}")
+
+        # 输出所有 >=32KB 的大对象列表，按大小降序排列
+        if all_large_objects:
+            sorted_large = sorted(all_large_objects, key=lambda x: x[1], reverse=True)
+            with open(base_name + ".objects.log", "w") as obj_out:
+                obj_out.write(f"{'Address':>18}  {'Size':>12}  {'Type':<18}\n")
+                obj_out.write("-" * 52 + "\n")
+                for ptr, sz, atype in sorted_large:
+                    obj_out.write(f"0x{ptr:016x}  {sz:>12,}  {atype:<18}\n")
+            print(f"Large objects (>=32KB) report ({len(all_large_objects)} total) saved to: {base_name}.objects.log")
+        else:
+            with open(base_name + ".objects.log", "w") as obj_out:
+                obj_out.write("No objects >= 32KB found.\n")
+            print("No objects >= 32KB found.")
+
+        print(f"Analysis successfully done. Output logs saved to base: {base_name}")
+
+        # 恢复系统的标准输出流
+        sys.stdout = sys.__stdout__
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='High Performance streaming Analyzer')
-    parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz')
+    parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all" to process all *.malloc.bin.xz in current directory')
     args = parser.parse_args()
-    process_malloc_binary(args.input)
+
+    if args.input.lower() == 'all':
+        files = sorted(glob.glob('*.malloc.bin.xz'))
+        if not files:
+            print("No *.malloc.bin.xz files found in current directory.")
+            sys.exit(1)
+        print(f"Processing {len(files)} file(s):")
+        for f in files:
+            print(f"\n  --- {f} ---")
+            process_malloc_binary(f)
+        print("\nAll files processed.")
+    else:
+        process_malloc_binary(args.input)

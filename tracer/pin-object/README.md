@@ -98,26 +98,29 @@ The `little_object_analyzer.py` tool provides streaming, low-memory-footprint an
 
 1. **Function call statistics** — count of each allocation and deallocation type
 2. **Active memory tracking** — peak memory usage over time, both original and power-of-2-aligned
-3. **Multi-threshold peak comparison** — compares aligned peaks at [8, 16, 32, 64, 128, 256, 512, 1024] byte thresholds
-4. **Per-IP allocation summary** (`ips.log`) — which call sites allocate the most, sorted by total bytes
+3. **Multi-threshold peak comparison** — compares aligned peaks at [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072] byte thresholds
+4. **Large object listing** (`*.objects.log`) — all allocated objects ≥32KB, sorted by size descending
 
 ### Usage
 
 ```bash
-# Basic analysis (supports both .bin and .bin.xz input)
+# Single file analysis (supports both .bin and .bin.xz input)
 python3 little_object_analyzer.py -i malloc.bin
+
+# Batch mode: process all *.malloc.bin.xz files in the current directory
+python3 little_object_analyzer.py -i all
 ```
 
 ### Parameters
 
-- `-i, --input`: Input binary malloc trace file (required). Supports `.xz` compressed files.
+- `-i, --input`: Input binary malloc trace file (required). Supports `.xz` compressed files. Use `all` to batch-process every `*.malloc.bin.xz` in the current directory.
 
 ### Output Files
 
-| File               | Description                                           |
-|--------------------|-------------------------------------------------------|
-| `*.result.log`     | Full analysis report (console output mirror)          |
-| `*.ips.log`        | Per-call-site (IP) allocation summary (CSV format)    |
+| File               | Description                                                              |
+|--------------------|--------------------------------------------------------------------------|
+| `*.result.log`     | Full analysis report including per-threshold peak comparison (console mirror) |
+| `*.objects.log`    | All objects ≥32KB ever allocated, sorted by size descending              |
 
 ## Testing
 
