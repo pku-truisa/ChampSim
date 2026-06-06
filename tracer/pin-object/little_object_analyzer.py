@@ -9,6 +9,7 @@ import os
 import glob
 import lzma
 import argparse
+import bisect
 
 class Tee:
     def __init__(self, *files):
@@ -72,29 +73,47 @@ def read_malloc_binary(filename):
                 yield etype, arg1, arg2, ret
                 offset += struct_size
 
-def process_malloc_binary(filename):
+def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, thresholds, n, size, pow2, split_idx):
+    """更新所有阈值的 current_sizes, peak_sizes, object_counts（分配时调用）"""
+    for i in range(split_idx):
+        # size >= thresholds[i]: aligned_sz = size (原始大小)
+        current_sizes[i] += size
+        if current_sizes[i] > peak_sizes[i]:
+            peak_sizes[i] = current_sizes[i]
+    for i in range(split_idx, n):
+        # size < thresholds[i]: aligned_sz = pow2, 计入 object count
+        threshold_object_counts[i] += 1
+        current_sizes[i] += pow2
+        if current_sizes[i] > peak_sizes[i]:
+            peak_sizes[i] = current_sizes[i]
+
+def _update_sizes_on_free(current_sizes, thresholds, n, old_sz, pow2, split_idx):
+    """更新所有阈值的 current_sizes（释放时调用）"""
+    for i in range(split_idx):
+        current_sizes[i] -= old_sz
+    for i in range(split_idx, n):
+        current_sizes[i] -= pow2
+
+def process_malloc_binary(filename, objects_path=None):
     # 基础统计，仅使用轻量标量
     func_stats = {k: 0 for k in TYPE_MAP.values()}
     
     # 核心精简状态账本：只保留 ACTIVE 对象。
-    # 结构: ptr -> allocated_size
-    # 释放后立刻 pop，内存中永远只保留当前的"活对象"
     active_heap = {}
     
-    # 各阈值的水位线控制 (仅维护当前的整型大小，杜绝维护历史对象多级字典)
+    # 各阈值的水位线控制 — 使用 list 替代 dict 以提升性能
     thresholds = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
-    current_sizes = {t: 0 for t in thresholds}
-    peak_sizes = {t: 0 for t in thresholds}
-    peak_moment_sizes = {t: 0 for t in thresholds}  # original_peak 时刻的 aligned size 快照
-    threshold_object_counts = {t: 0 for t in thresholds}
+    n = len(thresholds)
+    current_sizes = [0] * n
+    peak_sizes = [0] * n
+    peak_moment_sizes = [0] * n  # original_peak 时刻的快照
+    threshold_object_counts = [0] * n
     
     original_current_size = 0
     original_peak_size = 0
 
     # 记录所有 >=32KB 的大对象 (ptr -> (size, alloc_type))
     all_large_objects = []  # 所有曾分配过的大对象，每项 (ptr, size, alloc_type)
-    # 峰值时刻的大对象快照
-    peak_large_objects = {}
     
     print("Streaming processing data to minimize memory footprint...")
     
@@ -113,9 +132,9 @@ def process_malloc_binary(filename):
                 if etype in (6, 16) and arg1 != 0 and arg1 in active_heap:
                     old_sz = active_heap.pop(arg1)
                     original_current_size -= old_sz
-                    for t in thresholds:
-                        old_aligned = next_power_of_2(old_sz) if old_sz < t else old_sz
-                        current_sizes[t] -= old_aligned
+                    old_pow2 = next_power_of_2(old_sz)
+                    old_idx = bisect.bisect_right(thresholds, old_sz)
+                    _update_sizes_on_free(current_sizes, thresholds, n, old_sz, old_pow2, old_idx)
                 
                 # 记录新对象
                 active_heap[ret] = size
@@ -123,19 +142,15 @@ def process_malloc_binary(filename):
                 if size >= 32768:
                     all_large_objects.append((ret, size, func_name))
 
-                for t in thresholds:
-                    if size < t:
-                        threshold_object_counts[t] += 1
-                    aligned_sz = next_power_of_2(size) if size < t else size
-                    current_sizes[t] += aligned_sz
-                    if current_sizes[t] > peak_sizes[t]:
-                        peak_sizes[t] = current_sizes[t]
+                pow2 = next_power_of_2(size)
+                split_idx = bisect.bisect_right(thresholds, size)
+                _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts,
+                                       thresholds, n, size, pow2, split_idx)
 
                 if original_current_size > original_peak_size:
                     original_peak_size = original_current_size
                     # 峰值时刻，保存 aligned sizes 和大对象快照
-                    peak_moment_sizes = dict(current_sizes)
-                    peak_large_objects = dict((p, (s, t)) for p, s, t in all_large_objects if p in active_heap)
+                    peak_moment_sizes = current_sizes.copy()
 
         elif etype in (2, 4):  # 释放类行为 (free, munmap)
             func_stats[func_name] += 1
@@ -144,10 +159,9 @@ def process_malloc_binary(filename):
             if ptr in active_heap:
                 old_sz = active_heap.pop(ptr) # ★关键：立刻从内存哈希表中弹出销毁！
                 original_current_size -= old_sz
-                
-                for t in thresholds:
-                    old_aligned = next_power_of_2(old_sz) if old_sz < t else old_sz
-                    current_sizes[t] -= old_aligned
+                old_pow2 = next_power_of_2(old_sz)
+                old_idx = bisect.bisect_right(thresholds, old_sz)
+                _update_sizes_on_free(current_sizes, thresholds, n, old_sz, old_pow2, old_idx)
 
     # 接下来把轻量化的汇总数据整理输出到最后的报告文件（控制台 + result.log）
     base_name = os.path.splitext(filename)[0]
@@ -181,27 +195,29 @@ def process_malloc_binary(filename):
         print("\n Threshold   Aligned Increase               Increase %   Objects (interval)   % of Total Objs")
         print("-" * 100)
         prev = 0
-        for t in thresholds:
-            increase = peak_moment_sizes[t] - original_peak_size
+        for i in range(n):
+            t = thresholds[i]
+            increase = peak_moment_sizes[i] - original_peak_size
             inc_pct = (increase / original_peak_size * 100) if original_peak_size > 0 else 0
-            delta = threshold_object_counts[t] - prev
-            obj_pct = (threshold_object_counts[t] / total_alloc * 100) if total_alloc > 0 else 0
+            delta = threshold_object_counts[i] - prev
+            obj_pct = (threshold_object_counts[i] / total_alloc * 100) if total_alloc > 0 else 0
             print(f"{t:>9}  {increase:>27,}  {inc_pct:>9.2f}%  {delta:>16,}  {obj_pct:>15.2f}%")
-            prev = threshold_object_counts[t]
+            prev = threshold_object_counts[i]
 
         # 输出所有 >=32KB 的大对象列表，按大小降序排列
-        if all_large_objects:
-            sorted_large = sorted(all_large_objects, key=lambda x: x[1], reverse=True)
-            with open(base_name + ".objects.log", "w") as obj_out:
-                obj_out.write(f"{'Address':>18}  {'Size':>12}  {'Type':<18}\n")
-                obj_out.write("-" * 52 + "\n")
-                for ptr, sz, atype in sorted_large:
-                    obj_out.write(f"0x{ptr:016x}  {sz:>12,}  {atype:<18}\n")
-            print(f"Large objects (>=32KB) report ({len(all_large_objects)} total) saved to: {base_name}.objects.log")
-        else:
-            with open(base_name + ".objects.log", "w") as obj_out:
-                obj_out.write("No objects >= 32KB found.\n")
-            print("No objects >= 32KB found.")
+        if objects_path is not None:
+            if all_large_objects:
+                sorted_large = sorted(all_large_objects, key=lambda x: x[1], reverse=True)
+                with open(objects_path, "w") as obj_out:
+                    obj_out.write(f"{'Address':>18}  {'Size':>12}  {'Type':<18}\n")
+                    obj_out.write("-" * 52 + "\n")
+                    for ptr, sz, atype in sorted_large:
+                        obj_out.write(f"0x{ptr:016x}  {sz:>12,}  {atype:<18}\n")
+                print(f"Large objects (>=32KB) report ({len(all_large_objects)} total) saved to: {objects_path}")
+            else:
+                with open(objects_path, "w") as obj_out:
+                    obj_out.write("No objects >= 32KB found.\n")
+                print(f"No objects >= 32KB found (empty report written to: {objects_path})")
 
         print(f"Analysis successfully done. Output logs saved to base: {base_name}")
 
@@ -211,6 +227,7 @@ def process_malloc_binary(filename):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='High Performance streaming Analyzer')
     parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all" to process all *.malloc.bin.xz in current directory')
+    parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report. If not specified, no objects log is generated.')
     args = parser.parse_args()
 
     if args.input.lower() == 'all':
@@ -221,7 +238,14 @@ if __name__ == '__main__':
         print(f"Processing {len(files)} file(s):")
         for f in files:
             print(f"\n  --- {f} ---")
-            process_malloc_binary(f)
+            # In batch mode, generate per-file objects path if -o is given
+            if args.objects:
+                base_name = os.path.splitext(os.path.basename(f))[0]
+                if base_name.endswith('.malloc'): base_name = base_name[:-7]
+                objs = base_name + ".objects.log"
+            else:
+                objs = None
+            process_malloc_binary(f, objects_path=objs)
         print("\nAll files processed.")
     else:
-        process_malloc_binary(args.input)
+        process_malloc_binary(args.input, objects_path=args.objects)
