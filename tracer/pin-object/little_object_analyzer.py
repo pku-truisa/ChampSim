@@ -73,10 +73,11 @@ def read_malloc_binary(filename):
                 yield etype, arg1, arg2, ret
                 offset += struct_size
 
-def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, thresholds, n, size, pow2, split_idx):
-    """更新所有阈值的 current_sizes, peak_sizes, object_counts（分配时调用）"""
+def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, ge_counts, n, size, pow2, split_idx):
+    """更新所有阈值的 current_sizes, peak_sizes, object_counts, ge_counts（分配时调用）"""
     for i in range(split_idx):
-        # size >= thresholds[i]: aligned_sz = size (原始大小)
+        # size >= thresholds[i]: aligned_sz = size (原始大小), 计入 ge_counts
+        ge_counts[i] += 1
         current_sizes[i] += size
         if current_sizes[i] > peak_sizes[i]:
             peak_sizes[i] = current_sizes[i]
@@ -87,11 +88,14 @@ def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, t
         if current_sizes[i] > peak_sizes[i]:
             peak_sizes[i] = current_sizes[i]
 
-def _update_sizes_on_free(current_sizes, thresholds, n, old_sz, pow2, split_idx):
-    """更新所有阈值的 current_sizes（释放时调用）"""
+def _update_sizes_on_free(current_sizes, ge_counts, n, old_sz, pow2, split_idx):
+    """更新所有阈值的 current_sizes 和 ge_counts（释放时调用）"""
     for i in range(split_idx):
+        # old_sz >= thresholds[i]: aligned_sz = old_sz
+        ge_counts[i] -= 1
         current_sizes[i] -= old_sz
     for i in range(split_idx, n):
+        # old_sz < thresholds[i]: aligned_sz = pow2
         current_sizes[i] -= pow2
 
 def process_malloc_binary(filename, objects_path=None):
@@ -108,6 +112,8 @@ def process_malloc_binary(filename, objects_path=None):
     peak_sizes = [0] * n
     peak_moment_sizes = [0] * n  # original_peak 时刻的快照
     threshold_object_counts = [0] * n
+    current_ge_counts = [0] * n  # 当前活跃对象中 size >= thresholds[i] 的计数
+    peak_moment_ge_counts = [0] * n  # original_peak 时刻的 ge_counts 快照
     
     original_current_size = 0
     original_peak_size = 0
@@ -134,7 +140,7 @@ def process_malloc_binary(filename, objects_path=None):
                     original_current_size -= old_sz
                     old_pow2 = next_power_of_2(old_sz)
                     old_idx = bisect.bisect_right(thresholds, old_sz)
-                    _update_sizes_on_free(current_sizes, thresholds, n, old_sz, old_pow2, old_idx)
+                    _update_sizes_on_free(current_sizes, current_ge_counts, n, old_sz, old_pow2, old_idx)
                 
                 # 记录新对象
                 active_heap[ret] = size
@@ -144,13 +150,14 @@ def process_malloc_binary(filename, objects_path=None):
 
                 pow2 = next_power_of_2(size)
                 split_idx = bisect.bisect_right(thresholds, size)
-                _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts,
-                                       thresholds, n, size, pow2, split_idx)
+                _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, current_ge_counts,
+                                       n, size, pow2, split_idx)
 
                 if original_current_size > original_peak_size:
                     original_peak_size = original_current_size
-                    # 峰值时刻，保存 aligned sizes 和大对象快照
+                    # 峰值时刻，保存 aligned sizes, ge_counts 和大对象快照
                     peak_moment_sizes = current_sizes.copy()
+                    peak_moment_ge_counts = current_ge_counts.copy()
 
         elif etype in (2, 4):  # 释放类行为 (free, munmap)
             func_stats[func_name] += 1
@@ -161,7 +168,7 @@ def process_malloc_binary(filename, objects_path=None):
                 original_current_size -= old_sz
                 old_pow2 = next_power_of_2(old_sz)
                 old_idx = bisect.bisect_right(thresholds, old_sz)
-                _update_sizes_on_free(current_sizes, thresholds, n, old_sz, old_pow2, old_idx)
+                _update_sizes_on_free(current_sizes, current_ge_counts, n, old_sz, old_pow2, old_idx)
 
     # 接下来把轻量化的汇总数据整理输出到最后的报告文件（控制台 + result.log）
     base_name = os.path.splitext(filename)[0]
@@ -192,8 +199,8 @@ def process_malloc_binary(filename, objects_path=None):
 
         print("\n=== Peak Memory Usage Summary ===")
         print(f"Original Physical Peak: {format_size(original_peak_size)}")
-        print("\n Threshold   Aligned Increase               Increase %   Objects (interval)   % of Total Objs")
-        print("-" * 100)
+        print("\n Threshold   Aligned Increase               Increase %   Objects (interval)   % of Total Objs   Desc Overhead   Desc Overhead %")
+        print("-" * 137)
         prev = 0
         for i in range(n):
             t = thresholds[i]
@@ -201,7 +208,9 @@ def process_malloc_binary(filename, objects_path=None):
             inc_pct = (increase / original_peak_size * 100) if original_peak_size > 0 else 0
             delta = threshold_object_counts[i] - prev
             obj_pct = (threshold_object_counts[i] / total_alloc * 100) if total_alloc > 0 else 0
-            print(f"{t:>9}  {increase:>27,}  {inc_pct:>9.2f}%  {delta:>16,}  {obj_pct:>15.2f}%")
+            desc_overhead = peak_moment_ge_counts[i] * 16
+            desc_pct = (desc_overhead / original_peak_size * 100) if original_peak_size > 0 else 0
+            print(f"{t:>9}  {increase:>27,}  {inc_pct:>9.2f}%  {delta:>16,}  {obj_pct:>15.2f}%  {desc_overhead:>13,}  {desc_pct:>15.2f}%")
             prev = threshold_object_counts[i]
 
         # 输出所有 >=32KB 的大对象列表，按大小降序排列
