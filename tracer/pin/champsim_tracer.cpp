@@ -15,8 +15,17 @@
  */
 
 /*! @file
- *  This is an example of the PIN tool that demonstrates some basic PIN APIs
- *  and could serve as the starting point for developing your first PIN tool
+ *  ChampSim Tracer — Produces instruction trace with embedded memory allocation events.
+ *
+ *  Memory allocation analysis logic is verbatim from object_tracer.cpp (v5):
+ *  - Depth counter with saturation (MAX_DEPTH=16) and auto-reset (MAX_STUCK=2)
+ *  - Thread-local state (TLS) + PIN_LOCK for thread safety
+ *  - tracked_addresses set to filter free/munmap (suppress glibc-internal noise)
+ *  - Independent mmap depth tracking
+ *  - realloc_inplace (type=16) detection
+ *  - posix_memalign passes alignment as source_memory[1]
+ *  - C++ new/delete, mimalloc/jemalloc/tcmalloc, Fortran symbol coverage
+ *  - aligned_alloc and memalign are NOT hooked (thin wrappers that call malloc internally)
  */
 
 #include <fstream>
@@ -24,14 +33,30 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "../../inc/trace_instruction.h"
 #include "pin.H"
 
+/* ===================================================================== */
+// Binary malloc trace record (32 bytes) — same as object_tracer
+/* ===================================================================== */
+struct malloc_instr {
+  unsigned long long arg1;     // parameter 1 (Size or Ptr)
+  unsigned long long arg2;     // parameter 2 (Alignment or extra)
+  unsigned long long ret;      // return value (Allocated Addr)
+  unsigned char type;          // 1=malloc, 2=free, 3=mmap, 4=munmap,
+                               // 5=calloc, 6=realloc, 8=posix_memalign,
+                               // 10=fortran_alloc, 16=realloc_inplace
+  unsigned char reserved[7];
+};
+static_assert(sizeof(malloc_instr) == 32, "malloc_instr must be exactly 32 bytes");
+
 using trace_instr_format_t = input_instr;
 
 #ifndef MAP_ANONYMOUS
-#define MAP_ANONYMOUS 0x20  // Linux x86_64 
+#define MAP_ANONYMOUS 0x20  // Linux x86_64
 #endif
 
 /* ================================================================== */
@@ -43,23 +68,56 @@ trace_instr_format_t curr_instr;
 INT64 trace_insts_left = 0;
 INT64 fast_forward_insts_left = 0;
 bool skip_dumping_instructions = false;
-
-ADDRINT pending_alloc_size = 0;
-ADDRINT pending_alloc_memptr = 0; // for posix_memalign
-ADDRINT pending_realloc_old_ptr = 0; // for realloc old pointer
-int pending_alloc_type = 0; // 0: none, 1: malloc, 3: mmap, 5: calloc, 6: realloc, 7: aligned_alloc, 8: posix_memalign, 9: memalign
 bool trace_limit_reached = false;
 
-// Depth counter for allocator reentrancy protection (fixes realloc nesting defects)
-// Replaces the faulty boolean in_allocator_hook that could be prematurely cleared
-// by inner After callbacks during glibc's internal malloc/free calls within realloc.
-INT32 allocator_hook_depth = 0;
+/* ================================================================== */
+// Allocation tracking state — from object_tracer v5
+/* ================================================================== */
+struct TrackedAlloc { ADDRINT size; unsigned char type; };
+std::unordered_map<ADDRINT, TrackedAlloc> tracked_allocations;
+static PIN_LOCK malloc_lock;
 
-// Prototype
-VOID insert_analysis_functions(INS ins);
+// Maximum nesting depth before saturation.
+constexpr int MAX_DEPTH = 16;
+
+// Staged parameters held between outermost BEFORE and AFTER.
+struct PendingAlloc {
+  ADDRINT size          = 0;
+  ADDRINT arg2          = 0;   // alignment (posix_memalign) or new_size (realloc)
+  int     type          = 0;
+  ADDRINT posix_memptr  = 0;
+};
+
+struct ThreadState {
+  PendingAlloc pending;
+  int alloc_depth         = 0;  // 0 = idle, 1 = outermost, 2..MAX_DEPTH = nested
+  int alloc_overflow      = 0;  // counts lost AFTER frames beyond MAX_DEPTH
+  int alloc_stuck_counter = 0;  // auto-reset when depth stays non-zero too long
+
+  // mmap has its own independent depth tracking
+  ADDRINT mmap_pending_size  = 0;
+  int     mmap_depth         = 0;
+  int     mmap_overflow      = 0;
+  int     mmap_stuck_counter = 0;
+};
+
+constexpr int MAX_STUCK = 2;  // auto-reset threshold
+
+static TLS_KEY tls_key;
+
+static void ThreadCleanup(void* p) { delete static_cast<ThreadState*>(p); }
+
+static ThreadState* get_tls()
+{
+  ThreadState* ts = static_cast<ThreadState*>(PIN_GetThreadData(tls_key, PIN_ThreadId()));
+  if (ts) return ts;
+  ts = new ThreadState();
+  PIN_SetThreadData(tls_key, ts, PIN_ThreadId());
+  return ts;
+}
 
 // Pending malloc event to be embedded into the next instruction's trace record.
-// Set by malloc/free/realloc/mmap/munmap After callbacks, consumed by ResetCurrentInstruction.
+// Set by allocator After callbacks, consumed by ResetCurrentInstruction.
 struct {
   unsigned char type = 0;            // is_malloc value
   unsigned long long arg1 = 0;       // source_memory[0] (size or ptr)
@@ -112,7 +170,26 @@ void fast_forward_ins()
     fast_forward_insts_left -= 1;
     skip_dumping_instructions = true;
   } else if (skip_dumping_instructions) {
-    std::cout << "Fast-forward finished, starting tracing\n";
+    // Fast-forward finished: dump all active allocations as baseline
+    // memory state for Champsim's initial memory footprint.
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    for (const auto& [addr, info] : tracked_allocations) {
+      curr_instr = {};
+      curr_instr.is_malloc = info.type;
+      curr_instr.source_memory[0] = info.size;
+      curr_instr.destination_memory[0] = addr;
+
+      typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
+      std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
+      outfile.write(buf, sizeof(trace_instr_format_t));
+    }
+    PIN_ReleaseLock(&malloc_lock);
+
+    // Clear any pending alloc event from the last fast-forward instruction
+    pending_instr_malloc = {};
+
+    std::cout << "Fast-forward finished, starting tracing. Baseline allocations: "
+              << tracked_allocations.size() << std::endl;
     skip_dumping_instructions = false;
   }
 }
@@ -127,7 +204,6 @@ void check_end_of_trace()
       PIN_ExitApplication(0);
     }
   }
-  // If trace_insts_left == 0 initially, it means unlimited tracing - don't decrement or exit
 }
 
 template <typename Func>
@@ -154,7 +230,7 @@ void insert_instrumentation(TRACE trace, void* v)
 }
 
 /* ===================================================================== */
-// Analysis routines
+// Analysis routines — instruction trace
 /* ===================================================================== */
 
 void ResetCurrentInstruction(VOID* ip)
@@ -162,9 +238,9 @@ void ResetCurrentInstruction(VOID* ip)
   curr_instr = {};
   curr_instr.ip = (unsigned long long int)ip;
 
-  // Embed pending malloc event into this instruction's trace record
-  // This is set by malloc/free/realloc/mmap/munmap After callbacks
-  // and consumed here to pair the malloc event with the next retiring instruction
+  // Embed pending malloc event into this instruction's trace record.
+  // Set by allocator After callbacks, consumed here to pair the malloc
+  // event with the next retiring instruction.
   if (pending_instr_malloc.type != 0) {
     curr_instr.is_malloc = pending_instr_malloc.type;
     curr_instr.source_memory[0] = pending_instr_malloc.arg1;
@@ -176,6 +252,10 @@ void ResetCurrentInstruction(VOID* ip)
 
 void WriteCurrentInstruction()
 {
+  // During fast-forward, skip instruction writes — allocation baseline
+  // is dumped in bulk when fast-forward ends.
+  if (skip_dumping_instructions) return;
+
   typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
   std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
   outfile.write(buf, sizeof(trace_instr_format_t));
@@ -191,285 +271,250 @@ template <typename T>
 void WriteToSet(T* begin, T* end, UINT32 r)
 {
   auto set_end = std::find(begin, end, 0);
-  auto found_reg = std::find(begin, set_end, r); // check to see if this register is already in the list
+  auto found_reg = std::find(begin, set_end, r);
   *found_reg = r;
 }
 
 // =========================================================================
-// Allocator analysis routines
+// Allocator analysis routines — from object_tracer v5
 //
-// All Before/After callbacks use a depth counter (allocator_hook_depth)
-// instead of a boolean reentrancy lock. This correctly handles nested
-// internal malloc/free/mmap/munmap calls within glibc's realloc, etc.
+// Depth counter with saturation, thread-safe.
 // Only the outermost user-level call writes records.
-//
 // Allocation events are embedded in-band into the instruction trace via
-// pending_instr_malloc. Each allocation is paired with the next retiring
-// instruction's trace record.
+// pending_instr_malloc.
 // =========================================================================
 
-// --- MALLOC ---
-VOID MallocBefore(ADDRINT size)
+// --- Helper: outermost BEFORE for depth-protected alloc family ---
+static bool depth_outermost_before(ThreadState* ts, int alloc_type,
+                                   ADDRINT size, ADDRINT arg2 = 0)
 {
-  if (trace_limit_reached) return;
-
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-
-  pending_alloc_size = size;
-  pending_alloc_type = 1; // 1: malloc
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) {
+      ts->alloc_depth++;      // nested — count but don't stage
+    } else {
+      ts->alloc_overflow++;   // push overflow to keep AFTER pairing
+    }
+    return false;             // not outermost
+  }
+  // Outermost: stage parameters
+  ts->alloc_depth = 1;
+  ts->pending = PendingAlloc{size, arg2, alloc_type, 0};
+  return true;
 }
 
-VOID MallocAfter(ADDRINT ret)
+// --- Stuck-depth auto-reset ---
+static void try_auto_reset_depth(ThreadState* ts)
 {
-  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
-  if (allocator_hook_depth == 0) return;
-  allocator_hook_depth = 0;
-
-  // Handle different allocation types that use MallocAfter as the After callback
-  // 1=malloc, 5=calloc, 6=realloc, 7=aligned_alloc
-  bool is_valid_type = (pending_alloc_type == 1 || pending_alloc_type == 5 || 
-                        pending_alloc_type == 6 || pending_alloc_type == 7);
-  
-  if (!is_valid_type) {
-    pending_alloc_size = 0;
-    pending_alloc_type = 0;
+  if (ts->alloc_depth == 0) {
+    ts->alloc_stuck_counter = 0;
     return;
   }
+  ts->alloc_stuck_counter++;
+  if (ts->alloc_stuck_counter >= MAX_STUCK) {
+    // Depth permanently stuck (glibc init loss) — force reset
+    ts->alloc_depth = 0;
+    ts->alloc_overflow = 0;
+    ts->alloc_stuck_counter = 0;
+  }
+}
 
-  if (pending_alloc_type == 6) {
-    // realloc: arg1=old_ptr, arg2=new_size, ret=new_ptr (or 0 on failure)
-    if (ret != 0) {
-      pending_instr_malloc.type = 6;
-      pending_instr_malloc.arg1 = pending_realloc_old_ptr;
-      pending_instr_malloc.arg2 = pending_alloc_size;
-      pending_instr_malloc.ret = ret;
-    }
-  } else if (ret != 0) {
-    // malloc/calloc/aligned_alloc: arg1=size, ret=allocated address
-    pending_instr_malloc.type = (unsigned char)pending_alloc_type;
-    pending_instr_malloc.arg1 = pending_alloc_size;
-    pending_instr_malloc.arg2 = 0;
+// --- MALLOC / C++ new (type=1) ---
+VOID AllocBefore(ADDRINT size)
+{
+  if (trace_limit_reached) return;
+  ThreadState* ts = get_tls();
+  try_auto_reset_depth(ts);
+  depth_outermost_before(ts, 1, size);
+}
+
+// --- CALLOC (type=5) ---
+VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size)
+{
+  if (trace_limit_reached) return;
+  ThreadState* ts = get_tls();
+  try_auto_reset_depth(ts);
+  depth_outermost_before(ts, 5, nmemb * elem_size);
+}
+
+// --- REALLOC (type=6 or 16) ---
+VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size)
+{
+  if (trace_limit_reached) return;
+  ThreadState* ts = get_tls();
+  try_auto_reset_depth(ts);
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
+    else ts->alloc_overflow++;
+    return;
+  }
+  ts->alloc_depth = 1;
+  ts->pending = PendingAlloc{old_ptr, new_size, 6, 0};
+}
+
+// --- FORTRAN alloc (type=10) ---
+VOID FortranAllocBefore(ADDRINT size)
+{
+  if (trace_limit_reached) return;
+  ThreadState* ts = get_tls();
+  try_auto_reset_depth(ts);
+  depth_outermost_before(ts, 10, size);
+}
+
+// --- UNIFIED AFTER (all alloc families) ---
+VOID AllocAfter(ADDRINT ret)
+{
+  ThreadState* ts = get_tls();
+  if (ts->alloc_overflow > 0) { ts->alloc_overflow--; return; }
+  if (ts->alloc_depth == 0) return;
+  if (ts->alloc_depth > 1) { ts->alloc_depth--; return; }
+
+  // depth == 1: outermost — write record
+  ts->alloc_depth = 0;
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+
+  if (ts->pending.type == 6) {
+    ADDRINT old_ptr  = ts->pending.size;   // staged in size slot
+    ADDRINT new_size = ts->pending.arg2;
+    unsigned char final_type = 6;
+    if (ret == old_ptr && ret != 0) final_type = 16;
+    pending_instr_malloc.type = final_type;
+    pending_instr_malloc.arg1 = old_ptr;
+    pending_instr_malloc.arg2 = new_size;
     pending_instr_malloc.ret = ret;
+    if (old_ptr != 0) tracked_allocations.erase(old_ptr);
+    if (ret != 0 && ret != (ADDRINT)-1) tracked_allocations[ret] = {new_size, final_type};
+  } else {
+    if (ret != 0 && ret != (ADDRINT)-1) {
+      pending_instr_malloc.type = (unsigned char)ts->pending.type;
+      pending_instr_malloc.arg1 = ts->pending.size;
+      pending_instr_malloc.arg2 = ts->pending.arg2;
+      pending_instr_malloc.ret = ret;
+      tracked_allocations[ret] = {ts->pending.size, (unsigned char)ts->pending.type};
+    }
   }
 
-  pending_alloc_size = 0;
-  pending_alloc_type = 0;
-  pending_realloc_old_ptr = 0;
+  PIN_ReleaseLock(&malloc_lock);
 }
 
-// --- CALLOC ---
-VOID CallocBefore(ADDRINT nmemb, ADDRINT size)
+// --- POSIX_MEMALIGN (type=8) — uses depth counter, but BEFORE always stages ---
+VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size)
 {
   if (trace_limit_reached) return;
-
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-
-  ADDRINT total_size = nmemb * size;
-  pending_alloc_size = total_size;
-  pending_alloc_type = 5; // 5: calloc
+  ThreadState* ts = get_tls();
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
+    else ts->alloc_overflow++;
+    return;
+  }
+  ts->alloc_depth = 1;
+  ts->pending = PendingAlloc{size, alignment, 8, memptr};
 }
 
-// --- REALLOC ---
-VOID ReallocBefore(ADDRINT ptr, ADDRINT size)
+VOID PosixMemalignAfter(ADDRINT status)
 {
-  if (trace_limit_reached) return;
+  ThreadState* ts = get_tls();
+  if (ts->alloc_overflow > 0) { ts->alloc_overflow--; return; }
+  if (ts->alloc_depth == 0) return;
+  if (ts->alloc_depth > 1) { ts->alloc_depth--; return; }
 
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
+  ts->alloc_depth = 0;
 
-  pending_alloc_size = size;
-  pending_alloc_type = 6; // 6: realloc
-  pending_realloc_old_ptr = ptr; // save old pointer for After callback
+  if (status == 0 && ts->pending.posix_memptr != 0) {
+    ADDRINT real_addr = 0;
+    PIN_SafeCopy(&real_addr, (void*)ts->pending.posix_memptr, sizeof(ADDRINT));
+    if (real_addr != 0 && real_addr != (ADDRINT)-1) {
+      PIN_GetLock(&malloc_lock, PIN_ThreadId());
+      pending_instr_malloc.type = 8;
+      pending_instr_malloc.arg1 = ts->pending.size;
+      pending_instr_malloc.arg2 = ts->pending.arg2;   // alignment
+      pending_instr_malloc.ret = real_addr;
+      tracked_allocations[real_addr] = {ts->pending.size, 8};
+      PIN_ReleaseLock(&malloc_lock);
+    }
+  }
 }
 
-// --- ALIGNED_ALLOC ---
-VOID AlignedAllocBefore(ADDRINT alignment, ADDRINT size)
-{
-  if (trace_limit_reached) return;
-
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-
-  pending_alloc_size = size;
-  pending_alloc_type = 7; // 7: aligned_alloc
-}
-
-// --- FREE ---
+// --- FREE (type=2) — only write if tracked (suppresses glibc-internal free) ---
 VOID FreeBefore(ADDRINT ptr)
 {
-  if (ptr == 0) {
-    if (allocator_hook_depth > 0) { allocator_hook_depth++; }
-    return;
-  }
+  if (ptr == 0) return;
 
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-
-  pending_instr_malloc.type = 2;
-  pending_instr_malloc.arg1 = (unsigned long long)ptr;
-  pending_instr_malloc.arg2 = 0;
-  pending_instr_malloc.ret = 0;
-}
-
-VOID FreeAfter()
-{
-  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
-  if (allocator_hook_depth == 0) return;
-  allocator_hook_depth = 0;
-}
-
-// --- MEMALIGN ---
-VOID MemalignBefore(ADDRINT alignment, ADDRINT size)
-{
-  if (trace_limit_reached) return;
-
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-
-  pending_alloc_size = size;
-  pending_alloc_type = 9; // 9: memalign
-}
-
-VOID MemalignAfter(ADDRINT ret)
-{
-  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
-  if (allocator_hook_depth == 0) return;
-  allocator_hook_depth = 0;
-
-  if (pending_alloc_type != 9) {
-    pending_alloc_size = 0;
-    return;
-  }
-
-  if (ret != 0) {
-    pending_instr_malloc.type = 9;
-    pending_instr_malloc.arg1 = pending_alloc_size;
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+  auto it = tracked_allocations.find(ptr);
+  if (it != tracked_allocations.end()) {
+    pending_instr_malloc.type = 2;
+    pending_instr_malloc.arg1 = (unsigned long long)ptr;
     pending_instr_malloc.arg2 = 0;
-    pending_instr_malloc.ret = ret;
+    pending_instr_malloc.ret = 0;
+    tracked_allocations.erase(it);
   }
-
-  pending_alloc_size = 0;
-  pending_alloc_type = 0;
+  PIN_ReleaseLock(&malloc_lock);
 }
 
-// --- POSIX_MEMALIGN ---
-VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT size)
-{
-  if (trace_limit_reached) return;
+VOID FreeAfter() { /* no-op */ }
 
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-
-  pending_alloc_size = size;
-  pending_alloc_type = 8; // 8: posix_memalign
-  pending_alloc_memptr = memptr; // save for After callback
-}
-
-VOID PosixMemalignAfter(ADDRINT ret)
-{
-  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
-  if (allocator_hook_depth == 0) return;
-  allocator_hook_depth = 0;
-
-  if (pending_alloc_type != 8) {
-    pending_alloc_size = 0;
-    pending_alloc_memptr = 0;
-    return;
-  }
-
-  // For posix_memalign, the return value is the error code (0 on success)
-  // The actual pointer is stored in *memptr
-  if (ret == 0 && pending_alloc_memptr != 0) {
-    ADDRINT allocated_addr = 0;
-    size_t copied = PIN_SafeCopy(&allocated_addr, (VOID*)pending_alloc_memptr, sizeof(ADDRINT));
-
-    if (copied == sizeof(ADDRINT) && allocated_addr != 0) {
-      pending_instr_malloc.type = 8;
-      pending_instr_malloc.arg1 = pending_alloc_size;
-      pending_instr_malloc.arg2 = 0;
-      pending_instr_malloc.ret = allocated_addr;
-    }
-  }
-
-  pending_alloc_size = 0;
-  pending_alloc_type = 0;
-  pending_alloc_memptr = 0;
-}
-
-// --- MMAP ---
+// --- MMAP (independent depth + saturation) ---
 VOID MmapBefore(ADDRINT length, ADDRINT flags)
 {
   if (trace_limit_reached) return;
 
-  // If this is a nested internal mmap (e.g. inside glibc's malloc/realloc),
-  // only track depth without overwriting the outer pending alloc state.
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
+  if (!(flags & MAP_ANONYMOUS)) return;
 
-  // Only track anonymous mappings (MAP_ANONYMOUS)
-  if (!(flags & MAP_ANONYMOUS)) {
-    allocator_hook_depth = 0;
+  ThreadState* ts = get_tls();
+  if (ts->mmap_depth > 0) {
+    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
+    else ts->mmap_overflow++;
     return;
   }
-
-  pending_alloc_size = length;
-  pending_alloc_type = 3; // 3: mmap
+  ts->mmap_depth = 1;
+  ts->mmap_pending_size = length;
 }
 
 VOID MmapAfter(ADDRINT ret)
 {
-  // Nested internal mmap: just decrement depth, don't write record.
-  // The outer malloc/calloc/realloc call will write the correct record.
-  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
-  if (allocator_hook_depth == 0) return;
-  allocator_hook_depth = 0;
+  ThreadState* ts = get_tls();
+  if (ts->mmap_overflow > 0) { ts->mmap_overflow--; return; }
+  if (ts->mmap_depth == 0) return;
+  if (ts->mmap_depth > 1) { ts->mmap_depth--; return; }
 
-  if (pending_alloc_type != 3) {
-    pending_alloc_size = 0;
-    return;
-  }
+  ts->mmap_depth = 0;
 
   if (ret != 0 && ret != (ADDRINT)-1) {
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
     pending_instr_malloc.type = 3;
-    pending_instr_malloc.arg1 = pending_alloc_size;
+    pending_instr_malloc.arg1 = ts->mmap_pending_size;
     pending_instr_malloc.arg2 = 0;
     pending_instr_malloc.ret = ret;
+    tracked_allocations[ret] = {ts->mmap_pending_size, 3};
+    PIN_ReleaseLock(&malloc_lock);
   }
-
-  pending_alloc_size = 0;
-  pending_alloc_type = 0;
 }
 
-// --- MUNMAP ---
+// --- MUNMAP (type=4) — only write if tracked ---
 VOID MunmapBefore(ADDRINT addr, ADDRINT length)
 {
-  if (addr == 0 || addr == (ADDRINT)-1) {
-    if (allocator_hook_depth > 0) { allocator_hook_depth++; }
-    return;
+  if (addr == 0 || addr == (ADDRINT)-1) return;
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+  auto it = tracked_allocations.find(addr);
+  if (it != tracked_allocations.end()) {
+    pending_instr_malloc.type = 4;
+    pending_instr_malloc.arg1 = (unsigned long long)addr;
+    pending_instr_malloc.arg2 = (unsigned long long)length;
+    pending_instr_malloc.ret = 0;
+    tracked_allocations.erase(it);
   }
-
-  // Nested internal munmap (e.g. inside glibc's realloc shrink):
-  // only track depth without overwriting pending state.
-  if (allocator_hook_depth > 0) { allocator_hook_depth++; return; }
-  allocator_hook_depth = 1;
-
-  pending_instr_malloc.type = 4;
-  pending_instr_malloc.arg1 = (unsigned long long)addr;
-  pending_instr_malloc.arg2 = (unsigned long long)length;
-  pending_instr_malloc.ret = 0;
+  PIN_ReleaseLock(&malloc_lock);
 }
 
-VOID MunmapAfter()
-{
-  if (allocator_hook_depth > 1) { allocator_hook_depth--; return; }
-  if (allocator_hook_depth == 0) return;
-  allocator_hook_depth = 0;
-}
+VOID MunmapAfter() { /* no-op */ }
+
+// Forward declaration
+VOID ResetDepthOnMain();
 
 /* ===================================================================== */
-// Instrumentation callbacks
+// Automation analysis callbacks — instruction instrumentation
 /* ===================================================================== */
 
 // Is called for every instruction and instruments reads and writes
@@ -516,157 +561,186 @@ VOID insert_analysis_functions(INS ins)
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)WriteCurrentInstruction, IARG_END);
 }
 
-// =========================================================================
-// ImageLoad: Instrument main executable only
-//
-// KEY FIX: Only hook functions in the main executable image.
-// This prevents capturing internal glibc calls (e.g., __libc_malloc,
-// __libc_free, internal mmap/munmap within malloc/free), which were
-// the root cause of double-counting and cross-type pollution.
-// =========================================================================
+/* ===================================================================== */
+// ImageLoad — from object_tracer v5 symbol coverage
+// ===================================================================== */
 VOID ImageLoad(IMG img, VOID* v)
 {
-  // Instrument all images (including libc.so where malloc/free/mmap are defined).
-  // The allocator_hook_depth counter prevents double-counting from nested internal
-  // glibc calls (e.g., __libc_malloc within realloc). We only hook public API names
-  // (malloc, free, etc.), never internal __libc_* symbols.
-  //
-  // Skip images with no useful symbols (e.g., vdso) to reduce noise.
-  if (!IMG_Valid(img)) {
-    return;
-  }
-
-  // Only instrument images that actually define these symbols (libc, ld-linux, etc.)
-  bool has_symbols = false;
-  const char* func_names[] = {"malloc", "calloc", "realloc", "free", "mmap", "munmap", "aligned_alloc", "posix_memalign", "memalign"};
-  for (const char* name : func_names) {
-    RTN test_rtn = RTN_FindByName(img, name);
-    if (RTN_Valid(test_rtn)) {
-      has_symbols = true;
-      break;
-    }
-  }
-  if (!has_symbols) {
-    return;
-  }
-
-  std::cout << "[ChampSim Tracer] Instrumenting: " << IMG_Name(img) << std::endl;
+  if (!IMG_Valid(img)) return;
 
   RTN rtn;
 
-  // Hook malloc
-  rtn = RTN_FindByName(img, "malloc");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // Hook calloc
-  rtn = RTN_FindByName(img, "calloc");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // Hook realloc
-  rtn = RTN_FindByName(img, "realloc");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // Hook aligned_alloc
-  rtn = RTN_FindByName(img, "aligned_alloc");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AlignedAllocBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MallocAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // Hook posix_memalign
+  // --- posix_memalign (type=8) ---
   rtn = RTN_FindByName(img, "posix_memalign");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                   IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
 
-  // Hook memalign
-  rtn = RTN_FindByName(img, "memalign");
-  if (RTN_Valid(rtn)) {
+  // --- malloc-like (type=1) ---
+  const std::vector<std::string> mallocSyms = {
+    "malloc",
+    "mi_malloc", "je_malloc", "tc_malloc",
+    "_Znwm", "_Znam"
+  };
+  for (const auto& sym : mallocSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MemalignBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MemalignAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
 
-  // Hook free (with paired FreeAfter for proper depth management)
-  rtn = RTN_FindByName(img, "free");
-  if (RTN_Valid(rtn)) {
+  // --- calloc (type=5) ---
+  const std::vector<std::string> callocSyms = {
+    "calloc",
+    "mi_calloc", "je_calloc", "tc_calloc"
+  };
+  for (const auto& sym : callocSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // --- realloc (type=6) ---
+  const std::vector<std::string> reallocSyms = {
+    "realloc",
+    "mi_realloc", "je_realloc", "tc_realloc"
+  };
+  for (const auto& sym : reallocSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // --- Fortran alloc (type=10) ---
+  const std::vector<std::string> fortranAllocSyms = {
+    "for_alloc_allocatable", "for_allocate", "CFI_allocate",
+    "_gfortran_internal_malloc",
+    "_gfortran_allocate", "_gfortran_allocate_array",
+    "f90_alloc", "f90_alloc04",
+    "_f90_malloc", "pgf90_alloc"
+  };
+  for (const auto& sym : fortranAllocSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FortranAllocBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // --- Free ---
+  const std::vector<std::string> freeSyms = {
+    "free",
+    "mi_free", "je_free", "tc_free",
+    "for_deallocate", "_gfortran_internal_free", "CFI_deallocate",
+    "_gfortran_deallocate",
+    "f90_free", "_f90_free",
+    "_ZdlPv", "_ZdaPv"
+  };
+  for (const auto& sym : freeSyms) {
+    rtn = RTN_FindByName(img, sym.c_str());
+    if (!RTN_Valid(rtn)) continue;
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
     RTN_Close(rtn);
   }
 
-  // Hook mmap
+  // --- mmap ---
   rtn = RTN_FindByName(img, "mmap");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                   IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
   }
 
-  // Hook munmap (with paired MunmapAfter for proper depth management)
+  // --- Reset depth at entry points (glibc init may have leaked depth) ---
+  for (const char* entry : {"main", "MAIN__", "main_"}) {
+    rtn = RTN_FindByName(img, entry);
+    if (RTN_Valid(rtn)) {
+      RTN_Open(rtn);
+      RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ResetDepthOnMain, IARG_END);
+      RTN_Close(rtn);
+    }
+  }
+
+  // --- munmap ---
   rtn = RTN_FindByName(img, "munmap");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore, IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
     RTN_Close(rtn);
   }
+
+  std::cout << "[ChampSim Tracer] Instrumented: " << IMG_Name(img) << std::endl;
 }
 
-/*!
- * Print out analysis results.
- * This function is called when the application exits.
- * @param[in]   code            exit code of the application
- * @param[in]   v               value specified by the tool in the
- *                              PIN_AddFiniFunction function call
- */
-VOID Fini(INT32 code, VOID* v) { 
+// --- Reset depth counters at program entry (after glibc init) ---
+VOID ResetDepthOnMain()
+{
+  ThreadState* ts = get_tls();
+  ts->alloc_depth = 0;
+  ts->alloc_overflow = 0;
+  ts->mmap_depth = 0;
+  ts->mmap_overflow = 0;
+}
+
+/* ===================================================================== */
+VOID Fini(INT32 code, VOID* v)
+{
   if (outfile.is_open()) {
     outfile.close();
   }
-  std::cout << "[ChampSim Tracer] Trace saved." << std::endl;
+  std::cout << "[ChampSim Tracer] Trace saved. Active tracked: " << tracked_allocations.size() << std::endl;
 }
 
-/*!
- * The main procedure of the tool.
- * This function is called when the application image is loaded but not yet started.
- * @param[in]   argc            total number of elements in the argv array
- * @param[in]   argv            array of command line arguments,
- *                              including pin -t <toolname> -- ...
- */
 int main(int argc, char* argv[])
 {
-  // Initialize PIN library. Print help message if -h(elp) is specified
-  // in the command line or the command line is invalid
   PIN_InitSymbols();
   if (PIN_Init(argc, argv))
     return Usage();
 
   trace_insts_left = KnobTraceLen.Value();
   fast_forward_insts_left = KnobFastForward.Value();
+
+  PIN_InitLock(&malloc_lock);
+  tls_key = PIN_CreateThreadDataKey(ThreadCleanup);
 
   outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
   if (!outfile) {
@@ -678,10 +752,8 @@ int main(int argc, char* argv[])
 
   IMG_AddInstrumentFunction(ImageLoad, 0);
 
-  // Register function to be called when the application exits
   PIN_AddFiniFunction(Fini, 0);
 
-  // Start the program, never returns
   PIN_StartProgram();
 
   return 0;
