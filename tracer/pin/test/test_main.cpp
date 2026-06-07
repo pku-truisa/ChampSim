@@ -33,6 +33,22 @@ void test_writetoset_normal();
 void test_writetoset_dedup();
 void test_writetoset_boundary();
 
+void test_threshold_malloc_above();
+void test_threshold_malloc_below();
+void test_threshold_malloc_failure();
+void test_threshold_realloc_above();
+void test_threshold_realloc_below();
+void test_threshold_realloc_inplace_above();
+void test_threshold_posix_memalign_above();
+void test_threshold_posix_memalign_below();
+void test_threshold_mmap_above();
+void test_threshold_mmap_below();
+void test_threshold_boundary_exact();
+void test_threshold_boundary_below();
+void test_threshold_custom_value();
+void test_threshold_free_only_tracked();
+void test_threshold_free_large_tracked();
+
 int main() {
   std::cout << "=== champsim_tracer Unit Tests ===" << std::endl;
   std::cout << std::endl;
@@ -71,6 +87,23 @@ int main() {
   test_writetoset_normal();
   test_writetoset_dedup();
   test_writetoset_boundary();
+
+  std::cout << std::endl << "--- Malloc Threshold (-k) ---" << std::endl;
+  test_threshold_malloc_above();
+  test_threshold_malloc_below();
+  test_threshold_malloc_failure();
+  test_threshold_realloc_above();
+  test_threshold_realloc_below();
+  test_threshold_realloc_inplace_above();
+  test_threshold_posix_memalign_above();
+  test_threshold_posix_memalign_below();
+  test_threshold_mmap_above();
+  test_threshold_mmap_below();
+  test_threshold_boundary_exact();
+  test_threshold_boundary_below();
+  test_threshold_custom_value();
+  test_threshold_free_only_tracked();
+  test_threshold_free_large_tracked();
 
   std::cout << std::endl << "================================" << std::endl;
   std::cout << "Total:  " << total_tests  << std::endl;

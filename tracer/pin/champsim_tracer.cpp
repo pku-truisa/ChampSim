@@ -138,6 +138,8 @@ KNOB<UINT64> KnobFastForward(KNOB_MODE_WRITEONCE, "pintool", "s", "0", "How many
 
 KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "0", "How many instructions to trace (0 for unlimited)");
 
+KNOB<UINT64> KnobMallocThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "256", "Record malloc/free events only for allocations >= this size in bytes");
+
 /* ===================================================================== */
 // Utilities
 /* ===================================================================== */
@@ -151,6 +153,7 @@ INT32 Usage()
             << "Specify the output trace file with -o" << std::endl
             << "Specify the number of instructions to skip before tracing with -s" << std::endl
             << "Specify the number of instructions to trace with -t (0 for unlimited)" << std::endl
+            << "Specify the minimum allocation size threshold with -k (default 256)" << std::endl
             << std::endl;
 
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
@@ -382,14 +385,18 @@ VOID AllocAfter(ADDRINT ret)
     ADDRINT new_size = ts->pending.arg2;
     unsigned char final_type = 6;
     if (ret == old_ptr && ret != 0) final_type = 16;
-    pending_instr_malloc.type = final_type;
-    pending_instr_malloc.arg1 = old_ptr;
-    pending_instr_malloc.arg2 = new_size;
-    pending_instr_malloc.ret = ret;
+    // Always erase old_ptr from tracked set (free implied by realloc)
     if (old_ptr != 0) tracked_allocations.erase(old_ptr);
-    if (ret != 0 && ret != (ADDRINT)-1) tracked_allocations[ret] = {new_size, final_type};
+    // Only record realloc if new_size meets threshold
+    if (new_size >= KnobMallocThreshold.Value() && ret != 0 && ret != (ADDRINT)-1) {
+      pending_instr_malloc.type = final_type;
+      pending_instr_malloc.arg1 = old_ptr;
+      pending_instr_malloc.arg2 = new_size;
+      pending_instr_malloc.ret = ret;
+      tracked_allocations[ret] = {new_size, final_type};
+    }
   } else {
-    if (ret != 0 && ret != (ADDRINT)-1) {
+    if (ret != 0 && ret != (ADDRINT)-1 && ts->pending.size >= KnobMallocThreshold.Value()) {
       pending_instr_malloc.type = (unsigned char)ts->pending.type;
       pending_instr_malloc.arg1 = ts->pending.size;
       pending_instr_malloc.arg2 = ts->pending.arg2;
@@ -427,7 +434,7 @@ VOID PosixMemalignAfter(ADDRINT status)
   if (status == 0 && ts->pending.posix_memptr != 0) {
     ADDRINT real_addr = 0;
     PIN_SafeCopy(&real_addr, (void*)ts->pending.posix_memptr, sizeof(ADDRINT));
-    if (real_addr != 0 && real_addr != (ADDRINT)-1) {
+    if (real_addr != 0 && real_addr != (ADDRINT)-1 && ts->pending.size >= KnobMallocThreshold.Value()) {
       PIN_GetLock(&malloc_lock, PIN_ThreadId());
       pending_instr_malloc.type = 8;
       pending_instr_malloc.arg1 = ts->pending.size;
@@ -484,7 +491,7 @@ VOID MmapAfter(ADDRINT ret)
 
   ts->mmap_depth = 0;
 
-  if (ret != 0 && ret != (ADDRINT)-1) {
+  if (ret != 0 && ret != (ADDRINT)-1 && ts->mmap_pending_size >= KnobMallocThreshold.Value()) {
     PIN_GetLock(&malloc_lock, PIN_ThreadId());
     pending_instr_malloc.type = 3;
     pending_instr_malloc.arg1 = ts->mmap_pending_size;
