@@ -70,6 +70,10 @@ INT64 fast_forward_insts_left = 0;
 bool skip_dumping_instructions = false;
 bool trace_limit_reached = false;
 
+// Forward declarations
+VOID insert_analysis_functions(INS ins);
+VOID ResetCurrentInstruction(VOID* ip);
+
 /* ================================================================== */
 // Allocation tracking state — from object_tracer v5
 /* ================================================================== */
