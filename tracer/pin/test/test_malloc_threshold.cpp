@@ -14,7 +14,7 @@
 
 static constexpr ADDRINT DEFAULT_THRESHOLD = 4096;
 
-// Helper: simulates the AllocAfter non-realloc branch (malloc/calloc/fortran)
+// Helper: simulates the AllocAfter non-realloc branch (malloc/calloc)
 static bool alloc_after_non_realloc_should_record(ADDRINT size, ADDRINT ret,
                                                    ADDRINT threshold)
 {

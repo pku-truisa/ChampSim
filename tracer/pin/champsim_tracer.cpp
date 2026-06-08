@@ -24,7 +24,7 @@
  *  - Independent mmap depth tracking
  *  - realloc_inplace (type=16) detection
  *  - posix_memalign passes alignment as source_memory[1]
- *  - C++ new/delete, mimalloc/jemalloc/tcmalloc, Fortran symbol coverage
+ *  - C++ new/delete, mimalloc/jemalloc/tcmalloc
  *  - aligned_alloc and memalign are NOT hooked (thin wrappers that call malloc internally)
  */
 
@@ -50,7 +50,7 @@ struct malloc_instr {
   unsigned long long ret;      // return value (Allocated Addr)
   unsigned char type;          // 1=malloc, 2=free, 3=mmap, 4=munmap,
                                // 5=calloc, 6=realloc, 8=posix_memalign,
-                               // 10=fortran_alloc, 16=realloc_inplace
+                               // 16=realloc_inplace
   unsigned char reserved[7];
 };
 static_assert(sizeof(malloc_instr) == 32, "malloc_instr must be exactly 32 bytes");
@@ -552,15 +552,6 @@ VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size)
   ts->pending = PendingAlloc{old_ptr, new_size, 6, 0};
 }
 
-// --- FORTRAN alloc (type=10) ---
-VOID FortranAllocBefore(ADDRINT size)
-{
-  if (trace_limit_reached) return;
-  ThreadState* ts = get_tls();
-  try_auto_reset_depth(ts);
-  depth_outermost_before(ts, 10, size);
-}
-
 // --- UNIFIED AFTER (all alloc families) ---
 VOID AllocAfter(ADDRINT ret)
 {
@@ -840,32 +831,10 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
-  // --- Fortran alloc (type=10) ---
-  const std::vector<std::string> fortranAllocSyms = {
-    "for_alloc_allocatable", "for_allocate", "CFI_allocate",
-    "_gfortran_internal_malloc",
-    "_gfortran_allocate", "_gfortran_allocate_array",
-    "f90_alloc", "f90_alloc04",
-    "_f90_malloc", "pgf90_alloc"
-  };
-  for (const auto& sym : fortranAllocSyms) {
-    rtn = RTN_FindByName(img, sym.c_str());
-    if (!RTN_Valid(rtn)) continue;
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FortranAllocBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
   // --- Free ---
   const std::vector<std::string> freeSyms = {
     "free",
     "mi_free", "je_free", "tc_free",
-    "for_deallocate", "_gfortran_internal_free", "CFI_deallocate",
-    "_gfortran_deallocate",
-    "f90_free", "_f90_free",
     "_ZdlPv", "_ZdaPv"
   };
   for (const auto& sym : freeSyms) {
@@ -891,8 +860,8 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
-  // --- Reset depth at entry points (glibc init may have leaked depth) ---
-  for (const char* entry : {"main", "MAIN__", "main_"}) {
+  // --- Reset depth at entry point (glibc init may have leaked depth) ---
+  for (const char* entry : {"main"}) {
     rtn = RTN_FindByName(img, entry);
     if (RTN_Valid(rtn)) {
       RTN_Open(rtn);

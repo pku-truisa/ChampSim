@@ -22,15 +22,15 @@ void test_trace_format_layout() {
 
 void test_trace_format_is_malloc_types() {
   TEST("is_malloc type values are distinct and match malloc_instr");
-  // All allocation type values (1,2,3,4,5,6,8,10,16) must be non-overlapping
+  // All allocation type values (1,2,3,4,5,6,8,16) must be non-overlapping
   // and match the malloc_instr type definitions in champsim_tracer.cpp
   //
   // 0: normal instruction
   // 1: malloc, 2: free, 3: mmap, 4: munmap, 5: calloc
-  // 6: realloc, 8: posix_memalign, 10: fortran_alloc, 16: realloc_inplace
+  // 6: realloc, 8: posix_memalign, 16: realloc_inplace
 
   // Verify no overlap between allocation types
-  unsigned char types[] = {1, 2, 3, 4, 5, 6, 8, 10, 16};
+  unsigned char types[] = {1, 2, 3, 4, 5, 6, 8, 16};
   for (size_t i = 0; i < sizeof(types); i++) {
     for (size_t j = i + 1; j < sizeof(types); j++) {
       CHECK(types[i] != types[j], "duplicate type value found");

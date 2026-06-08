@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-高性能低内存流式 Memory Allocation Trace File Analyzer
+高性能低内存流式 Memory Allocation Trace File Analyzer — v5 39-type scheme.
 """
 
 import struct
@@ -40,109 +40,100 @@ def format_size(size):
     return "{} B".format(size)
 
 TYPE_MAP = {
-    1: 'malloc', 2: 'free', 3: 'mmap', 4: 'munmap',
-    5: 'calloc', 6: 'realloc', 7: 'aligned_alloc',
-    8: 'posix_memalign', 9: 'memalign', 10: 'fortran_alloc',
-    11: 'valloc', 12: '__libc_memalign', 16: 'realloc_inplace'
+    1: 'malloc', 2: 'mi_malloc', 3: 'je_malloc', 4: 'tc_malloc',
+    5: '_Znwm', 6: '_Znam',
+    7: 'calloc', 8: 'mi_calloc', 9: 'je_calloc', 10: 'tc_calloc',
+    11: 'realloc', 12: 'mi_realloc', 13: 'je_realloc', 14: 'tc_realloc',
+    15: 'posix_memalign',
+    16: 'mmap', 17: 'munmap',
+    18: 'free', 19: 'mi_free', 20: 'je_free', 21: 'tc_free',
+    22: '_ZdlPv', 23: '_ZdaPv',
 }
 
+_ALLOC_TYPES = set(range(1, 17))  # 1-16
+_FREE_TYPES = {17}.union(set(range(18, 24)))  # 17-23
+
+_ALLOC_GROUPS = [
+    ("malloc-like",   list(range(1, 7))),
+    ("calloc",        list(range(7, 11))),
+    ("realloc",       list(range(11, 15))),
+    ("posix_memalign", [15]),
+    ("mmap",          [16]),
+]
+_FREE_GROUPS = [
+    ("munmap",        [17]),
+    ("free/delete",   list(range(18, 24))),
+]
+
 def read_malloc_binary(filename):
-    """高效的分块流式读取，避免一次性载入"""
     is_xz = filename.endswith('.xz')
     open_func = lzma.open if is_xz else open
-    
-    # 32字节的固定的结构体格式 (ip removed from the binary record)
     fmt = "<QQQB7s"
     struct_size = struct.calcsize(fmt)
-    
     with open_func(filename, "rb") as f:
-        # 约 2.0MB 的读取缓冲区以加速 I/O (32 bytes * 64K records)
         chunk_size = 32 * 1024 * 64
         while True:
             chunk = f.read(chunk_size)
-            if not chunk:
-                break
-
+            if not chunk: break
             offset = 0
             while offset < len(chunk):
                 record = chunk[offset:offset+struct_size]
-                if len(record) < struct_size:
-                    break
-
+                if len(record) < struct_size: break
                 arg1, arg2, ret, etype, _ = struct.unpack(fmt, record)
                 yield etype, arg1, arg2, ret
                 offset += struct_size
 
 def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, ge_counts, n, size, pow2, split_idx):
-    """更新所有阈值的 current_sizes, peak_sizes, object_counts, ge_counts（分配时调用）"""
     for i in range(split_idx):
-        # size >= thresholds[i]: aligned_sz = size (原始大小), 计入 ge_counts
         ge_counts[i] += 1
         current_sizes[i] += size
-        if current_sizes[i] > peak_sizes[i]:
-            peak_sizes[i] = current_sizes[i]
+        if current_sizes[i] > peak_sizes[i]: peak_sizes[i] = current_sizes[i]
     for i in range(split_idx, n):
-        # size < thresholds[i]: aligned_sz = pow2, 计入 object count
         threshold_object_counts[i] += 1
         current_sizes[i] += pow2
-        if current_sizes[i] > peak_sizes[i]:
-            peak_sizes[i] = current_sizes[i]
+        if current_sizes[i] > peak_sizes[i]: peak_sizes[i] = current_sizes[i]
 
 def _update_sizes_on_free(current_sizes, ge_counts, n, old_sz, pow2, split_idx):
-    """更新所有阈值的 current_sizes 和 ge_counts（释放时调用）"""
     for i in range(split_idx):
-        # old_sz >= thresholds[i]: aligned_sz = old_sz
         ge_counts[i] -= 1
         current_sizes[i] -= old_sz
     for i in range(split_idx, n):
-        # old_sz < thresholds[i]: aligned_sz = pow2
         current_sizes[i] -= pow2
 
 def process_malloc_binary(filename, objects_path=None):
-    # 基础统计，仅使用轻量标量
     func_stats = {k: 0 for k in TYPE_MAP.values()}
-    
-    # 核心精简状态账本：只保留 ACTIVE 对象。
     active_heap = {}
-    
-    # 各阈值的水位线控制 — 使用 list 替代 dict 以提升性能
+
     thresholds = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
     n = len(thresholds)
     current_sizes = [0] * n
     peak_sizes = [0] * n
-    peak_moment_sizes = [0] * n  # original_peak 时刻的快照
+    peak_moment_sizes = [0] * n
     threshold_object_counts = [0] * n
-    current_ge_counts = [0] * n  # 当前活跃对象中 size >= thresholds[i] 的计数
-    peak_moment_ge_counts = [0] * n  # original_peak 时刻的 ge_counts 快照
-    
+    current_ge_counts = [0] * n
+    peak_moment_ge_counts = [0] * n
+
     original_current_size = 0
     original_peak_size = 0
+    all_large_objects = []
 
-    # 记录所有 >=32KB 的大对象 (ptr -> (size, alloc_type))
-    all_large_objects = []  # 所有曾分配过的大对象，每项 (ptr, size, alloc_type)
-    
     print("Streaming processing data to minimize memory footprint...")
-    
-    record_gen = read_malloc_binary(filename)
-    
-    for etype, arg1, arg2, ret in record_gen:
+
+    for etype, arg1, arg2, ret in read_malloc_binary(filename):
         func_name = TYPE_MAP.get(etype, 'unknown')
-        
-        if etype in (1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 16):  # 分配类行为
+
+        if etype in _ALLOC_TYPES:
             func_stats[func_name] += 1
-            
-            size = arg2 if etype in (6, 16) else arg1 # realloc/realloc_inplace: size in arg2
-                
+            size = arg2 if 11 <= etype <= 14 else arg1
+
             if ret != 0:
-                # 发生 realloc 覆盖时，前置清理旧指针占用的内存
-                if etype in (6, 16) and arg1 != 0 and arg1 in active_heap:
+                if 11 <= etype <= 14 and arg1 != 0 and arg1 in active_heap:
                     old_sz = active_heap.pop(arg1)
                     original_current_size -= old_sz
                     old_pow2 = next_power_of_2(old_sz)
                     old_idx = bisect.bisect_right(thresholds, old_sz)
                     _update_sizes_on_free(current_sizes, current_ge_counts, n, old_sz, old_pow2, old_idx)
-                
-                # 记录新对象
+
                 active_heap[ret] = size
                 original_current_size += size
                 if size >= 32768:
@@ -155,47 +146,56 @@ def process_malloc_binary(filename, objects_path=None):
 
                 if original_current_size > original_peak_size:
                     original_peak_size = original_current_size
-                    # 峰值时刻，保存 aligned sizes, ge_counts 和大对象快照
                     peak_moment_sizes = current_sizes.copy()
                     peak_moment_ge_counts = current_ge_counts.copy()
 
-        elif etype in (2, 4):  # 释放类行为 (free, munmap)
+        elif etype in _FREE_TYPES:
             func_stats[func_name] += 1
-            
             ptr = arg1
             if ptr in active_heap:
-                old_sz = active_heap.pop(ptr) # ★关键：立刻从内存哈希表中弹出销毁！
+                old_sz = active_heap.pop(ptr)
                 original_current_size -= old_sz
                 old_pow2 = next_power_of_2(old_sz)
                 old_idx = bisect.bisect_right(thresholds, old_sz)
                 _update_sizes_on_free(current_sizes, current_ge_counts, n, old_sz, old_pow2, old_idx)
 
-    # 接下来把轻量化的汇总数据整理输出到最后的报告文件（控制台 + result.log）
     base_name = os.path.splitext(filename)[0]
     if base_name.endswith('.malloc'): base_name = base_name[:-7]
-    
+
     with open(base_name + ".result.log", "w") as log_out:
         sys.stdout = Tee(sys.stdout, log_out)
-        
-        alloc_types = ['malloc', 'calloc', 'realloc', 'mmap', 'aligned_alloc', 'posix_memalign', 'memalign', 'fortran_alloc', 'valloc', '__libc_memalign', 'realloc_inplace']
-        free_types = ['free', 'munmap']
-        total_alloc = sum(func_stats[t] for t in alloc_types)
-        total_dealloc = sum(func_stats[t] for t in free_types)
+
+        total_alloc = 0
+        total_dealloc = 0
+        for name, codes in _ALLOC_GROUPS:
+            total_alloc += sum(func_stats.get(TYPE_MAP.get(c, 'unknown'), 0) for c in codes)
+        for name, codes in _FREE_GROUPS:
+            total_dealloc += sum(func_stats.get(TYPE_MAP.get(c, 'unknown'), 0) for c in codes)
+
         print("\n=== Function Call Statistics ===")
         print(f"Total Alloc calls: {total_alloc}")
         print(f"Total Free calls:  {total_dealloc}")
         print(f"Active objects remaining in memory: {len(active_heap)}")
 
-        print("\n--- Breakdown by Type ---")
-        breakdown_order = [('malloc', 1), ('calloc', 5), ('realloc', 6), ('realloc_inplace', 16),
-                           ('posix_memalign', 8), ('fortran_alloc', 10), ('mmap', 3),
-                           ('free', 2), ('munmap', 4)]
-        print(f"{'Type':<18} {'Code':>4}  {'Count':>14}")
-        print("-" * 38)
-        for name, code in breakdown_order:
+        print("\n--- Breakdown by Type Group ---")
+        print(f"{'Group':<18} {'Types':>12}  {'Count':>14}")
+        print("-" * 48)
+        for group_name, codes in _ALLOC_GROUPS + _FREE_GROUPS:
+            group_total = 0
+            for c in codes:
+                name = TYPE_MAP.get(c, 'unknown')
+                group_total += func_stats.get(name, 0)
+            if group_total > 0:
+                print(f"{group_name:<18} {len(codes):>12}  {group_total:>14,}")
+
+        print("\n--- Breakdown by Symbol ---")
+        print(f"{'Symbol':<30} {'Code':>4}  {'Count':>14}")
+        print("-" * 52)
+        for code in range(1, 24):
+            name = TYPE_MAP.get(code, 'unknown')
             count = func_stats.get(name, 0)
-            if count > 0 or name in ('malloc','free','mmap','munmap'):
-                print(f"{name:<18} {code:>4}  {count:>14,}")
+            if count > 0:
+                print(f"{name:<30} {code:>4}  {count:>14,}")
 
         print("\n=== Peak Memory Usage Summary ===")
         print(f"Original Physical Peak: {format_size(original_peak_size)}")
@@ -213,7 +213,6 @@ def process_malloc_binary(filename, objects_path=None):
             print(f"{t:>9}  {increase:>27,}  {inc_pct:>9.2f}%  {delta:>16,}  {obj_pct:>15.2f}%  {desc_overhead:>13,}  {desc_pct:>15.2f}%")
             prev = threshold_object_counts[i]
 
-        # 输出所有 >=32KB 的大对象列表，按大小降序排列
         if objects_path is not None:
             if all_large_objects:
                 sorted_large = sorted(all_large_objects, key=lambda x: x[1], reverse=True)
@@ -229,14 +228,12 @@ def process_malloc_binary(filename, objects_path=None):
                 print(f"No objects >= 32KB found (empty report written to: {objects_path})")
 
         print(f"Analysis successfully done. Output logs saved to base: {base_name}")
-
-        # 恢复系统的标准输出流
         sys.stdout = sys.__stdout__
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer')
-    parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all" to process all *.malloc.bin.xz in current directory')
-    parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report. If not specified, no objects log is generated.')
+    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v5 39-type)')
+    parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all"')
+    parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report')
     args = parser.parse_args()
 
     if args.input.lower() == 'all':
@@ -247,13 +244,11 @@ if __name__ == '__main__':
         print(f"Processing {len(files)} file(s):")
         for f in files:
             print(f"\n  --- {f} ---")
-            # In batch mode, generate per-file objects path if -o is given
+            objs = None
             if args.objects:
                 base_name = os.path.splitext(os.path.basename(f))[0]
                 if base_name.endswith('.malloc'): base_name = base_name[:-7]
                 objs = base_name + ".objects.log"
-            else:
-                objs = None
             process_malloc_binary(f, objects_path=objs)
         print("\nAll files processed.")
     else:

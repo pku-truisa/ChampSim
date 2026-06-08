@@ -19,6 +19,10 @@
 #include <unistd.h>
 #include <new>
 
+// File-scope class with virtual destructor to force g++ to emit _Znam
+// (not _Znwm) for operator new[].
+struct GlobalObj { int val; virtual ~GlobalObj() {} };
+
 int main()
 {
   printf("=== Tracer v3 Comprehensive Test ===\n\n");
@@ -105,14 +109,16 @@ int main()
   printf("  realloc chain: 1024→2048→512→4096 → 4 allocs + 1 free\n");
 
   // ================================================================
-  // Phase 8: C++ operator new (type=1 via _Znwm hook)
+  // Phase 8: C++ operator new / new[] / delete / delete[]
+  //   Uses GlobalObj with virtual destructor (file scope) to force
+  //   g++ to emit _Znam instead of optimizing to _Znwm.
   // ================================================================
-  printf("--- Phase 8: C++ operator new → type=1 ---\n");
-  int* np1 = new int(42);                     allocs++;  // type=1
-  int* np2 = new int[10];                     allocs++;  // type=1 (_Znam)
-  delete np1;                                  frees++;   // type=2
-  delete[] np2;                                frees++;   // type=2
-  printf("  new/delete => 2 allocs + 2 frees\n");
+  printf("--- Phase 8: C++ operator new/new[]/delete/delete[] ---\n");
+  int* np1 = new int(42);                     allocs++;  // type=5 (_Znwm)
+  GlobalObj* np2 = new GlobalObj[10];         allocs++;  // type=6 (_Znam)
+  delete np1;                                  frees++;   // type=22 (_ZdlPv)
+  delete[] np2;                                frees++;   // type=23 (_ZdaPv)
+  printf("  new/new[]/delete/delete[] => 2 allocs + 2 frees\n");
 
   // ================================================================
   // Summary
