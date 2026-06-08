@@ -30,11 +30,13 @@
 
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 #include "../../inc/trace_instruction.h"
 #include "pin.H"
@@ -140,6 +142,25 @@ KNOB<UINT64> KnobTraceLen(KNOB_MODE_WRITEONCE, "pintool", "t", "0", "How many in
 
 KNOB<UINT64> KnobMallocThreshold(KNOB_MODE_WRITEONCE, "pintool", "k", "256", "Record malloc/free events only for allocations >= this size in bytes");
 
+KNOB<std::string> KnobConfigFile(KNOB_MODE_WRITEONCE, "pintool", "c", "", "specify a config file for multi-segment trace (format: -s N -t N -o file per line)");
+
+/* ===================================================================== */
+// Multi-segment trace support
+/* ===================================================================== */
+struct TraceSegment {
+  INT64 abs_skip;           // absolute skip from program start
+  INT64 length;             // trace length
+  std::string output_file;  // output file name
+};
+
+std::vector<TraceSegment> segments;
+size_t current_segment_idx = 0;
+INT64 total_instructions_passed = 0;  // cumulative instruction count from program start
+
+// Forward declarations for multi-segment functions
+void dump_tracked_allocations(std::ofstream& of);
+void start_next_segment();
+
 /* ===================================================================== */
 // Utilities
 /* ===================================================================== */
@@ -154,6 +175,9 @@ INT32 Usage()
             << "Specify the number of instructions to skip before tracing with -s" << std::endl
             << "Specify the number of instructions to trace with -t (0 for unlimited)" << std::endl
             << "Specify the minimum allocation size threshold with -k (default 256)" << std::endl
+            << "Specify a multi-segment config file with -c" << std::endl
+            << "  Config file format: one line per segment, each with -s N -t N -o filename" << std::endl
+            << "  Example: echo '-s 100000000 -t 50000000 -o trace_0.champsim' > cfg.txt" << std::endl
             << std::endl;
 
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
@@ -171,6 +195,22 @@ void fast_forward_trace(UINT32 trace_size)
   }
 }
 
+void dump_tracked_allocations(std::ofstream& of)
+{
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+  for (const auto& [addr, info] : tracked_allocations) {
+    curr_instr = {};
+    curr_instr.is_malloc = info.type;
+    curr_instr.source_memory[0] = info.size;
+    curr_instr.destination_memory[0] = addr;
+
+    typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
+    std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
+    of.write(buf, sizeof(trace_instr_format_t));
+  }
+  PIN_ReleaseLock(&malloc_lock);
+}
+
 void fast_forward_ins()
 {
   if (fast_forward_insts_left > 0) {
@@ -179,18 +219,7 @@ void fast_forward_ins()
   } else if (skip_dumping_instructions) {
     // Fast-forward finished: dump all active allocations as baseline
     // memory state for Champsim's initial memory footprint.
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    for (const auto& [addr, info] : tracked_allocations) {
-      curr_instr = {};
-      curr_instr.is_malloc = info.type;
-      curr_instr.source_memory[0] = info.size;
-      curr_instr.destination_memory[0] = addr;
-
-      typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
-      std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
-      outfile.write(buf, sizeof(trace_instr_format_t));
-    }
-    PIN_ReleaseLock(&malloc_lock);
+    dump_tracked_allocations(outfile);
 
     // Clear any pending alloc event from the last fast-forward instruction
     pending_instr_malloc = {};
@@ -201,14 +230,179 @@ void fast_forward_ins()
   }
 }
 
+// Parse multi-segment config file. Format: one segment per line:
+//   -s N -t N -o filename
+// Comments starting with '#' are ignored.  Blank lines are skipped.
+// Segments must be sorted by ascending abs_skip.
+void parse_config(const std::string& config_path)
+{
+  std::ifstream cfg(config_path);
+  if (!cfg) {
+    std::cerr << "Error: cannot open config file: " << config_path << std::endl;
+    exit(1);
+  }
+
+  std::string line;
+  int line_no = 0;
+  INT64 prev_skip = -1;
+
+  while (std::getline(cfg, line)) {
+    line_no++;
+
+    // strip comment
+    auto comment_pos = line.find('#');
+    if (comment_pos != std::string::npos)
+      line = line.substr(0, comment_pos);
+
+    // trim
+    line.erase(0, line.find_first_not_of(" \t\r\n"));
+    line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+    if (line.empty()) continue;
+
+    std::istringstream iss(line);
+    TraceSegment seg;
+    seg.length = 0;
+
+    std::string token;
+    while (iss >> token) {
+      if (token == "-s") {
+        if (!(iss >> seg.abs_skip)) {
+          std::cerr << "Error in config line " << line_no << ": missing value for -s" << std::endl;
+          exit(1);
+        }
+      } else if (token == "-t") {
+        if (!(iss >> seg.length)) {
+          std::cerr << "Error in config line " << line_no << ": missing value for -t" << std::endl;
+          exit(1);
+        }
+      } else if (token == "-o") {
+        if (!(iss >> seg.output_file)) {
+          std::cerr << "Error in config line " << line_no << ": missing value for -o" << std::endl;
+          exit(1);
+        }
+      } else {
+        std::cerr << "Error in config line " << line_no << ": unexpected token '" << token << "'" << std::endl;
+        exit(1);
+      }
+    }
+
+    if (seg.output_file.empty()) {
+      std::cerr << "Error in config line " << line_no << ": missing -o filename" << std::endl;
+      exit(1);
+    }
+    if (seg.length < 0) {
+      std::cerr << "Error in config line " << line_no << ": -t must be >= 0" << std::endl;
+      exit(1);
+    }
+
+    // Validate ascending order of abs_skip
+    if (seg.abs_skip < prev_skip) {
+      std::cerr << "Error in config line " << line_no << ": -s values must be non-decreasing "
+                << "(prev=" << prev_skip << ", cur=" << seg.abs_skip << ")" << std::endl;
+      exit(1);
+    }
+    prev_skip = seg.abs_skip;
+
+    segments.push_back(seg);
+  }
+
+  if (segments.empty()) {
+    std::cerr << "Error: config file contains no valid segments" << std::endl;
+    exit(1);
+  }
+
+  std::cout << "[ChampSim Tracer] Parsed " << segments.size() << " trace segment(s) from config." << std::endl;
+  for (size_t i = 0; i < segments.size(); i++) {
+    std::cout << "  segment " << i << ": skip=" << segments[i].abs_skip
+              << " trace=" << segments[i].length
+              << " output=" << segments[i].output_file << std::endl;
+  }
+}
+
+// Switch to the next trace segment. Called when current segment ends.
+// Sets up fast-forward for the next segment's absolute skip offset,
+// opens the new output file, and resets all per-segment state.
+void start_next_segment()
+{
+  current_segment_idx++;
+  if (current_segment_idx >= segments.size()) {
+    // No more segments — let program run to natural completion
+    trace_limit_reached = true;
+    std::cout << "[ChampSim Tracer] All segments completed. Letting program finish.\n";
+    return;
+  }
+
+  const auto& seg = segments[current_segment_idx];
+
+  // Compute how many more instructions to skip to reach abs_skip
+  INT64 delta_skip = seg.abs_skip - total_instructions_passed;
+  if (delta_skip < 0) delta_skip = 0;
+
+  // Close previous output file
+  if (outfile.is_open()) {
+    outfile.close();
+  }
+
+  // Open new output file
+  outfile.open(seg.output_file.c_str(), std::ios_base::binary | std::ios_base::trunc);
+  if (!outfile) {
+    std::cerr << "Error: cannot open output file: " << seg.output_file << std::endl;
+    exit(1);
+  }
+
+  // Write allocation baseline for this segment
+  dump_tracked_allocations(outfile);
+  pending_instr_malloc = {};
+
+  // Set up counters for this segment
+  fast_forward_insts_left = delta_skip;
+  trace_insts_left = seg.length;
+  skip_dumping_instructions = (delta_skip > 0);
+
+  // Reset trace_limit_reached so allocator callbacks run again
+  trace_limit_reached = false;
+
+  // Re-instrument if we're in fast-forward mode
+  if (fast_forward_insts_left > 500) {
+    std::cout << "[ChampSim Tracer] Segment " << current_segment_idx
+              << ": fast-forwarding " << fast_forward_insts_left
+              << " instructions (abs_skip=" << seg.abs_skip
+              << "), then tracing " << seg.length
+              << " instrs to " << seg.output_file << std::endl;
+    PIN_RemoveInstrumentation();
+  } else {
+    std::cout << "[ChampSim Tracer] Segment " << current_segment_idx
+              << ": no fast-forward needed (abs_skip=" << seg.abs_skip
+              << "), tracing " << seg.length
+              << " instrs to " << seg.output_file
+              << ". Baseline allocations: " << tracked_allocations.size() << std::endl;
+    skip_dumping_instructions = false;
+  }
+}
+
 void check_end_of_trace()
 {
   if (trace_insts_left > 0) {
     trace_insts_left -= 1;
     if (trace_insts_left == 0) {
-      trace_limit_reached = true;
-      std::cout << "Reaching trace length limit, terminating early.\n";
-      PIN_ExitApplication(0);
+      // Accumulate instruction count: abs_skip + length for this completed segment
+      const auto& seg = segments.empty() ? TraceSegment{0, 0, ""} : segments[current_segment_idx];
+      total_instructions_passed = seg.abs_skip + seg.length;
+
+      if (!segments.empty() && current_segment_idx + 1 < segments.size()) {
+        std::cout << "[ChampSim Tracer] Segment " << current_segment_idx
+                  << " finished. Switching to next segment.\n";
+        start_next_segment();
+      } else {
+        trace_limit_reached = true;
+        std::cout << "Reaching trace length limit, terminating early.\n";
+        if (segments.empty()) {
+          // Single-segment mode: exit immediately
+          PIN_ExitApplication(0);
+        }
+        // Multi-segment mode: let program run to natural exit (Fini will handle cleanup)
+      }
     }
   }
 }
@@ -747,16 +941,44 @@ int main(int argc, char* argv[])
   if (PIN_Init(argc, argv))
     return Usage();
 
-  trace_insts_left = KnobTraceLen.Value();
-  fast_forward_insts_left = KnobFastForward.Value();
-
   PIN_InitLock(&malloc_lock);
   tls_key = PIN_CreateThreadDataKey(ThreadCleanup);
 
-  outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
-  if (!outfile) {
-    std::cout << "Couldn't open output trace file. Exiting." << std::endl;
-    exit(1);
+  std::string config_path = KnobConfigFile.Value();
+
+  if (!config_path.empty()) {
+    // --- Multi-segment mode ---
+    parse_config(config_path);
+
+    // Initialize the first segment
+    const auto& first = segments[0];
+
+    // Prepare the first output file
+    outfile.open(first.output_file.c_str(), std::ios_base::binary | std::ios_base::trunc);
+    if (!outfile) {
+      std::cerr << "Couldn't open output trace file: " << first.output_file << std::endl;
+      exit(1);
+    }
+
+    fast_forward_insts_left = first.abs_skip;   // skip from program start
+    trace_insts_left = first.length;
+    trace_limit_reached = false;
+    skip_dumping_instructions = (first.abs_skip > 0);
+
+    std::cout << "[ChampSim Tracer] Multi-segment mode: " << segments.size() << " segments" << std::endl;
+    std::cout << "[ChampSim Tracer] Segment 0: skip=" << first.abs_skip
+              << " trace=" << first.length
+              << " output=" << first.output_file << std::endl;
+  } else {
+    // --- Single-segment mode (backward compatible) ---
+    trace_insts_left = KnobTraceLen.Value();
+    fast_forward_insts_left = KnobFastForward.Value();
+
+    outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
+    if (!outfile) {
+      std::cout << "Couldn't open output trace file. Exiting." << std::endl;
+      exit(1);
+    }
   }
 
   TRACE_AddInstrumentFunction(insert_instrumentation, 0);
