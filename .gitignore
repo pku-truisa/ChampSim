@@ -40,4 +40,9 @@ tracer/pin-object/test/test_malloc
 *.log
 .gitignore
 
-malloc_bin
+**/*.malloc_bin
+**/*.bin
+**/whole_program.1/
+**/*.Data
+**/*.swp
+**/*.info.*

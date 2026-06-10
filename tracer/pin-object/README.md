@@ -18,10 +18,24 @@ Download the source of PIN from Intel's website, then build it in a location of 
 
 ## Building the tracer
 
-The provided makefile will generate `obj-intel64/object_tracer.so`.
+The provided makefile uses the standard Pin kit build system. Set `PIN_ROOT` to your Pin or SDE kit's `pinkit` directory.
 
-    make
-    $PIN_ROOT/pin -t obj-intel64/object_tracer.so -- <your program here>
+```bash
+# Build with SDE kit (recommended)
+make PIN_ROOT=$SDE_BUILD_KIT/pinkit
+
+# Or build with standalone Pin kit
+export PIN_ROOT=/path/to/pin
+make
+```
+
+This generates `obj-intel64/object_tracer.so`.
+
+> **Important for SDE users:** The compiled `.so` **must** be copied into the SDE kit's `intel64/` directory before use, as `sde64` resolves tool names relative to that path:
+>
+> ```bash
+> cp obj-intel64/object_tracer.so $SDE_BUILD_KIT/intel64/
+> ```
 
 ## Command-line options
 
@@ -31,15 +45,68 @@ Specify the output file for the binary malloc trace.
 The default is malloc.bin.
 ```
 
+## SDE PinPlay Replay
+
+The tool includes a built-in argument filter that strips PinPlay-injected internal options (`-work-dir`, `-pinplay:work-dir`, `-replay`, etc.), making it compatible with **both** standard `pin -t` and SDE PinPlay replay modes without any code changes.
+
+### Whole Program replay
+
+Replay a whole-program pinball with object tracing:
+
+```bash
+$SDE_BUILD_KIT/sde64 -skl -replay \
+  -t object_tracer.so \
+  -replay:basename whole_program.1/<program>.<pid>_<tid> \
+  -replay:strace -replay:playout 0 -replay:deadlock_timeout 0 \
+  -xyzzy \
+  -- $SDE_BUILD_KIT/intel64/nullapp
+```
+
+`malloc.bin` is written to the current working directory.
+
+### Region Pinball replay
+
+Each region pinball can be replayed independently:
+
+```bash
+for rpb in test-malloc.1_6864.pp/*.address; do
+  rpbname=$(basename "$rpb" .address)
+  dir=$(dirname "$rpb")
+  $SDE_BUILD_KIT/sde64 -skl -replay \
+    -t object_tracer.so \
+    -replay:basename "$dir/$rpbname" \
+    -replay:strace -replay:playout 0 -replay:deadlock_timeout 0 \
+    -xyzzy \
+    -- $SDE_BUILD_KIT/intel64/nullapp
+  mv malloc.bin "$dir/${rpbname}.malloc.bin"
+done
+```
+
 ## Usage Examples
 
-### Trace malloc events for a program
+### Standard Pin — trace a live program
 
-    pin -t obj-intel64/object_tracer.so -- ./my_program
+```bash
+pin -t obj-intel64/object_tracer.so -- ./my_program
+pin -t obj-intel64/object_tracer.so -m my_malloc.bin -- ./my_program
+```
 
-### Trace malloc events with a custom output file
+### SDE — trace a live program
 
-    pin -t obj-intel64/object_tracer.so -m my_malloc.bin -- ./my_program
+```bash
+$SDE_BUILD_KIT/sde64 -skl -t object_tracer.so -m malloc.bin -- ./my_program
+```
+
+### SDE — replay a whole program pinball
+
+```bash
+$SDE_BUILD_KIT/sde64 -skl -replay \
+  -t object_tracer.so \
+  -replay:basename whole_program.1/test-malloc.1_6864 \
+  -replay:strace -replay:playout 0 -replay:deadlock_timeout 0 \
+  -xyzzy \
+  -- $SDE_BUILD_KIT/intel64/nullapp
+```
 
 ## Tracked Allocation Functions
 

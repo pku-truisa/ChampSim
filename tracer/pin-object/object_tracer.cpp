@@ -498,10 +498,43 @@ VOID Fini(INT32 code, VOID* v)
   std::cout << "[Object Tracer v5] Active tracked: " << tracked_addresses.size() << std::endl;
 }
 
+/* ===================================================================== */
+// PinPlay/SDE argument filter for SDE replay compatibility
+/* ===================================================================== */
+static bool is_pinplay_arg(const std::string& arg)
+{
+  static const std::vector<std::string> pinplay_prefixes = {
+    "-pinplay:", "-xyzzy", "-work-dir", "-use-cpuid-from-kit",
+    "-chip-check", "-cpuid-in", "-bridge-save-mxcsr", "-bridge-set-mxcsr",
+    "-cc_memory_size_64", "-follow-execv", "-virtual_segments",
+    "-xed_ignore_unknown_reg", "-update-cpuid-from-host", "-sync-avx512-state",
+    "-logfile", "-dcfg", "-dcfg:read_dcfg", "-log:mt", "-log:mp_mode",
+    "-log:mp_atomic", "-log:fat", "-log:region_id", "-log:syminfo",
+    "-log:pid", "-start_address", "-controller_log", "-controller_olog",
+    "-pcregions:in", "-pcregions:merge_warmup", "-replay",
+    "-replay:basename", "-replay:strace", "-replay:playout",
+    "-replay:deadlock_timeout", "-reserve_memory", "--no_print_cmd"
+  };
+  for (const auto& pf : pinplay_prefixes) {
+    if (arg == pf || arg.rfind(pf, 0) == 0) return true;
+  }
+  return false;
+}
+
 int main(int argc, char* argv[])
 {
+  std::vector<char*> filtered;
+  for (int i = 0; i < argc; i++) {
+    std::string arg(argv[i]);
+    if (is_pinplay_arg(arg)) {
+      if (arg.find('=') == std::string::npos && i + 1 < argc &&
+          argv[i+1][0] != '-') i++;
+      continue;
+    }
+    filtered.push_back(argv[i]);
+  }
   PIN_InitSymbols();
-  if (PIN_Init(argc, argv)) return Usage();
+  if (PIN_Init((int)filtered.size(), filtered.data())) return Usage();
   PIN_InitLock(&malloc_lock);
   PIN_InitLock(&stats_lock);
   tls_key = PIN_CreateThreadDataKey(ThreadCleanup);
