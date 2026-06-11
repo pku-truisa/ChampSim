@@ -132,6 +132,29 @@ struct {
 } pending_instr_malloc;
 
 /* ===================================================================== */
+// Batch write buffer — accumulate records and flush in bulk
+/* ===================================================================== */
+template <size_t N = 4096>
+struct TraceBuffer {
+  trace_instr_format_t buffer[N];
+  size_t count = 0;
+
+  void push(const trace_instr_format_t& rec, std::ofstream& of) {
+    buffer[count++] = rec;
+    if (count == N) flush(of);
+  }
+
+  void flush(std::ofstream& of) {
+    if (count == 0) return;
+    of.write(reinterpret_cast<typename decltype(of)::char_type*>(buffer),
+             sizeof(trace_instr_format_t) * count);
+    count = 0;
+  }
+};
+
+static TraceBuffer<4096> trace_buffer;
+
+/* ===================================================================== */
 // Command line switches
 /* ===================================================================== */
 KNOB<std::string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "champsim.trace", "specify file name for Champsim tracer output");
@@ -197,6 +220,9 @@ void fast_forward_trace(UINT32 trace_size)
 
 void dump_tracked_allocations(std::ofstream& of)
 {
+  // Flush any buffered instruction records so baseline appears after them
+  trace_buffer.flush(outfile);
+
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
   for (const auto& [addr, info] : tracked_allocations) {
     curr_instr = {};
@@ -339,6 +365,9 @@ void start_next_segment()
   INT64 delta_skip = seg.abs_skip - total_instructions_passed;
   if (delta_skip < 0) delta_skip = 0;
 
+  // Flush any buffered records to the current file before closing
+  trace_buffer.flush(outfile);
+
   // Close previous output file
   if (outfile.is_open()) {
     outfile.close();
@@ -457,9 +486,7 @@ void WriteCurrentInstruction()
   // is dumped in bulk when fast-forward ends.
   if (skip_dumping_instructions) return;
 
-  typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
-  std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
-  outfile.write(buf, sizeof(trace_instr_format_t));
+  trace_buffer.push(curr_instr, outfile);
 }
 
 void BranchOrNot(UINT32 taken)
@@ -899,15 +926,51 @@ VOID ResetDepthOnMain()
 VOID Fini(INT32 code, VOID* v)
 {
   if (outfile.is_open()) {
+    trace_buffer.flush(outfile);
     outfile.close();
   }
   std::cout << "[ChampSim Tracer] Trace saved. Active tracked: " << tracked_allocations.size() << std::endl;
 }
 
+/* ===================================================================== */
+// SDE/PinPlay argument filter — verbatim from object_tracer.cpp v5
+/* ===================================================================== */
+static bool is_pinplay_arg(const std::string& arg)
+{
+  static const std::vector<std::string> pinplay_prefixes = {
+    "-pinplay:", "-xyzzy", "-work-dir", "-use-cpuid-from-kit",
+    "-chip-check", "-cpuid-in", "-bridge-save-mxcsr", "-bridge-set-mxcsr",
+    "-cc_memory_size_64", "-follow-execv", "-virtual_segments",
+    "-xed_ignore_unknown_reg", "-update-cpuid-from-host", "-sync-avx512-state",
+    "-logfile", "-dcfg", "-dcfg:read_dcfg", "-log:mt", "-log:mp_mode",
+    "-log:mp_atomic", "-log:fat", "-log:region_id", "-log:syminfo",
+    "-log:pid", "-start_address", "-controller_log", "-controller_olog",
+    "-pcregions:in", "-pcregions:merge_warmup", "-replay",
+    "-replay:basename", "-replay:strace", "-replay:playout",
+    "-replay:deadlock_timeout", "-reserve_memory", "--no_print_cmd"
+  };
+  for (const auto& pf : pinplay_prefixes) {
+    if (arg == pf || arg.rfind(pf, 0) == 0) return true;
+  }
+  return false;
+}
+
 int main(int argc, char* argv[])
 {
   PIN_InitSymbols();
-  if (PIN_Init(argc, argv))
+
+  // Filter out PinPlay/SDE-specific arguments (e.g. -replay, -xyzzy)
+  std::vector<char*> filtered;
+  for (int i = 0; i < argc; i++) {
+    std::string arg(argv[i]);
+    if (is_pinplay_arg(arg)) {
+      if (arg.find('=') == std::string::npos && i + 1 < argc &&
+          argv[i+1][0] != '-') i++;
+      continue;
+    }
+    filtered.push_back(argv[i]);
+  }
+  if (PIN_Init((int)filtered.size(), filtered.data()))
     return Usage();
 
   PIN_InitLock(&malloc_lock);
