@@ -25,15 +25,19 @@ fi
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 PINOBJECT_DIR="$SCRIPT_DIR"
 
-# --- Build/install object_tracer.so ---
-echo "=== Building object_tracer.so ==="
-make -C "$PINOBJECT_DIR" PIN_ROOT="$SDE_BUILD_KIT/pinkit" 2>&1 | tail -1
-if [ ! -e "$PINOBJECT_DIR/obj-intel64/object_tracer.so" ]; then
-  echo "ERROR: Failed to build object_tracer.so"
-  exit 1
+# --- Build/install object_tracer.so (skip if already present) ---
+if [ ! -e "$SDE_BUILD_KIT/intel64/object_tracer.so" ]; then
+  echo "=== Building object_tracer.so ==="
+  make -C "$PINOBJECT_DIR" PIN_ROOT="$SDE_BUILD_KIT/pinkit" 2>&1 | tail -1
+  if [ ! -e "$PINOBJECT_DIR/obj-intel64/object_tracer.so" ]; then
+    echo "ERROR: Failed to build object_tracer.so"
+    exit 1
+  fi
+  cp "$PINOBJECT_DIR/obj-intel64/object_tracer.so" "$SDE_BUILD_KIT/intel64/object_tracer.so"
+  echo "object_tracer.so installed to SDE kit"
+else
+  echo "object_tracer.so already exists in SDE kit, skipping build"
 fi
-cp "$PINOBJECT_DIR/obj-intel64/object_tracer.so" "$SDE_BUILD_KIT/intel64/object_tracer.so"
-echo "object_tracer.so installed to SDE kit"
 
 # --- Check prerequisites ---
 if [ ! -e "$SDE_BUILD_KIT/pinplay-scripts" ]; then
@@ -46,23 +50,34 @@ if [ ! -e "$SDE_BUILD_KIT/intel64/nullapp" ]; then
   exit 1
 fi
 
-# --- Step 1: Whole Program Recording ---
-echo ""
-echo "=== Step 1: Whole Program Recording ==="
-$SDE_BUILD_KIT/pinplay-scripts/sde_pinpoints.py \
-  --pin_options "$SDE_ARCH" $GLOBAL $PCCOUNT \
-  --program_name=$PROGRAM --input_name=$INPUT \
-  --command="$COMMAND" --delete --mode st \
-  --log_options="-start_address main -log:fat -log:mp_mode 0 -log:mp_atomic 0" \
-  --replay_options="-replay:strace" -l -r
-
-# Determine whole_program pinball basename
-WPB=$(ls whole_program.$INPUT/*.address 2>/dev/null | head -1 | sed '/.address/s///')
-if [ -z "$WPB" ]; then
-  echo "ERROR: Whole program pinball not found in whole_program.$INPUT/"
-  exit 1
+# --- Step 1: Whole Program Recording (skip if already done) ---
+WPB=""
+if [ -d "whole_program.$INPUT" ]; then
+  WPB=$(ls whole_program.$INPUT/*.address 2>/dev/null | head -1 | sed '/.address/s///')
 fi
-echo "Whole program pinball: $WPB"
+
+if [ -z "$WPB" ]; then
+  echo ""
+  echo "=== Step 1: Whole Program Recording ==="
+  $SDE_BUILD_KIT/pinplay-scripts/sde_pinpoints.py \
+    --pin_options "$SDE_ARCH" $GLOBAL $PCCOUNT \
+    --program_name=$PROGRAM --input_name=$INPUT \
+    --command="$COMMAND" --delete --mode st \
+    --log_options="-start_address main -log:fat -log:mp_mode 0 -log:mp_atomic 0" \
+    --replay_options="-replay:strace" -l -r
+
+  # Determine whole_program pinball basename
+  WPB=$(ls whole_program.$INPUT/*.address 2>/dev/null | head -1 | sed '/.address/s///')
+  if [ -z "$WPB" ]; then
+    echo "ERROR: Whole program pinball not found in whole_program.$INPUT/"
+    exit 1
+  fi
+  echo "Whole program pinball: $WPB"
+else
+  echo ""
+  echo "=== Whole program recording already exists, skipping Step 1 ==="
+  echo "Using existing pinball: $WPB"
+fi
 
 # --- Step 2: Replay whole program with object_tracer.so ---
 echo ""
