@@ -127,69 +127,32 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
     // Inflate trace format into core model instructions
     auto begin = std::begin(trace_read_buf);
     auto end = std::next(begin, bytes_read / sizeof(T));
-    std::transform(begin, end, std::back_inserter(instr_buffer), [cpu = this->cpu](T t) {
-      // Process memory allocation/deallocation events before creating ooo_model_instr
-      // Support both new input_instr (instr_type/instr_info) and cloudsuite_instr (is_malloc) formats
-      if constexpr (std::is_same_v<T, input_instr>) {
-        // New format: instr_type=2 indicates allocation, instr_info holds the alloc type
-        if (t.instr_type == 2) {
-          uint8_t alloc_type = t.instr_info;
-          switch (alloc_type) {
-            case 1: case 3: case 5: case 8:
-              mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
-              break;
-            case 6: // realloc
-              if (t.source_memory[1] != 0)
-                mol_table.record_free(champsim::address{t.source_memory[1]});
-              mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
-              break;
-            case 2: case 4:
-              mol_table.record_free(champsim::address{t.source_memory[0]});
-              break;
-            default: break;
-          }
+    // Process trace records: record memory operations, skip allocation events
+    for (auto it = begin; it != end; ++it) {
+      T t = *it;
+      // Process memory allocation/deallocation events (shared logic for both formats)
+      if (t.instr_type == 2) {
+        uint8_t alloc_type = t.instr_info;
+        switch (alloc_type) {
+          case 1: case 3: case 5: case 8:
+            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
+            break;
+          case 6: // realloc
+            if (t.source_memory[1] != 0)
+              mol_table.record_free(champsim::address{t.source_memory[1]});
+            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
+            break;
+          case 2: case 4:
+            mol_table.record_free(champsim::address{t.source_memory[0]});
+            break;
+          default: break;
         }
-        // Convert to old field names for ooo_model_instr constructor compatibility
-        struct legacy_instr {
-          unsigned long long ip;
-          unsigned char is_branch;
-          unsigned char branch_taken;
-          unsigned char destination_registers[NUM_INSTR_DESTINATIONS];
-          unsigned char source_registers[NUM_INSTR_SOURCES];
-          unsigned long long destination_memory[NUM_INSTR_DESTINATIONS];
-          unsigned long long source_memory[NUM_INSTR_SOURCES];
-        };
-        legacy_instr compat;
-        compat.ip = t.ip;
-        compat.is_branch = (t.instr_type == 1) ? 1 : 0;
-        compat.branch_taken = (t.instr_type == 1) ? t.instr_info : 0;
-        std::copy(std::begin(t.destination_registers), std::end(t.destination_registers), compat.destination_registers);
-        std::copy(std::begin(t.source_registers), std::end(t.source_registers), compat.source_registers);
-        std::copy(std::begin(t.destination_memory), std::end(t.destination_memory), compat.destination_memory);
-        std::copy(std::begin(t.source_memory), std::end(t.source_memory), compat.source_memory);
-        return ooo_model_instr{cpu, compat};
-      } else {
-        // Legacy cloudsuite_instr format: is_malloc field indicates allocation
-        if (t.is_malloc > 0) {
-          uint8_t alloc_type = t.is_malloc;
-          switch (alloc_type) {
-            case 1: case 3: case 5: case 7: case 8: case 9:
-              mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
-              break;
-            case 6: // realloc
-              if (t.source_memory[1] != 0)
-                mol_table.record_free(champsim::address{t.source_memory[1]});
-              mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
-              break;
-            case 2: case 4:
-              mol_table.record_free(champsim::address{t.source_memory[0]});
-              break;
-            default: break;
-          }
-        }
-        return ooo_model_instr{cpu, t};
+        // Skip allocation instructions: they are not real instructions
+        continue;
       }
-    });
+      // Normal instruction or branch: create ooo_model_instr and enqueue
+      instr_buffer.push_back(ooo_model_instr{cpu, t});
+    }
 
     // Set branch targets
     set_branch_targets(std::begin(instr_buffer), std::end(instr_buffer));

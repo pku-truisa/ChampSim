@@ -1,7 +1,7 @@
 # Intel PIN tracer
 
 The included PIN tool `champsim_tracer.cpp` can be used to generate new traces.
-It has been tested (April 2022) using PIN 3.22.
+It has been tested using PIN 3.22+.
 
 ## Download and install PIN
 
@@ -17,19 +17,49 @@ Download the source of PIN from Intel's website, then build it in a location of 
 
 The provided makefile will generate `obj-intel64/champsim_tracer.so`.
 
+    cd tracer/pin
     make
     $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -- <your program here>
 
-The tracer has several options you can set:
+## Three Operation Modes
+
+The tracer supports three mutually exclusive modes:
+
+### 1. Compat mode (default, no `-m`)
+
+Produces an instruction trace **without** allocation events. Compatible with the upstream
+ChampSim trace format. Only normal instructions (instr_type=0) and branches (instr_type=1)
+are recorded. Allocation events are completely ignored.
+
+    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -o trace.champsim -t 1000000 -- ./my_program
+
+### 2. Embedded alloc mode (`-m`, no `-a`)
+
+Produces an instruction trace **with** allocation events (instr_type=2) embedded between
+normal instructions. Allocation events are mixed into the same output file as the instruction
+records. This allows the simulator to reconstruct the dynamic memory allocation history.
+
+    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -o trace.champsim -t 1000000 -m -- ./my_program
+
+### 3. Alloc-only mode (`-m -a <file>`)
+
+Produces **only** allocation events (64-byte input_instr records with instr_type=2).
+No instruction trace is generated. This mode has no threshold filtering — all allocation
+events are recorded regardless of size.
+
+    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -m -a alloc_trace.bin -- ./my_program
+
+## Options
+
 ```
 -o <filename>
-Specify the output file for your instruction trace.
-The default is champsim.trace.
+Specify the output file for the instruction trace (compat and embedded alloc modes only).
+The default is champsim.trace. Not used in alloc-only mode.
 
 -s <number>
 Specify the number of instructions to skip in the program before tracing begins.
-This is useful for skipping initialization code that you don't want to include in your instruction trace.
-The default value is 0 (start tracing from the beginning).
+This is useful for skipping initialization code that you don't want to include in
+your instruction trace. The default value is 0 (start tracing from the beginning).
 
 -t <number>
 The number of instructions to trace, after -s instructions have been skipped.
@@ -37,39 +67,39 @@ The default value is 0, which means trace all instructions (unlimited).
 If you specify a positive number N, the tracer will stop after tracing N instructions.
 
 -k <number>
-Minimum allocation size to trace for malloc events embedded in instruction trace (in bytes).
-The default value is 256, which means record only allocations >= 256 bytes.
+Minimum allocation size to record for allocation events embedded in the instruction
+trace (embedded alloc mode only). The default value is 256 bytes.
+Not used in compat or alloc-only modes.
 
 -c <filename>
-Specify a config file for multi-segment trace. Format: one line per segment, each with -s N -t N -o filename.
+Specify a config file for multi-segment trace. Format: one line per segment,
+each with -s N -t N -o filename.
 Example: echo '-s 100000000 -t 50000000 -o trace_0.champsim' > cfg.txt
 
--m <filename>
-Malloc-only mode. Generate a binary malloc trace file (32-byte records) compatible with
-object_tracer.cpp and analyzable by little_object_analyzer.py.
-When this flag is set, all other options (-o, -s, -t, -k, -c) are ignored.
-The tracer will only record memory allocation/deallocation events in a format
-identical to tracer/pin-object/object_tracer.cpp, with 23 fine-grained type codes
-(1=malloc, 2=mi_malloc, ..., 23=_ZdaPv).
-Default filename: malloc.bin
+-m
+Enable allocation event recording. Without -a, operates in embedded alloc mode:
+allocation events are mixed into the instruction trace output.
+With -a, operates in alloc-only mode. See "Three Operation Modes" above.
+
+-a <filename>
+(Requires -m) Alloc-only mode. Output only allocation events (64-byte input_instr
+records with instr_type=2) to the specified file. No instruction trace is generated.
+All allocation events are recorded regardless of size (-k is ignored).
 ```
 
 ## Usage Examples
 
-### Trace entire program execution (default behavior)
-Trace all instructions from start to finish:
-
-    pin -t obj-intel64/champsim_tracer.so -- ./my_program
-
-### Trace with fast-forward
-Skip the first 1 million instructions, then trace the next 500,000 instructions:
+### Compat mode (upstream ChampSim compatible)
 
     pin -t obj-intel64/champsim_tracer.so -o my_trace.champsim -s 1000000 -t 500000 -- ./my_program
 
-### Trace with custom output file
-Specify a custom output filename:
+### Embedded alloc mode
 
-    pin -t obj-intel64/champsim_tracer.so -o traces/ls_trace.champsim -- ls
+    pin -t obj-intel64/champsim_tracer.so -o trace_with_alloc.champsim -t 500000 -m -- ls
+
+### Alloc-only mode
+
+    pin -t obj-intel64/champsim_tracer.so -m -a alloc_events.bin -- ./my_program
 
 ### Multi-segment trace
 
@@ -77,63 +107,54 @@ Specify a custom output filename:
     echo '-s 2000000 -t 500000 -o seg1.champsim' >> cfg.txt
     pin -t obj-intel64/champsim_tracer.so -c cfg.txt -- ./my_program
 
-### Malloc-only binary trace (compatible with little_object_analyzer.py)
+## Output File Formats
 
-    pin -t obj-intel64/champsim_tracer.so -m malloc.bin -- ./my_program
-    python3 tracer/pin-object/little_object_analyzer.py -i malloc.bin
+### Instruction trace (compat and embedded alloc modes)
 
-    # Custom output filename:
-    pin -t obj-intel64/champsim_tracer.so -m my_trace.bin -- ./my_program
+Output is a sequence of 64-byte `input_instr` records:
 
-### Compare with object_tracer
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0..7   | ip    | Instruction pointer (PC) |
+| 8      | instr_type | 0=normal, 1=branch, 2=alloc (embedded only) |
+| 9      | instr_info | branch_taken or alloc type code |
+| 10..11 | destination_registers[2] | Written register numbers |
+| 12..15 | source_registers[4] | Read register numbers |
+| 16..31 | destination_memory[2] | Written memory addresses |
+| 32..63 | source_memory[4] | Read memory addresses |
 
-The -m output is byte-identical in format to the trace generated by
-tracer/pin-object/object_tracer.so -m. Both can be used interchangeably
-with little_object_analyzer.py.
+### Alloc-only mode
 
-## Tracked Allocation Functions (23 fine-grained type codes)
+Output is also a sequence of 64-byte `input_instr` records, but every record has
+`instr_type=2`. The memory fields encode allocation parameters:
 
-In malloc-only mode (-m), the tracer hooks the following functions with per-symbol type codes:
+| Field | Content |
+|-------|---------|
+| instr_type | Always 2 (allocation event) |
+| instr_info | Coarse type code (see table below) |
+| destination_memory[0] | Returned address (allocated/freed) |
+| source_memory[0] | Size (for alloc) or pointer (for free) |
+| source_memory[1] | Alignment (for posix_memalign) or new_size (for realloc) |
 
-| Code | Function        | Description                    |
-|------|-----------------|--------------------------------|
-| 1    | malloc          | Standard memory allocation     |
-| 2    | mi_malloc       | mimalloc (if linked)           |
-| 3    | je_malloc       | jemalloc (if linked)           |
-| 4    | tc_malloc       | tcmalloc (if linked)           |
-| 5    | _Znwm           | C++ operator new               |
-| 6    | _Znam           | C++ operator new[]             |
-| 7    | calloc          | Allocate and zero-initialize   |
-| 8-10 | mi/je/tc_calloc | Allocator-specific calloc      |
-| 11   | realloc         | Reallocation (moving)          |
-| 12-14| mi/je/tc_realloc| Allocator-specific realloc     |
-| 15   | posix_memalign  | POSIX aligned allocation       |
-| 16   | mmap            | Anonymous memory mapping       |
-| 17   | munmap          | Unmap memory region            |
-| 18   | free            | Standard memory deallocation   |
-| 19-21| mi/je/tc_free   | Allocator-specific free        |
-| 22   | _ZdlPv          | C++ operator delete            |
-| 23   | _ZdaPv          | C++ operator delete[]          |
+### Coarse allocation type codes
 
-In instruction trace mode, these fine-grained types are mapped to coarse type codes
-(1=malloc-like, 2=free-like, 3=mmap, 4=munmap, 5=calloc-like, 6=realloc-like, 8=posix_memalign, 16=realloc_inplace)
-
-## Binary File Format (malloc-only mode)
-
-The -m output consists of consecutive 32-byte records with the following C layout:
-
-```c
-struct malloc_instr {
-  unsigned long long arg1;     // parameter 1 (Size or Ptr)
-  unsigned long long arg2;     // parameter 2 (Alignment or extra)
-  unsigned long long ret;      // return value (Allocated Addr)
-  unsigned char type;          // allocation event type (1-23)
-  unsigned char reserved[7];   // alignment padding (zeros)
-};  // total: 32 bytes
-```
+| Code | Type | Meaning |
+|------|------|---------|
+| 1 | malloc-like | malloc, mi_malloc, je_malloc, tc_malloc, _Znwm, _Znam |
+| 2 | free-like | free, mi_free, je_free, tc_free, _ZdlPv, _ZdaPv |
+| 3 | mmap | Anonymous memory mapping |
+| 4 | munmap | Unmap memory region |
+| 5 | calloc-like | calloc, mi_calloc, je_calloc, tc_calloc |
+| 6 | realloc-like | realloc, mi_realloc, je_realloc, tc_realloc |
+| 8 | posix_memalign | POSIX aligned allocation |
+| 16 | realloc_inplace | realloc with same address (in-place resize) |
 
 ## Unit Tests
 
 The `test/` directory contains unit tests that verify the core logic of
 champsim_tracer.cpp without requiring the Intel PIN SDK. See test/README.md
 for details.
+
+    cd tracer/pin/test
+    make
+    ./test_runner

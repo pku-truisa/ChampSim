@@ -130,7 +130,7 @@ struct ooo_model_instr : champsim::program_ordered<ooo_model_instr> {
 
 private:
   template <typename T>
-  ooo_model_instr(T instr, std::array<uint8_t, 2> local_asid) : ip(instr.ip), is_branch(instr.is_branch), branch_taken(instr.branch_taken), asid(local_asid)
+  ooo_model_instr(T instr, std::array<uint8_t, 2> local_asid) : ip(instr.ip), is_branch(instr.instr_type == 1), branch_taken(instr.instr_type == 1 ? instr.instr_info != 0 : false), asid(local_asid)
   {
     std::remove_copy(std::begin(instr.destination_registers), std::end(instr.destination_registers), std::back_inserter(this->destination_registers), 0);
     std::remove_copy(std::begin(instr.source_registers), std::end(instr.source_registers), std::back_inserter(this->source_registers), 0);
@@ -164,7 +164,7 @@ private:
     } else if (!reads_sp && reads_ip && !writes_sp && writes_ip && (reads_flags || reads_other)) {
       // conditional branch
       is_branch = true;
-      branch_taken = instr.branch_taken; // don't change this
+      branch_taken = (instr.instr_type == 1 && instr.instr_info != 0); // don't change this
       branch = BRANCH_CONDITIONAL;
     } else if (reads_sp && reads_ip && writes_sp && writes_ip && !reads_flags && !reads_other) {
       // direct call
@@ -184,7 +184,7 @@ private:
     } else if (writes_ip) {
       // some other branch type that doesn't fit the above categories
       is_branch = true;
-      branch_taken = instr.branch_taken; // don't change this
+      branch_taken = (instr.instr_type == 1 && instr.instr_info != 0); // don't change this
       branch = BRANCH_OTHER;
     } else {
       branch_taken = false;
