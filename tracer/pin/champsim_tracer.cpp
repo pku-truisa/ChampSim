@@ -274,7 +274,8 @@ void dump_tracked_allocations(std::ofstream& of)
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
   for (const auto& [addr, info] : tracked_allocations) {
     curr_instr = {};
-    curr_instr.is_malloc = info.type;
+    curr_instr.instr_type = 2;  // allocation event
+    curr_instr.instr_info = info.type;
     curr_instr.source_memory[0] = info.size;
     curr_instr.destination_memory[0] = addr;
 
@@ -522,7 +523,8 @@ void ResetCurrentInstruction(VOID* ip)
   // Set by allocator After callbacks, consumed here to pair the malloc
   // event with the next retiring instruction.
   if (pending_instr_malloc.type != 0) {
-    curr_instr.is_malloc = pending_instr_malloc.type;
+    curr_instr.instr_type = 2;  // allocation event
+    curr_instr.instr_info = pending_instr_malloc.type;
     curr_instr.source_memory[0] = pending_instr_malloc.arg1;
     curr_instr.source_memory[1] = pending_instr_malloc.arg2;
     curr_instr.destination_memory[0] = pending_instr_malloc.ret;
@@ -541,8 +543,8 @@ void WriteCurrentInstruction()
 
 void BranchOrNot(UINT32 taken)
 {
-  curr_instr.is_branch = 1;
-  curr_instr.branch_taken = taken;
+  curr_instr.instr_type = 1;  // branch instruction
+  curr_instr.instr_info = taken;
 }
 
 template <typename T>

@@ -20,7 +20,7 @@ void test_fast_forward_skip_writes() {
 
   trace_instr_format_t rec = {};
   rec.ip = 0x400000;
-  rec.is_branch = 1;
+  rec.instr_type = 1;  // branch instruction
 
   // Simulate the WriteCurrentInstruction guard
   if (!skip_dumping) {
@@ -46,7 +46,8 @@ void test_fast_forward_baseline_dump() {
   {
     for (const auto& [addr, info] : tracked) {
       trace_instr_format_t rec = {};
-      rec.is_malloc = info.type;
+      rec.instr_type = 2;  // allocation event
+      rec.instr_info = info.type;
       rec.source_memory[0] = info.size;
       rec.destination_memory[0] = addr;
       write_record(buf, rec);
@@ -61,7 +62,7 @@ void test_fast_forward_baseline_dump() {
   for (const auto& r : buf) {
     ADDRINT addr = r.instr.destination_memory[0];
     CHECK(tracked.find(addr) != tracked.end(), "dumped addr exists in tracked");
-    CHECK_EQ(r.instr.is_malloc, tracked[addr].type, "type matches");
+    CHECK_EQ(r.instr.instr_info, tracked[addr].type, "type matches");
     CHECK_EQ(r.instr.source_memory[0], tracked[addr].size, "size matches");
   }
 

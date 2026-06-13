@@ -12,7 +12,7 @@ int failed_tests = 0;
 
 // Test function declarations
 void test_trace_format_layout();
-void test_trace_format_is_malloc_types();
+void test_trace_format_instr_types();
 void test_depth_outermost();
 void test_depth_nested();
 void test_depth_saturation();
@@ -65,7 +65,7 @@ int main() {
 
   std::cout << "--- Trace Format ---" << std::endl;
   test_trace_format_layout();
-  test_trace_format_is_malloc_types();
+  test_trace_format_instr_types();
 
   std::cout << std::endl << "--- Depth Counter ---" << std::endl;
   test_depth_outermost();
