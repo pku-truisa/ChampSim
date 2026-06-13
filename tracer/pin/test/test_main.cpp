@@ -49,6 +49,16 @@ void test_threshold_custom_value();
 void test_threshold_free_only_tracked();
 void test_threshold_free_large_tracked();
 
+// Malloc-only mode tests
+void test_malloc_type_name_all_types();
+void test_coarse_type_mapping();
+void test_malloc_instr_size();
+void test_malloc_only_mode_no_threshold();
+void test_instr_trace_mode_threshold();
+void test_malloc_only_mode_free_filter();
+void test_malloc_instr_record_format();
+void test_malloc_only_mode_realloc();
+
 int main() {
   std::cout << "=== champsim_tracer Unit Tests ===" << std::endl;
   std::cout << std::endl;
@@ -87,6 +97,16 @@ int main() {
   test_writetoset_normal();
   test_writetoset_dedup();
   test_writetoset_boundary();
+
+  std::cout << std::endl << "--- Malloc-Only Mode (-m) ---" << std::endl;
+  test_malloc_type_name_all_types();
+  test_coarse_type_mapping();
+  test_malloc_instr_size();
+  test_malloc_only_mode_no_threshold();
+  test_instr_trace_mode_threshold();
+  test_malloc_only_mode_free_filter();
+  test_malloc_instr_record_format();
+  test_malloc_only_mode_realloc();
 
   std::cout << std::endl << "--- Malloc Threshold (-k) ---" << std::endl;
   test_threshold_malloc_above();

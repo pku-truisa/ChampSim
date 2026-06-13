@@ -12,7 +12,8 @@ SRCS     := test_main.cpp \
             test_free_munmap_filter.cpp \
             test_fast_forward.cpp \
             test_writetoset.cpp \
-            test_malloc_threshold.cpp
+            test_malloc_threshold.cpp \
+            test_malloc_only_mode.cpp
 
 OBJS     := $(SRCS:.cpp=.o)
 TARGET   := test_runner

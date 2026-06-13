@@ -26,6 +26,10 @@
  *  - posix_memalign passes alignment as source_memory[1]
  *  - C++ new/delete, mimalloc/jemalloc/tcmalloc
  *  - aligned_alloc and memalign are NOT hooked (thin wrappers that call malloc internally)
+ *
+ *  New: -m <filename> enables malloc-only mode. All other options are ignored.
+ *  The output is a binary malloc trace (32-byte records) compatible with
+ *  object_tracer.cpp and analyzable by little_object_analyzer.py.
  */
 
 #include <fstream>
@@ -35,6 +39,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -55,6 +60,40 @@ struct malloc_instr {
 };
 static_assert(sizeof(malloc_instr) == 32, "malloc_instr must be exactly 32 bytes");
 
+/* ===================================================================== */
+// Fine-grained type codes matching object_tracer v5 (23 types)
+/* ===================================================================== */
+enum MallocType : unsigned char {
+  TYPE_MALLOC         = 1,
+  TYPE_MI_MALLOC      = 2,
+  TYPE_JE_MALLOC      = 3,
+  TYPE_TC_MALLOC      = 4,
+  TYPE_ZNWM           = 5,
+  TYPE_ZNAM           = 6,
+
+  TYPE_CALLOC         = 7,
+  TYPE_MI_CALLOC      = 8,
+  TYPE_JE_CALLOC      = 9,
+  TYPE_TC_CALLOC      = 10,
+
+  TYPE_REALLOC        = 11,
+  TYPE_MI_REALLOC     = 12,
+  TYPE_JE_REALLOC     = 13,
+  TYPE_TC_REALLOC     = 14,
+
+  TYPE_POSIX_MEMALIGN = 15,
+
+  TYPE_MMAP           = 16,
+  TYPE_MUNMAP         = 17,
+
+  TYPE_FREE           = 18,
+  TYPE_MI_FREE        = 19,
+  TYPE_JE_FREE        = 20,
+  TYPE_TC_FREE        = 21,
+  TYPE_ZDLPV          = 22,
+  TYPE_ZDAPV          = 23,
+};
+
 using trace_instr_format_t = input_instr;
 
 #ifndef MAP_ANONYMOUS
@@ -71,6 +110,13 @@ INT64 trace_insts_left = 0;
 INT64 fast_forward_insts_left = 0;
 bool skip_dumping_instructions = false;
 bool trace_limit_reached = false;
+
+// Malloc-only mode state
+std::ofstream malloc_binfile;
+bool malloc_only_mode = false;
+std::unordered_set<ADDRINT> tracked_addresses;
+static std::unordered_map<unsigned char, unsigned long long> type_counts;
+static PIN_LOCK stats_lock;
 
 // Forward declarations
 VOID insert_analysis_functions(INS ins);
@@ -146,7 +192,7 @@ struct TraceBuffer {
 
   void flush(std::ofstream& of) {
     if (count == 0) return;
-    of.write(reinterpret_cast<typename decltype(of)::char_type*>(buffer),
+    of.write(reinterpret_cast<std::ofstream::char_type*>(buffer),
              sizeof(trace_instr_format_t) * count);
     count = 0;
   }
@@ -201,6 +247,8 @@ INT32 Usage()
             << "Specify a multi-segment config file with -c" << std::endl
             << "  Config file format: one line per segment, each with -s N -t N -o filename" << std::endl
             << "  Example: echo '-s 100000000 -t 50000000 -o trace_0.champsim' > cfg.txt" << std::endl
+            << "Specify malloc-only mode with -m [filename] (default: malloc.bin)" << std::endl
+            << "  In -m mode, all other options are ignored." << std::endl
             << std::endl;
 
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
@@ -230,7 +278,7 @@ void dump_tracked_allocations(std::ofstream& of)
     curr_instr.source_memory[0] = info.size;
     curr_instr.destination_memory[0] = addr;
 
-    typename decltype(outfile)::char_type buf[sizeof(trace_instr_format_t)];
+    std::ofstream::char_type buf[sizeof(trace_instr_format_t)];
     std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
     of.write(buf, sizeof(trace_instr_format_t));
   }
@@ -448,6 +496,8 @@ void for_ins_in_trace(const TRACE& trace, Func f)
 
 void insert_instrumentation(TRACE trace, void* v)
 {
+  if (malloc_only_mode) return;  // No instruction tracing in malloc-only mode
+
   if (fast_forward_insts_left > 500) {
     TRACE_InsertCall(trace, IPOINT_BEFORE, (AFUNPTR)fast_forward_trace, IARG_UINT32, TRACE_NumIns(trace), IARG_END);
   } else {
@@ -508,9 +558,72 @@ void WriteToSet(T* begin, T* end, UINT32 r)
 //
 // Depth counter with saturation, thread-safe.
 // Only the outermost user-level call writes records.
-// Allocation events are embedded in-band into the instruction trace via
-// pending_instr_malloc.
+//
+// In instruction trace mode, allocation events are embedded in-band into the
+// instruction trace via pending_instr_malloc.
+// In malloc-only mode (-m), they are written directly as malloc_instr records.
 // =========================================================================
+
+/* Type name lookup for statistics display. */
+static const char* malloc_type_name(unsigned char t)
+{
+  switch (t) {
+    case TYPE_MALLOC:         return "malloc";
+    case TYPE_MI_MALLOC:      return "mi_malloc";
+    case TYPE_JE_MALLOC:      return "je_malloc";
+    case TYPE_TC_MALLOC:      return "tc_malloc";
+    case TYPE_ZNWM:           return "_Znwm";
+    case TYPE_ZNAM:           return "_Znam";
+    case TYPE_CALLOC:         return "calloc";
+    case TYPE_MI_CALLOC:      return "mi_calloc";
+    case TYPE_JE_CALLOC:      return "je_calloc";
+    case TYPE_TC_CALLOC:      return "tc_calloc";
+    case TYPE_REALLOC:        return "realloc";
+    case TYPE_MI_REALLOC:     return "mi_realloc";
+    case TYPE_JE_REALLOC:     return "je_realloc";
+    case TYPE_TC_REALLOC:     return "tc_realloc";
+    case TYPE_POSIX_MEMALIGN: return "posix_memalign";
+    case TYPE_MMAP:           return "mmap";
+    case TYPE_MUNMAP:         return "munmap";
+    case TYPE_FREE:           return "free";
+    case TYPE_MI_FREE:        return "mi_free";
+    case TYPE_JE_FREE:        return "je_free";
+    case TYPE_TC_FREE:        return "tc_free";
+    case TYPE_ZDLPV:          return "_ZdlPv";
+    case TYPE_ZDAPV:          return "_ZdaPv";
+    default:                  return "UNKNOWN";
+  }
+}
+
+/* Write a malloc_instr record (32 bytes) to malloc_binfile. */
+static void write_malloc_instr_locked(unsigned char type,
+                                      unsigned long long arg1,
+                                      unsigned long long arg2,
+                                      unsigned long long ret)
+{
+  if (malloc_binfile.is_open()) {
+    malloc_instr rec;
+    rec.type = type; rec.arg1 = arg1; rec.arg2 = arg2; rec.ret = ret;
+    std::memset(rec.reserved, 0, sizeof(rec.reserved));
+    malloc_binfile.write(reinterpret_cast<char*>(&rec), sizeof(malloc_instr));
+  }
+  PIN_GetLock(&stats_lock, PIN_ThreadId());
+  type_counts[type]++;
+  PIN_ReleaseLock(&stats_lock);
+}
+
+/* Map fine-grained type (1-23) to coarse type used by instruction trace is_malloc field. */
+static unsigned char coarse_type(unsigned char fine_type)
+{
+  if (fine_type >= 1 && fine_type <= 6)  return 1;  // malloc-like
+  if (fine_type >= 7 && fine_type <= 10) return 5;  // calloc-like
+  if (fine_type >= 11 && fine_type <= 14) return 6;  // realloc-like (may change to 16 in AllocAfter)
+  if (fine_type == TYPE_POSIX_MEMALIGN)  return 8;
+  if (fine_type == TYPE_MMAP)            return 3;
+  if (fine_type == TYPE_MUNMAP)          return 4;
+  if (fine_type >= 18 && fine_type <= 23) return 2;  // free-like
+  return 0;
+}
 
 // --- Helper: outermost BEFORE for depth-protected alloc family ---
 static bool depth_outermost_before(ThreadState* ts, int alloc_type,
@@ -546,26 +659,26 @@ static void try_auto_reset_depth(ThreadState* ts)
   }
 }
 
-// --- MALLOC / C++ new (type=1) ---
-VOID AllocBefore(ADDRINT size)
+// --- MALLOC / C++ new (type=1-6) ---
+VOID AllocBefore(ADDRINT size, UINT32 alloc_type)
 {
   if (trace_limit_reached) return;
   ThreadState* ts = get_tls();
   try_auto_reset_depth(ts);
-  depth_outermost_before(ts, 1, size);
+  depth_outermost_before(ts, (int)alloc_type, size);
 }
 
-// --- CALLOC (type=5) ---
-VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size)
+// --- CALLOC (type=7-10) ---
+VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size, UINT32 alloc_type)
 {
   if (trace_limit_reached) return;
   ThreadState* ts = get_tls();
   try_auto_reset_depth(ts);
-  depth_outermost_before(ts, 5, nmemb * elem_size);
+  depth_outermost_before(ts, (int)alloc_type, nmemb * elem_size);
 }
 
-// --- REALLOC (type=6 or 16) ---
-VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size)
+// --- REALLOC (type=11-14) ---
+VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size, UINT32 alloc_type)
 {
   if (trace_limit_reached) return;
   ThreadState* ts = get_tls();
@@ -576,7 +689,7 @@ VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size)
     return;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{old_ptr, new_size, 6, 0};
+  ts->pending = PendingAlloc{old_ptr, new_size, (int)alloc_type, 0};
 }
 
 // --- UNIFIED AFTER (all alloc families) ---
@@ -592,35 +705,64 @@ VOID AllocAfter(ADDRINT ret)
 
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
 
-  if (ts->pending.type == 6) {
+  int alloc_type = ts->pending.type;
+  bool is_realloc = (alloc_type >= 11 && alloc_type <= 14);
+
+  if (is_realloc) {
     ADDRINT old_ptr  = ts->pending.size;   // staged in size slot
     ADDRINT new_size = ts->pending.arg2;
-    unsigned char final_type = 6;
-    if (ret == old_ptr && ret != 0) final_type = 16;
-    // Always erase old_ptr from tracked set (free implied by realloc)
-    if (old_ptr != 0) tracked_allocations.erase(old_ptr);
-    // Only record realloc if new_size meets threshold
-    if (new_size >= KnobMallocThreshold.Value() && ret != 0 && ret != (ADDRINT)-1) {
-      pending_instr_malloc.type = final_type;
-      pending_instr_malloc.arg1 = old_ptr;
-      pending_instr_malloc.arg2 = new_size;
-      pending_instr_malloc.ret = ret;
-      tracked_allocations[ret] = {new_size, final_type};
+    unsigned char final_type = (unsigned char)alloc_type;
+
+    // Erase old_ptr from tracking sets
+    if (old_ptr != 0) {
+      tracked_allocations.erase(old_ptr);
+      tracked_addresses.erase(old_ptr);
+    }
+
+    if (malloc_only_mode) {
+      // Write direct malloc_instr record (no threshold in malloc-only mode)
+      if (ret != 0 && ret != (ADDRINT)-1) {
+        write_malloc_instr_locked(final_type, old_ptr, new_size, ret);
+        tracked_addresses.insert(ret);
+      }
+    } else {
+      // Instruction trace mode
+      if (new_size >= KnobMallocThreshold.Value() && ret != 0 && ret != (ADDRINT)-1) {
+        unsigned char coarse = coarse_type(final_type);
+        if (ret == old_ptr && ret != 0) coarse = 16;  // realloc_inplace
+        pending_instr_malloc.type = coarse;
+        pending_instr_malloc.arg1 = old_ptr;
+        pending_instr_malloc.arg2 = new_size;
+        pending_instr_malloc.ret = ret;
+        tracked_allocations[ret] = {new_size, coarse};
+      }
     }
   } else {
-    if (ret != 0 && ret != (ADDRINT)-1 && ts->pending.size >= KnobMallocThreshold.Value()) {
-      pending_instr_malloc.type = (unsigned char)ts->pending.type;
-      pending_instr_malloc.arg1 = ts->pending.size;
-      pending_instr_malloc.arg2 = ts->pending.arg2;
-      pending_instr_malloc.ret = ret;
-      tracked_allocations[ret] = {ts->pending.size, (unsigned char)ts->pending.type};
+    // Non-realloc (malloc, calloc, etc.)
+    if (ret != 0 && ret != (ADDRINT)-1) {
+      if (malloc_only_mode) {
+        // No threshold in malloc-only mode — record all allocations
+        write_malloc_instr_locked((unsigned char)alloc_type,
+                                  ts->pending.size, ts->pending.arg2, ret);
+        tracked_addresses.insert(ret);
+      } else {
+        // Instruction trace mode with threshold
+        if (ts->pending.size >= KnobMallocThreshold.Value()) {
+          unsigned char coarse = coarse_type((unsigned char)alloc_type);
+          pending_instr_malloc.type = coarse;
+          pending_instr_malloc.arg1 = ts->pending.size;
+          pending_instr_malloc.arg2 = ts->pending.arg2;
+          pending_instr_malloc.ret = ret;
+          tracked_allocations[ret] = {ts->pending.size, coarse};
+        }
+      }
     }
   }
 
   PIN_ReleaseLock(&malloc_lock);
 }
 
-// --- POSIX_MEMALIGN (type=8) — uses depth counter, but BEFORE always stages ---
+// --- POSIX_MEMALIGN (type=15) — uses depth counter, but BEFORE always stages ---
 VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size)
 {
   if (trace_limit_reached) return;
@@ -631,7 +773,7 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size)
     return;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, alignment, 8, memptr};
+  ts->pending = PendingAlloc{size, alignment, TYPE_POSIX_MEMALIGN, memptr};
 }
 
 VOID PosixMemalignAfter(ADDRINT status)
@@ -646,32 +788,51 @@ VOID PosixMemalignAfter(ADDRINT status)
   if (status == 0 && ts->pending.posix_memptr != 0) {
     ADDRINT real_addr = 0;
     PIN_SafeCopy(&real_addr, (void*)ts->pending.posix_memptr, sizeof(ADDRINT));
-    if (real_addr != 0 && real_addr != (ADDRINT)-1 && ts->pending.size >= KnobMallocThreshold.Value()) {
+    if (real_addr != 0 && real_addr != (ADDRINT)-1) {
+      if (!malloc_only_mode && ts->pending.size < KnobMallocThreshold.Value()) {
+        return;  // skip below threshold in instruction trace mode
+      }
       PIN_GetLock(&malloc_lock, PIN_ThreadId());
-      pending_instr_malloc.type = 8;
-      pending_instr_malloc.arg1 = ts->pending.size;
-      pending_instr_malloc.arg2 = ts->pending.arg2;   // alignment
-      pending_instr_malloc.ret = real_addr;
-      tracked_allocations[real_addr] = {ts->pending.size, 8};
+      if (malloc_only_mode) {
+        write_malloc_instr_locked(TYPE_POSIX_MEMALIGN, ts->pending.size, ts->pending.arg2, real_addr);
+        tracked_addresses.insert(real_addr);
+      } else {
+        pending_instr_malloc.type = 8;
+        pending_instr_malloc.arg1 = ts->pending.size;
+        pending_instr_malloc.arg2 = ts->pending.arg2;   // alignment
+        pending_instr_malloc.ret = real_addr;
+        tracked_allocations[real_addr] = {ts->pending.size, 8};
+      }
       PIN_ReleaseLock(&malloc_lock);
     }
   }
 }
 
-// --- FREE (type=2) — only write if tracked (suppresses glibc-internal free) ---
-VOID FreeBefore(ADDRINT ptr)
+// --- FREE (type=18-23) — only write if tracked (suppresses glibc-internal free) ---
+VOID FreeBefore(ADDRINT ptr, UINT32 free_type)
 {
   if (ptr == 0) return;
 
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
-  auto it = tracked_allocations.find(ptr);
-  if (it != tracked_allocations.end()) {
-    pending_instr_malloc.type = 2;
-    pending_instr_malloc.arg1 = (unsigned long long)ptr;
-    pending_instr_malloc.arg2 = 0;
-    pending_instr_malloc.ret = 0;
-    tracked_allocations.erase(it);
+
+  if (malloc_only_mode) {
+    // In malloc-only mode, filter using tracked_addresses
+    auto it = tracked_addresses.find(ptr);
+    if (it != tracked_addresses.end()) {
+      write_malloc_instr_locked((unsigned char)free_type, (unsigned long long)ptr, 0, 0);
+      tracked_addresses.erase(it);
+    }
+  } else {
+    auto it = tracked_allocations.find(ptr);
+    if (it != tracked_allocations.end()) {
+      pending_instr_malloc.type = 2;
+      pending_instr_malloc.arg1 = (unsigned long long)ptr;
+      pending_instr_malloc.arg2 = 0;
+      pending_instr_malloc.ret = 0;
+      tracked_allocations.erase(it);
+    }
   }
+
   PIN_ReleaseLock(&malloc_lock);
 }
 
@@ -703,31 +864,49 @@ VOID MmapAfter(ADDRINT ret)
 
   ts->mmap_depth = 0;
 
-  if (ret != 0 && ret != (ADDRINT)-1 && ts->mmap_pending_size >= KnobMallocThreshold.Value()) {
+  if (ret != 0 && ret != (ADDRINT)-1) {
+    if (!malloc_only_mode && ts->mmap_pending_size < KnobMallocThreshold.Value()) {
+      return;  // skip below threshold in instruction trace mode
+    }
     PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    pending_instr_malloc.type = 3;
-    pending_instr_malloc.arg1 = ts->mmap_pending_size;
-    pending_instr_malloc.arg2 = 0;
-    pending_instr_malloc.ret = ret;
-    tracked_allocations[ret] = {ts->mmap_pending_size, 3};
+    if (malloc_only_mode) {
+      write_malloc_instr_locked(TYPE_MMAP, ts->mmap_pending_size, 0, ret);
+      tracked_addresses.insert(ret);
+    } else {
+      pending_instr_malloc.type = 3;
+      pending_instr_malloc.arg1 = ts->mmap_pending_size;
+      pending_instr_malloc.arg2 = 0;
+      pending_instr_malloc.ret = ret;
+      tracked_allocations[ret] = {ts->mmap_pending_size, 3};
+    }
     PIN_ReleaseLock(&malloc_lock);
   }
 }
 
-// --- MUNMAP (type=4) — only write if tracked ---
+// --- MUNMAP (type=17) — only write if tracked ---
 VOID MunmapBefore(ADDRINT addr, ADDRINT length)
 {
   if (addr == 0 || addr == (ADDRINT)-1) return;
 
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
-  auto it = tracked_allocations.find(addr);
-  if (it != tracked_allocations.end()) {
-    pending_instr_malloc.type = 4;
-    pending_instr_malloc.arg1 = (unsigned long long)addr;
-    pending_instr_malloc.arg2 = (unsigned long long)length;
-    pending_instr_malloc.ret = 0;
-    tracked_allocations.erase(it);
+
+  if (malloc_only_mode) {
+    auto it = tracked_addresses.find(addr);
+    if (it != tracked_addresses.end()) {
+      write_malloc_instr_locked(TYPE_MUNMAP, (unsigned long long)addr, (unsigned long long)length, 0);
+      tracked_addresses.erase(it);
+    }
+  } else {
+    auto it = tracked_allocations.find(addr);
+    if (it != tracked_allocations.end()) {
+      pending_instr_malloc.type = 4;
+      pending_instr_malloc.arg1 = (unsigned long long)addr;
+      pending_instr_malloc.arg2 = (unsigned long long)length;
+      pending_instr_malloc.ret = 0;
+      tracked_allocations.erase(it);
+    }
   }
+
   PIN_ReleaseLock(&malloc_lock);
 }
 
@@ -785,6 +964,38 @@ VOID insert_analysis_functions(INS ins)
 }
 
 /* ===================================================================== */
+// Symbol hook table — per-symbol fine-grained type registration
+// ===================================================================== */
+struct SymbolHook {
+  const char* name;
+  unsigned char type;
+  enum { MALLOC, CALLOC, REALLOC, FREE } family;
+};
+
+static const SymbolHook all_symbols[] = {
+  {"malloc",     TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"mi_malloc",  TYPE_MI_MALLOC,  SymbolHook::MALLOC},
+  {"je_malloc",  TYPE_JE_MALLOC,  SymbolHook::MALLOC},
+  {"tc_malloc",  TYPE_TC_MALLOC,  SymbolHook::MALLOC},
+  {"_Znwm",      TYPE_ZNWM,       SymbolHook::MALLOC},
+  {"_Znam",      TYPE_ZNAM,       SymbolHook::MALLOC},
+  {"calloc",     TYPE_CALLOC,     SymbolHook::CALLOC},
+  {"mi_calloc",  TYPE_MI_CALLOC,  SymbolHook::CALLOC},
+  {"je_calloc",  TYPE_JE_CALLOC,  SymbolHook::CALLOC},
+  {"tc_calloc",  TYPE_TC_CALLOC,  SymbolHook::CALLOC},
+  {"realloc",    TYPE_REALLOC,    SymbolHook::REALLOC},
+  {"mi_realloc", TYPE_MI_REALLOC, SymbolHook::REALLOC},
+  {"je_realloc", TYPE_JE_REALLOC, SymbolHook::REALLOC},
+  {"tc_realloc", TYPE_TC_REALLOC, SymbolHook::REALLOC},
+  {"free",       TYPE_FREE,       SymbolHook::FREE},
+  {"mi_free",    TYPE_MI_FREE,    SymbolHook::FREE},
+  {"je_free",    TYPE_JE_FREE,    SymbolHook::FREE},
+  {"tc_free",    TYPE_TC_FREE,    SymbolHook::FREE},
+  {"_ZdlPv",     TYPE_ZDLPV,      SymbolHook::FREE},
+  {"_ZdaPv",     TYPE_ZDAPV,      SymbolHook::FREE},
+};
+
+/* ===================================================================== */
 // ImageLoad — from object_tracer v5 symbol coverage
 // ===================================================================== */
 VOID ImageLoad(IMG img, VOID* v)
@@ -793,7 +1004,7 @@ VOID ImageLoad(IMG img, VOID* v)
 
   RTN rtn;
 
-  // --- posix_memalign (type=8) ---
+  // --- posix_memalign (type=15) ---
   rtn = RTN_FindByName(img, "posix_memalign");
   if (RTN_Valid(rtn)) {
     RTN_Open(rtn);
@@ -807,70 +1018,42 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
-  // --- malloc-like (type=1) ---
-  const std::vector<std::string> mallocSyms = {
-    "malloc",
-    "mi_malloc", "je_malloc", "tc_malloc",
-    "_Znwm", "_Znam"
-  };
-  for (const auto& sym : mallocSyms) {
-    rtn = RTN_FindByName(img, sym.c_str());
+  // --- malloc/calloc/realloc/free with per-symbol fine-grained types ---
+  for (const auto& sym : all_symbols) {
+    rtn = RTN_FindByName(img, sym.name);
     if (!RTN_Valid(rtn)) continue;
     RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // --- calloc (type=5) ---
-  const std::vector<std::string> callocSyms = {
-    "calloc",
-    "mi_calloc", "je_calloc", "tc_calloc"
-  };
-  for (const auto& sym : callocSyms) {
-    rtn = RTN_FindByName(img, sym.c_str());
-    if (!RTN_Valid(rtn)) continue;
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // --- realloc (type=6) ---
-  const std::vector<std::string> reallocSyms = {
-    "realloc",
-    "mi_realloc", "je_realloc", "tc_realloc"
-  };
-  for (const auto& sym : reallocSyms) {
-    rtn = RTN_FindByName(img, sym.c_str());
-    if (!RTN_Valid(rtn)) continue;
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // --- Free ---
-  const std::vector<std::string> freeSyms = {
-    "free",
-    "mi_free", "je_free", "tc_free",
-    "_ZdlPv", "_ZdaPv"
-  };
-  for (const auto& sym : freeSyms) {
-    rtn = RTN_FindByName(img, sym.c_str());
-    if (!RTN_Valid(rtn)) continue;
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
+    switch (sym.family) {
+      case SymbolHook::MALLOC:
+        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
+                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                       IARG_UINT32, sym.type, IARG_END);
+        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                       IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+        break;
+      case SymbolHook::CALLOC:
+        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
+                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                       IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                       IARG_UINT32, sym.type, IARG_END);
+        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                       IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+        break;
+      case SymbolHook::REALLOC:
+        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
+                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                       IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                       IARG_UINT32, sym.type, IARG_END);
+        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
+                       IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+        break;
+      case SymbolHook::FREE:
+        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
+                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                       IARG_UINT32, sym.type, IARG_END);
+        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
+        break;
+    }
     RTN_Close(rtn);
   }
 
@@ -888,7 +1071,7 @@ VOID ImageLoad(IMG img, VOID* v)
   }
 
   // --- Reset depth at entry point (glibc init may have leaked depth) ---
-  for (const char* entry : {"main"}) {
+  for (const char* entry : {"main", "MAIN__", "main_"}) {
     rtn = RTN_FindByName(img, entry);
     if (RTN_Valid(rtn)) {
       RTN_Open(rtn);
@@ -925,6 +1108,22 @@ VOID ResetDepthOnMain()
 /* ===================================================================== */
 VOID Fini(INT32 code, VOID* v)
 {
+  if (malloc_only_mode) {
+    if (malloc_binfile.is_open()) {
+      malloc_binfile.close();
+    }
+    // Print type statistics (like object_tracer.cpp)
+    std::cout << "\n[ChampSim Tracer] === Malloc-only Mode Type Statistics ===" << std::endl;
+    unsigned long long total = 0;
+    for (const auto& [t, count] : type_counts) {
+      std::cout << "  type " << (int)t << " (" << malloc_type_name(t) << "): " << count << std::endl;
+      total += count;
+    }
+    std::cout << "  TOTAL: " << total << " records" << std::endl;
+    std::cout << "[ChampSim Tracer] Active tracked addresses: " << tracked_addresses.size() << std::endl;
+    return;
+  }
+
   if (outfile.is_open()) {
     trace_buffer.flush(outfile);
     outfile.close();
@@ -957,10 +1156,11 @@ static bool is_pinplay_arg(const std::string& arg)
 
 int main(int argc, char* argv[])
 {
-  PIN_InitSymbols();
-
-  // Filter out PinPlay/SDE-specific arguments (e.g. -replay, -xyzzy)
+  // Scan argv for -m before PIN_Init (to avoid PIN KNOB parameter stealing)
   std::vector<char*> filtered;
+  std::string malloc_filename;
+  malloc_only_mode = false;
+
   for (int i = 0; i < argc; i++) {
     std::string arg(argv[i]);
     if (is_pinplay_arg(arg)) {
@@ -968,14 +1168,46 @@ int main(int argc, char* argv[])
           argv[i+1][0] != '-') i++;
       continue;
     }
+    if (arg == "-m") {
+      malloc_only_mode = true;
+      if (i + 1 < argc && argv[i+1][0] != '-') {
+        malloc_filename = argv[++i];
+      } else {
+        malloc_filename = "malloc.bin";
+      }
+      continue;  // do not pass -m to PIN_Init
+    }
     filtered.push_back(argv[i]);
   }
+
+  PIN_InitSymbols();
+
   if (PIN_Init((int)filtered.size(), filtered.data()))
     return Usage();
 
   PIN_InitLock(&malloc_lock);
+  PIN_InitLock(&stats_lock);
   tls_key = PIN_CreateThreadDataKey(ThreadCleanup);
 
+  if (malloc_only_mode) {
+    // --- Malloc-only mode (-m) ---
+    malloc_binfile.open(malloc_filename.c_str(), std::ios_base::binary | std::ios_base::trunc);
+    if (!malloc_binfile) {
+      std::cout << "Error: Cannot open malloc output file: " << malloc_filename << std::endl;
+      exit(1);
+    }
+    std::cout << "[ChampSim Tracer] Malloc-only mode enabled. Output: " << malloc_filename << std::endl;
+    std::cout << "[ChampSim Tracer] Other options (-o, -s, -t, -k, -c) are ignored." << std::endl;
+
+    // Do NOT add TRACE_AddInstrumentFunction — no instruction tracing needed.
+    // Allocator callbacks (ImageLoad) will write directly to malloc_binfile.
+    IMG_AddInstrumentFunction(ImageLoad, 0);
+    PIN_AddFiniFunction(Fini, 0);
+    PIN_StartProgram();
+    return 0;
+  }
+
+  // --- Normal (instruction trace) mode ---
   std::string config_path = KnobConfigFile.Value();
 
   if (!config_path.empty()) {
