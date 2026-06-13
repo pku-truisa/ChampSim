@@ -23,7 +23,7 @@ The provided makefile will generate `obj-intel64/champsim_tracer.so`.
 The tracer has several options you can set:
 ```
 -o <filename>
-Specify the output file for your trace.
+Specify the output file for your instruction trace.
 The default is champsim.trace.
 
 -s <number>
@@ -31,34 +31,27 @@ Specify the number of instructions to skip in the program before tracing begins.
 This is useful for skipping initialization code that you don't want to include in your instruction trace.
 The default value is 0 (start tracing from the beginning).
 
-Note: -s only affects the instruction trace (champsim.trace). Malloc/free events (malloc.trace)
-are always recorded from the very beginning of execution, regardless of the -s value.
-
 -t <number>
 The number of instructions to trace, after -s instructions have been skipped.
 The default value is 0, which means trace all instructions (unlimited).
 If you specify a positive number N, the tracer will stop after tracing N instructions.
 
-Note: -t has no effect in allocation-only mode (-a). When -a is used, malloc tracing
-continues until the program exits naturally.
+-k <number>
+Minimum allocation size to trace for malloc events embedded in instruction trace (in bytes).
+The default value is 256, which means record only allocations >= 256 bytes.
+
+-c <filename>
+Specify a config file for multi-segment trace. Format: one line per segment, each with -s N -t N -o filename.
+Example: echo '-s 100000000 -t 50000000 -o trace_0.champsim' > cfg.txt
 
 -m <filename>
-Specify the output file for malloc/free event traces.
-The default is malloc.trace.
-
--k <number>
-Minimum allocation size to trace for malloc events (in bytes).
-The default value is 0, which means trace all allocations regardless of size.
-
--a
-Only generate memory allocation trace, skip instruction trace.
-When this flag is set, the output file will contain only memory allocation events
-(malloc/free/calloc/realloc/mmap/munmap/aligned_alloc/posix_memalign/memalign) and no regular instructions. This is useful for creating
-smaller traces focused on memory allocation patterns.
-
-Note: When -a is used, the -s (fast-forward) and -t (trace length) options have no effect.
-Malloc tracing runs from program start to program exit, and the program will not be
-terminated early by -t.
+Malloc-only mode. Generate a binary malloc trace file (32-byte records) compatible with
+object_tracer.cpp and analyzable by little_object_analyzer.py.
+When this flag is set, all other options (-o, -s, -t, -k, -c) are ignored.
+The tracer will only record memory allocation/deallocation events in a format
+identical to tracer/pin-object/object_tracer.cpp, with 23 fine-grained type codes
+(1=malloc, 2=mi_malloc, ..., 23=_ZdaPv).
+Default filename: malloc.bin
 ```
 
 ## Usage Examples
@@ -73,83 +66,74 @@ Skip the first 1 million instructions, then trace the next 500,000 instructions:
 
     pin -t obj-intel64/champsim_tracer.so -o my_trace.champsim -s 1000000 -t 500000 -- ./my_program
 
-### Trace specific portion of execution
-Skip initialization (first 100K instructions), then trace everything after that:
-
-    pin -t obj-intel64/champsim_tracer.so -o my_trace.champsim -s 100000 -t 0 -- ./my_program
-
 ### Trace with custom output file
 Specify a custom output filename:
 
     pin -t obj-intel64/champsim_tracer.so -o traces/ls_trace.champsim -- ls
 
-### Trace with malloc event logging
-Enable malloc/free event tracing with minimum size threshold:
+### Multi-segment trace
 
-    pin -t obj-intel64/champsim_tracer.so -m malloc_events.trace -k 1024 -- ./my_program
+    echo '-s 1000000 -t 500000 -o seg0.champsim' > cfg.txt
+    echo '-s 2000000 -t 500000 -o seg1.champsim' >> cfg.txt
+    pin -t obj-intel64/champsim_tracer.so -c cfg.txt -- ./my_program
 
-The tracer now automatically hooks additional memory allocation functions:
-- `malloc`, `free`, `calloc`, `realloc` - C standard library allocation functions
-- `aligned_alloc` - C11 aligned allocation
-- `posix_memalign` - POSIX aligned allocation  
-- `memalign` - Traditional aligned allocation
-- `mmap`/`munmap` - Memory mapping (from all shared libraries, not just main executable)
+### Malloc-only binary trace (compatible with little_object_analyzer.py)
 
-### Trace only memory allocation events
-Generate a trace containing only memory allocation events, skipping all regular instructions:
+    pin -t obj-intel64/champsim_tracer.so -m malloc.bin -- ./my_program
+    python3 tracer/pin-object/little_object_analyzer.py -i malloc.bin
 
-    pin -t obj-intel64/champsim_tracer.so -o alloc_only.trace -a -- ./my_program
+    # Custom output filename:
+    pin -t obj-intel64/champsim_tracer.so -m my_trace.bin -- ./my_program
 
-This creates a much smaller trace file that focuses solely on memory allocation patterns.
+### Compare with object_tracer
 
-**Performance Optimization**: In allocation-only mode (`-a`), the tracer skips all instruction-level analysis (register tracking, memory operand analysis, etc.) and only maintains an instruction counter for the malloc trace. This significantly improves tracing speed compared to normal mode while still providing accurate `instrCount` values in the malloc trace output.
+The -m output is byte-identical in format to the trace generated by
+tracer/pin-object/object_tracer.so -m. Both can be used interchangeably
+with little_object_analyzer.py.
 
-## Analyzing Memory Allocation Traces
+## Tracked Allocation Functions (23 fine-grained type codes)
 
-The `analyze_malloc.py` tool can be used to analyze and modify memory allocation traces. It provides the following features:
+In malloc-only mode (-m), the tracer hooks the following functions with per-symbol type codes:
 
-1. **Size Adjustment**: Adjusts allocation sizes smaller than a threshold to the nearest power of 2
-2. **Memory Tracking**: Tracks active memory objects and records peak memory usage
-3. **Comparative Analysis**: Compares peak memory usage before and after size adjustments
+| Code | Function        | Description                    |
+|------|-----------------|--------------------------------|
+| 1    | malloc          | Standard memory allocation     |
+| 2    | mi_malloc       | mimalloc (if linked)           |
+| 3    | je_malloc       | jemalloc (if linked)           |
+| 4    | tc_malloc       | tcmalloc (if linked)           |
+| 5    | _Znwm           | C++ operator new               |
+| 6    | _Znam           | C++ operator new[]             |
+| 7    | calloc          | Allocate and zero-initialize   |
+| 8-10 | mi/je/tc_calloc | Allocator-specific calloc      |
+| 11   | realloc         | Reallocation (moving)          |
+| 12-14| mi/je/tc_realloc| Allocator-specific realloc     |
+| 15   | posix_memalign  | POSIX aligned allocation       |
+| 16   | mmap            | Anonymous memory mapping       |
+| 17   | munmap          | Unmap memory region            |
+| 18   | free            | Standard memory deallocation   |
+| 19-21| mi/je/tc_free   | Allocator-specific free        |
+| 22   | _ZdlPv          | C++ operator delete            |
+| 23   | _ZdaPv          | C++ operator delete[]          |
 
-### Supported Functions
+In instruction trace mode, these fine-grained types are mapped to coarse type codes
+(1=malloc-like, 2=free-like, 3=mmap, 4=munmap, 5=calloc-like, 6=realloc-like, 8=posix_memalign, 16=realloc_inplace)
 
-The tool supports all memory allocation functions tracked by champsim_tracer. Each trace line includes an instruction count prefix (`instrCount:<count>`) to track memory object lifecycle:
+## Binary File Format (malloc-only mode)
 
-- `instrCount:<count> malloc(size)=address`
-- `instrCount:<count> calloc(size)=address`
-- `instrCount:<count> realloc(old_ptr, size)=address [status]`
-- `instrCount:<count> aligned_alloc(size)=address`
-- `instrCount:<count> memalign(size)=address`
-- `instrCount:<count> posix_memalign(size)=address`
-- `instrCount:<count> app_mmap(length)=address`
-- `instrCount:<count> free(address)`
-- `instrCount:<count> app_munmap(address, length)`
+The -m output consists of consecutive 32-byte records with the following C layout:
 
-The instruction count indicates the number of instructions executed when the allocation/deallocation occurred, which can be used to calculate memory object lifetime (destruction_instr - creation_instr).
-
-### Usage
-
-```bash
-# Basic usage (default threshold: 1024 bytes)
-    python3 analyze_malloc.py -i malloc.trace
-
-# Specify custom threshold
-python3 analyze_malloc.py -i malloc.trace -s 2048
+```c
+struct malloc_instr {
+  unsigned long long arg1;     // parameter 1 (Size or Ptr)
+  unsigned long long arg2;     // parameter 2 (Alignment or extra)
+  unsigned long long ret;      // return value (Allocated Addr)
+  unsigned char type;          // allocation event type (1-23)
+  unsigned char reserved[7];   // alignment padding (zeros)
+};  // total: 32 bytes
 ```
 
-### Parameters
+## Unit Tests
 
-- `-i, --input`: Required input file path
-- `-s, --size`: Size threshold in bytes (default: 1024). Sizes smaller than this value will be adjusted to the nearest power of 2
-
-### Use Cases
-
-This tool is useful for:
-- Studying the impact of memory alignment on peak memory usage
-- Analyzing memory allocation patterns in applications
-- Understanding how size adjustments affect overall memory consumption
-- Preprocessing traces for cache simulation studies
-
-Traces created with the champsim_tracer.so are approximately 64 bytes per instruction, but they generally compress down to less than a byte per instruction using xz compression.
-
+The `test/` directory contains unit tests that verify the core logic of
+champsim_tracer.cpp without requiring the Intel PIN SDK. See test/README.md
+for details.
