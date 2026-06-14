@@ -17,6 +17,7 @@ typedef struct {
   unsigned long long arg1;
   unsigned long long arg2;
   unsigned long long ret;
+  unsigned long long caller_ip;
   unsigned char type;
   unsigned char reserved[7];
 } __attribute__((packed)) malloc_record_t;
@@ -79,9 +80,10 @@ static void resolve_syms(void) {
 }
 
 static void write_rec(unsigned char t, unsigned long long a1,
-                      unsigned long long a2, unsigned long long ret) {
+                      unsigned long long a2, unsigned long long ret,
+                      unsigned long long caller_ip) {
   if (trace_fd < 0) return;
-  malloc_record_t rec = {a1, a2, ret, t, {0}};
+  malloc_record_t rec = {a1, a2, ret, caller_ip, t, {0}};
   unsigned long long off = __sync_fetch_and_add(&write_offset, sizeof(rec));
   pwrite(trace_fd, &rec, sizeof(rec), off);
 }
@@ -92,7 +94,7 @@ void* malloc(size_t sz) {
   resolve_syms();
   in_trace = 1;
   void* a = real_malloc(sz);
-  if (a) write_rec(TYPE_MALLOC, sz, 0, (unsigned long long)a);
+  if (a) write_rec(TYPE_MALLOC, sz, 0, (unsigned long long)a, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return a;
 }
@@ -102,7 +104,7 @@ void* calloc(size_t n, size_t sz) {
   resolve_syms();
   in_trace = 1;
   void* a = real_calloc(n, sz);
-  if (a) write_rec(TYPE_CALLOC, n, sz, (unsigned long long)a);
+  if (a) write_rec(TYPE_CALLOC, n, sz, (unsigned long long)a, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return a;
 }
@@ -112,7 +114,7 @@ void* realloc(void* p, size_t sz) {
   resolve_syms();
   in_trace = 1;
   void* a = real_realloc(p, sz);
-  if (a) write_rec(TYPE_REALLOC, (unsigned long long)p, sz, (unsigned long long)a);
+  if (a) write_rec(TYPE_REALLOC, (unsigned long long)p, sz, (unsigned long long)a, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return a;
 }
@@ -122,7 +124,7 @@ void free(void* p) {
   if (in_trace) { if (real_free) real_free(p); return; }
   resolve_syms();
   in_trace = 1;
-  write_rec(TYPE_FREE, (unsigned long long)p, 0, 0);
+  write_rec(TYPE_FREE, (unsigned long long)p, 0, 0, (unsigned long long)__builtin_return_address(0));
   real_free(p);
   in_trace = 0;
 }
@@ -133,7 +135,7 @@ int posix_memalign(void** mp, size_t al, size_t sz) {
   resolve_syms();
   in_trace = 1;
   int r = real_posix_memalign(mp, al, sz);
-  if (r == 0 && mp && *mp) write_rec(TYPE_POSIX_MEMALIGN, sz, al, (unsigned long long)*mp);
+  if (r == 0 && mp && *mp) write_rec(TYPE_POSIX_MEMALIGN, sz, al, (unsigned long long)*mp, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return r;
 }
@@ -143,7 +145,7 @@ void* aligned_alloc(size_t al, size_t sz) {
   resolve_syms();
   in_trace = 1;
   void* a = real_aligned_alloc(al, sz);
-  if (a) write_rec(TYPE_MALLOC, sz, al, (unsigned long long)a);
+  if (a) write_rec(TYPE_MALLOC, sz, al, (unsigned long long)a, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return a;
 }
@@ -153,7 +155,7 @@ void* memalign(size_t al, size_t sz) {
   resolve_syms();
   in_trace = 1;
   void* a = real_memalign(al, sz);
-  if (a) write_rec(TYPE_MALLOC, sz, al, (unsigned long long)a);
+  if (a) write_rec(TYPE_MALLOC, sz, al, (unsigned long long)a, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return a;
 }
@@ -164,7 +166,7 @@ void* _Znwm(size_t sz) {
   resolve_syms();
   in_trace = 1;
   void* a = real_new(sz);
-  if (a) write_rec(TYPE_ZNWM, sz, 0, (unsigned long long)a);
+  if (a) write_rec(TYPE_ZNWM, sz, 0, (unsigned long long)a, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return a;
 }
@@ -174,7 +176,7 @@ void* _Znam(size_t sz) {
   resolve_syms();
   in_trace = 1;
   void* a = real_new_arr(sz);
-  if (a) write_rec(TYPE_ZNAM, sz, 0, (unsigned long long)a);
+  if (a) write_rec(TYPE_ZNAM, sz, 0, (unsigned long long)a, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return a;
 }
@@ -184,7 +186,7 @@ void _ZdlPv(void* p) {
   if (in_trace) { if (real_delete) real_delete(p); return; }
   resolve_syms();
   in_trace = 1;
-  write_rec(TYPE_ZDLPV, (unsigned long long)p, 0, 0);
+  write_rec(TYPE_ZDLPV, (unsigned long long)p, 0, 0, (unsigned long long)__builtin_return_address(0));
   real_delete(p);
   in_trace = 0;
 }
@@ -194,7 +196,7 @@ void _ZdaPv(void* p) {
   if (in_trace) { if (real_delete_arr) real_delete_arr(p); return; }
   resolve_syms();
   in_trace = 1;
-  write_rec(TYPE_ZDAPV, (unsigned long long)p, 0, 0);
+  write_rec(TYPE_ZDAPV, (unsigned long long)p, 0, 0, (unsigned long long)__builtin_return_address(0));
   real_delete_arr(p);
   in_trace = 0;
 }
@@ -205,7 +207,7 @@ void* mmap(void* a, size_t l, int p, int f, int fd, off_t o) {
   resolve_syms();
   in_trace = 1;
   void* r = real_mmap(a, l, p, f, fd, o);
-  if (r != MAP_FAILED) write_rec(TYPE_MMAP, l, 0, (unsigned long long)r);
+  if (r != MAP_FAILED) write_rec(TYPE_MMAP, l, 0, (unsigned long long)r, (unsigned long long)__builtin_return_address(0));
   in_trace = 0;
   return r;
 }
@@ -214,7 +216,7 @@ int munmap(void* a, size_t l) {
   if (in_trace) return real_munmap ? real_munmap(a, l) : -1;
   resolve_syms();
   in_trace = 1;
-  write_rec(TYPE_MUNMAP, (unsigned long long)a, l, 0);
+  write_rec(TYPE_MUNMAP, (unsigned long long)a, l, 0, (unsigned long long)__builtin_return_address(0));
   int r = real_munmap(a, l);
   in_trace = 0;
   return r;

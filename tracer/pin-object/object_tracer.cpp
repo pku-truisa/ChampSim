@@ -70,10 +70,11 @@ struct malloc_instr {
   unsigned long long arg1;
   unsigned long long arg2;
   unsigned long long ret;
+  unsigned long long caller_ip;
   unsigned char type;
   unsigned char reserved[7];
 };
-static_assert(sizeof(malloc_instr) == 32, "malloc_instr must be exactly 32 bytes");
+static_assert(sizeof(malloc_instr) == 40, "malloc_instr must be exactly 40 bytes");
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS 0x20
@@ -96,6 +97,7 @@ struct PendingAlloc {
   ADDRINT arg2 = 0;
   int type = 0;
   ADDRINT posix_memptr = 0;
+  ADDRINT caller_ip = 0;
 };
 
 struct ThreadState {
@@ -172,11 +174,12 @@ static const char* type_name(unsigned char t)
 
 void write_malloc_instr_locked(unsigned char type,
                                unsigned long long arg1, unsigned long long arg2,
-                               unsigned long long ret)
+                               unsigned long long ret, unsigned long long caller_ip)
 {
   if (malloc_binfile.is_open()) {
     malloc_instr rec;
     rec.type = type; rec.arg1 = arg1; rec.arg2 = arg2; rec.ret = ret;
+    rec.caller_ip = caller_ip;
     std::memset(rec.reserved, 0, sizeof(rec.reserved));
     typename decltype(malloc_binfile)::char_type buf[sizeof(malloc_instr)];
     std::memcpy(buf, &rec, sizeof(malloc_instr));
@@ -191,7 +194,7 @@ void write_malloc_instr_locked(unsigned char type,
 // Callback implementations
 /* ===================================================================== */
 static bool depth_outermost_before(ThreadState* ts, int alloc_type,
-                                   ADDRINT size, ADDRINT arg2 = 0)
+                                   ADDRINT size, ADDRINT caller_ip, ADDRINT arg2 = 0)
 {
   if (ts->alloc_depth > 0) {
     if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
@@ -199,7 +202,7 @@ static bool depth_outermost_before(ThreadState* ts, int alloc_type,
     return false;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, arg2, alloc_type, 0};
+  ts->pending = PendingAlloc{size, arg2, alloc_type, 0, caller_ip};
   return true;
 }
 
@@ -212,21 +215,21 @@ static void try_auto_reset_depth(ThreadState* ts)
   }
 }
 
-VOID AllocBefore(ADDRINT size, UINT32 alloc_type)
+VOID AllocBefore(ADDRINT size, UINT32 alloc_type, ADDRINT caller_ip)
 {
   ThreadState* ts = get_tls();
   try_auto_reset_depth(ts);
-  depth_outermost_before(ts, (int)alloc_type, size);
+  depth_outermost_before(ts, (int)alloc_type, size, caller_ip);
 }
 
-VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size, UINT32 alloc_type)
+VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size, UINT32 alloc_type, ADDRINT caller_ip)
 {
   ThreadState* ts = get_tls();
   try_auto_reset_depth(ts);
-  depth_outermost_before(ts, (int)alloc_type, nmemb * elem_size);
+  depth_outermost_before(ts, (int)alloc_type, nmemb * elem_size, caller_ip);
 }
 
-VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size, UINT32 alloc_type)
+VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size, UINT32 alloc_type, ADDRINT caller_ip)
 {
   ThreadState* ts = get_tls();
   try_auto_reset_depth(ts);
@@ -236,7 +239,7 @@ VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size, UINT32 alloc_type)
     return;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{old_ptr, new_size, (int)alloc_type, 0};
+  ts->pending = PendingAlloc{old_ptr, new_size, (int)alloc_type, 0, caller_ip};
 }
 
 VOID AllocAfter(ADDRINT ret)
@@ -253,20 +256,20 @@ VOID AllocAfter(ADDRINT ret)
   if (alloc_type >= 11 && alloc_type <= 14) {
     ADDRINT old_ptr = ts->pending.size;
     ADDRINT new_size = ts->pending.arg2;
-    write_malloc_instr_locked((unsigned char)alloc_type, old_ptr, new_size, ret);
+    write_malloc_instr_locked((unsigned char)alloc_type, old_ptr, new_size, ret, ts->pending.caller_ip);
     if (old_ptr != 0) tracked_addresses.erase(old_ptr);
     if (ret != 0 && ret != (ADDRINT)-1) tracked_addresses.insert(ret);
   } else {
     if (ret != 0 && ret != (ADDRINT)-1) {
       write_malloc_instr_locked((unsigned char)alloc_type,
-                                ts->pending.size, ts->pending.arg2, ret);
+                                ts->pending.size, ts->pending.arg2, ret, ts->pending.caller_ip);
       tracked_addresses.insert(ret);
     }
   }
   PIN_ReleaseLock(&malloc_lock);
 }
 
-VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size)
+VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size, ADDRINT caller_ip)
 {
   ThreadState* ts = get_tls();
   if (ts->alloc_depth > 0) {
@@ -275,7 +278,7 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size)
     return;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, alignment, TYPE_POSIX_MEMALIGN, memptr};
+  ts->pending = PendingAlloc{size, alignment, TYPE_POSIX_MEMALIGN, memptr, caller_ip};
 }
 
 VOID PosixMemalignAfter(ADDRINT status)
@@ -291,20 +294,20 @@ VOID PosixMemalignAfter(ADDRINT status)
     PIN_SafeCopy(&real_addr, (void*)ts->pending.posix_memptr, sizeof(ADDRINT));
     if (real_addr != 0 && real_addr != (ADDRINT)-1) {
       PIN_GetLock(&malloc_lock, PIN_ThreadId());
-      write_malloc_instr_locked(TYPE_POSIX_MEMALIGN, ts->pending.size, ts->pending.arg2, real_addr);
+      write_malloc_instr_locked(TYPE_POSIX_MEMALIGN, ts->pending.size, ts->pending.arg2, real_addr, ts->pending.caller_ip);
       tracked_addresses.insert(real_addr);
       PIN_ReleaseLock(&malloc_lock);
     }
   }
 }
 
-VOID FreeBefore(ADDRINT ptr, UINT32 free_type)
+VOID FreeBefore(ADDRINT ptr, UINT32 free_type, ADDRINT caller_ip)
 {
   if (ptr == 0) return;
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
   auto it = tracked_addresses.find(ptr);
   if (it != tracked_addresses.end()) {
-    write_malloc_instr_locked((unsigned char)free_type, (unsigned long long)ptr, 0, 0);
+    write_malloc_instr_locked((unsigned char)free_type, (unsigned long long)ptr, 0, 0, 0);
     tracked_addresses.erase(it);
   }
   PIN_ReleaseLock(&malloc_lock);
@@ -312,7 +315,7 @@ VOID FreeBefore(ADDRINT ptr, UINT32 free_type)
 
 VOID FreeAfter() { /* no-op */ }
 
-VOID MmapBefore(ADDRINT length, ADDRINT flags)
+VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT caller_ip)
 {
   if (!(flags & MAP_ANONYMOUS)) return;
   ThreadState* ts = get_tls();
@@ -335,19 +338,19 @@ VOID MmapAfter(ADDRINT ret)
 
   if (ret != 0 && ret != (ADDRINT)-1) {
     PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    write_malloc_instr_locked(TYPE_MMAP, ts->mmap_pending_size, 0, ret);
+    write_malloc_instr_locked(TYPE_MMAP, ts->mmap_pending_size, 0, ret, 0);
     tracked_addresses.insert(ret);
     PIN_ReleaseLock(&malloc_lock);
   }
 }
 
-VOID MunmapBefore(ADDRINT addr, ADDRINT length)
+VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT caller_ip)
 {
   if (addr == 0 || addr == (ADDRINT)-1) return;
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
   auto it = tracked_addresses.find(addr);
   if (it != tracked_addresses.end()) {
-    write_malloc_instr_locked(TYPE_MUNMAP, (unsigned long long)addr, (unsigned long long)length, 0);
+    write_malloc_instr_locked(TYPE_MUNMAP, (unsigned long long)addr, (unsigned long long)length, 0, 0);
     tracked_addresses.erase(it);
   }
   PIN_ReleaseLock(&malloc_lock);
@@ -400,7 +403,8 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                   IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -411,7 +415,8 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                   IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
                    IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
     RTN_Close(rtn);
@@ -422,7 +427,8 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Open(rtn);
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore,
                    IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_RETURN_IP, IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
     RTN_Close(rtn);
   }
@@ -435,7 +441,8 @@ VOID ImageLoad(IMG img, VOID* v)
       case SymbolHook::MALLOC:
         RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
                        IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                       IARG_UINT32, sym.type, IARG_END);
+                       IARG_UINT32, sym.type,
+                       IARG_RETURN_IP, IARG_END);
         RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                        IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
         break;
@@ -443,7 +450,8 @@ VOID ImageLoad(IMG img, VOID* v)
         RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
                        IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                        IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                       IARG_UINT32, sym.type, IARG_END);
+                       IARG_UINT32, sym.type,
+                       IARG_RETURN_IP, IARG_END);
         RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                        IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
         break;
@@ -451,14 +459,16 @@ VOID ImageLoad(IMG img, VOID* v)
         RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
                        IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                        IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                       IARG_UINT32, sym.type, IARG_END);
+                       IARG_UINT32, sym.type,
+                       IARG_RETURN_IP, IARG_END);
         RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
                        IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
         break;
       case SymbolHook::FREE:
         RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
                        IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                       IARG_UINT32, sym.type, IARG_END);
+                       IARG_UINT32, sym.type,
+                       IARG_RETURN_IP, IARG_END);
         RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
         break;
     }
