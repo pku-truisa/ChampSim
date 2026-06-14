@@ -583,42 +583,26 @@ static const char* malloc_type_name(unsigned char t)
 {
   switch (t) {
     case 1:   return "malloc";
-    case 2:   return "mi_malloc";
-    case 3:   return "je_malloc";
-    case 4:   return "tc_malloc";
-    case 5:   return "_Znwm";
-    case 6:   return "_Znam";
     case 7:   return "calloc";
-    case 8:   return "mi_calloc";
-    case 9:   return "je_calloc";
-    case 10:  return "tc_calloc";
     case 11:  return "realloc";
-    case 12:  return "mi_realloc";
-    case 13:  return "je_realloc";
-    case 14:  return "tc_realloc";
     case 15:  return "posix_memalign";
     case 16:  return "mmap";
     case 17:  return "munmap";
     case 18:  return "free";
-    case 19:  return "mi_free";
-    case 20:  return "je_free";
-    case 21:  return "tc_free";
-    case 22:  return "_ZdlPv";
-    case 23:  return "_ZdaPv";
     default:  return "UNKNOWN";
   }
 }
 
-/* Map fine-grained type (1-23) to coarse type used by instruction trace instr_info field. */
+/* Map fine-grained type to coarse type used by instruction trace instr_info field. */
 static unsigned char coarse_type(unsigned char fine_type)
 {
-  if (fine_type >= 1 && fine_type <= 6)  return 1;  // malloc-like
-  if (fine_type >= 7 && fine_type <= 10) return 5;  // calloc-like
-  if (fine_type >= 11 && fine_type <= 14) return 6;  // realloc-like
-  if (fine_type == 15)  return 8;  // posix_memalign
-  if (fine_type == 16)  return 3;  // mmap
-  if (fine_type == 17)  return 4;  // munmap
-  if (fine_type >= 18 && fine_type <= 23) return 2;  // free-like
+  if (fine_type == 1)  return 1;  // malloc
+  if (fine_type == 7)  return 5;  // calloc
+  if (fine_type == 11) return 6;  // realloc
+  if (fine_type == 15) return 8;  // posix_memalign
+  if (fine_type == 16) return 3;  // mmap
+  if (fine_type == 17) return 4;  // munmap
+  if (fine_type == 18) return 2;  // free
   return 0;
 }
 
@@ -949,26 +933,30 @@ struct SymbolHook {
 };
 
 static const SymbolHook all_symbols[] = {
+  // malloc-like (all mapped to type 1)
   {"malloc",     1,  SymbolHook::MALLOC},
-  {"mi_malloc",  2,  SymbolHook::MALLOC},
-  {"je_malloc",  3,  SymbolHook::MALLOC},
-  {"tc_malloc",  4,  SymbolHook::MALLOC},
-  {"_Znwm",      5,  SymbolHook::MALLOC},
-  {"_Znam",      6,  SymbolHook::MALLOC},
+  {"mi_malloc",  1,  SymbolHook::MALLOC},
+  {"je_malloc",  1,  SymbolHook::MALLOC},
+  {"tc_malloc",  1,  SymbolHook::MALLOC},
+  {"_Znwm",      1,  SymbolHook::MALLOC},
+  {"_Znam",      1,  SymbolHook::MALLOC},
+  // calloc-like (all mapped to type 7)
   {"calloc",     7,  SymbolHook::CALLOC},
-  {"mi_calloc",  8,  SymbolHook::CALLOC},
-  {"je_calloc",  9,  SymbolHook::CALLOC},
-  {"tc_calloc",  10, SymbolHook::CALLOC},
+  {"mi_calloc",  7,  SymbolHook::CALLOC},
+  {"je_calloc",  7,  SymbolHook::CALLOC},
+  {"tc_calloc",  7,  SymbolHook::CALLOC},
+  // realloc-like (all mapped to type 11)
   {"realloc",    11, SymbolHook::REALLOC},
-  {"mi_realloc", 12, SymbolHook::REALLOC},
-  {"je_realloc", 13, SymbolHook::REALLOC},
-  {"tc_realloc", 14, SymbolHook::REALLOC},
+  {"mi_realloc", 11, SymbolHook::REALLOC},
+  {"je_realloc", 11, SymbolHook::REALLOC},
+  {"tc_realloc", 11, SymbolHook::REALLOC},
+  // free-like (all mapped to type 18)
   {"free",       18, SymbolHook::FREE},
-  {"mi_free",    19, SymbolHook::FREE},
-  {"je_free",    20, SymbolHook::FREE},
-  {"tc_free",    21, SymbolHook::FREE},
-  {"_ZdlPv",     22, SymbolHook::FREE},
-  {"_ZdaPv",     23, SymbolHook::FREE},
+  {"mi_free",    18, SymbolHook::FREE},
+  {"je_free",    18, SymbolHook::FREE},
+  {"tc_free",    18, SymbolHook::FREE},
+  {"_ZdlPv",     18, SymbolHook::FREE},
+  {"_ZdaPv",     18, SymbolHook::FREE},
 };
 
 /* ===================================================================== */

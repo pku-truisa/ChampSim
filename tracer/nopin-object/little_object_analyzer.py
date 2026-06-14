@@ -42,35 +42,35 @@ def format_size(size):
     return "{} B".format(size)
 
 TYPE_MAP = {
-    1: 'malloc', 2: 'mi_malloc', 3: 'je_malloc', 4: 'tc_malloc',
-    5: '_Znwm', 6: '_Znam',
-    7: 'calloc', 8: 'mi_calloc', 9: 'je_calloc', 10: 'tc_calloc',
-    11: 'realloc', 12: 'mi_realloc', 13: 'je_realloc', 14: 'tc_realloc',
+    1: 'malloc',
+    7: 'calloc',
+    11: 'realloc',
     15: 'posix_memalign',
-    16: 'mmap', 17: 'munmap',
-    18: 'free', 19: 'mi_free', 20: 'je_free', 21: 'tc_free',
-    22: '_ZdlPv', 23: '_ZdaPv',
+    16: 'mmap',
+    17: 'munmap',
+    18: 'free',
 }
 
-_ALLOC_TYPES = set(range(1, 17))  # 1-16
-_FREE_TYPES = {17}.union(set(range(18, 24)))  # 17-23
+_ALLOC_TYPES = {1, 7, 11, 15, 16}  # alloc types
+_FREE_TYPES = {17, 18}             # free/munmap types
 
 _ALLOC_GROUPS = [
-    ("malloc-like",   list(range(1, 7))),
-    ("calloc",        list(range(7, 11))),
-    ("realloc",       list(range(11, 15))),
+    ("malloc",        [1]),
+    ("calloc",        [7]),
+    ("realloc",       [11]),
     ("posix_memalign", [15]),
     ("mmap",          [16]),
 ]
 _FREE_GROUPS = [
     ("munmap",        [17]),
-    ("free/delete",   list(range(18, 24))),
+    ("free",          [18]),
 ]
 
 def read_malloc_binary(filename):
     is_xz = filename.endswith('.xz')
     open_func = lzma.open if is_xz else open
-    fmt = "<QQQB7s"
+    # 40-byte format: arg1(8) arg2(8) ret(8) caller_ip(8) type(1) reserved(7)
+    fmt = "<QQQQB7s"
     struct_size = struct.calcsize(fmt)
     with open_func(filename, "rb") as f:
         chunk_size = 32 * 1024 * 64
@@ -81,7 +81,7 @@ def read_malloc_binary(filename):
             while offset < len(chunk):
                 record = chunk[offset:offset+struct_size]
                 if len(record) < struct_size: break
-                arg1, arg2, ret, etype, _ = struct.unpack(fmt, record)
+                arg1, arg2, ret, _caller_ip, etype, _ = struct.unpack(fmt, record)
                 yield etype, arg1, arg2, ret
                 offset += struct_size
 
@@ -249,8 +249,8 @@ def process_malloc_binary(filename, objects_path=None):
         print("\n--- Breakdown by Symbol ---")
         print(f"{'Symbol':<30} {'Code':>4}  {'Count':>14}")
         print("-" * 52)
-        for code in range(1, 24):
-            name = TYPE_MAP.get(code, 'unknown')
+        for code in sorted(TYPE_MAP.keys()):
+            name = TYPE_MAP[code]
             count = func_stats.get(name, 0)
             if count > 0:
                 print(f"{name:<30} {code:>4}  {count:>14,}")

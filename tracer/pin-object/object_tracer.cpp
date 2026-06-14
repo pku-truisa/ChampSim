@@ -15,8 +15,9 @@
  */
 
 /*! @file
- * Advanced Object Tracer v5 — 23 fine-grained type codes, one per hooked symbol.
- * Fortran symbols (24-39) removed: gfortran compiles ALLOCATE directly to malloc.
+ * Object Tracer — allocation events with caller IP.
+ * 7 base type codes; allocator-variant symbols (mi/je/tc, C++ new/delete)
+ * are all mapped to their corresponding base type.
  */
 
 #include <fstream>
@@ -30,37 +31,16 @@
 #include "pin.H"
 
 /* ===================================================================== */
-// Fine-grained malloc type codes — one per hooked symbol (23 total)
+// Malloc type codes (7 base types)
 /* ===================================================================== */
 enum MallocType : unsigned char {
   TYPE_MALLOC                      = 1,
-  TYPE_MI_MALLOC                   = 2,
-  TYPE_JE_MALLOC                   = 3,
-  TYPE_TC_MALLOC                   = 4,
-  TYPE_ZNWM                        = 5,
-  TYPE_ZNAM                        = 6,
-
   TYPE_CALLOC                      = 7,
-  TYPE_MI_CALLOC                   = 8,
-  TYPE_JE_CALLOC                   = 9,
-  TYPE_TC_CALLOC                   = 10,
-
   TYPE_REALLOC                     = 11,
-  TYPE_MI_REALLOC                  = 12,
-  TYPE_JE_REALLOC                  = 13,
-  TYPE_TC_REALLOC                  = 14,
-
   TYPE_POSIX_MEMALIGN              = 15,
-
   TYPE_MMAP                        = 16,
   TYPE_MUNMAP                      = 17,
-
   TYPE_FREE                        = 18,
-  TYPE_MI_FREE                     = 19,
-  TYPE_JE_FREE                     = 20,
-  TYPE_TC_FREE                     = 21,
-  TYPE_ZDLPV                       = 22,
-  TYPE_ZDAPV                       = 23,
 };
 
 /* ===================================================================== */
@@ -136,7 +116,7 @@ KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "mal
 /* ===================================================================== */
 INT32 Usage()
 {
-  std::cerr << "Object Tracer v5 — 23 fine-grained type codes (one per symbol)" << std::endl
+  std::cerr << "Object Tracer — allocation trace with caller IP. 7 base types." << std::endl
             << "Usage: pin -t object_tracer.so -m malloc.bin -- <program>" << std::endl;
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
   return -1;
@@ -146,28 +126,12 @@ static const char* type_name(unsigned char t)
 {
   switch (t) {
     case TYPE_MALLOC:         return "malloc";
-    case TYPE_MI_MALLOC:      return "mi_malloc";
-    case TYPE_JE_MALLOC:      return "je_malloc";
-    case TYPE_TC_MALLOC:      return "tc_malloc";
-    case TYPE_ZNWM:           return "_Znwm";
-    case TYPE_ZNAM:           return "_Znam";
     case TYPE_CALLOC:         return "calloc";
-    case TYPE_MI_CALLOC:      return "mi_calloc";
-    case TYPE_JE_CALLOC:      return "je_calloc";
-    case TYPE_TC_CALLOC:      return "tc_calloc";
     case TYPE_REALLOC:        return "realloc";
-    case TYPE_MI_REALLOC:     return "mi_realloc";
-    case TYPE_JE_REALLOC:     return "je_realloc";
-    case TYPE_TC_REALLOC:     return "tc_realloc";
     case TYPE_POSIX_MEMALIGN: return "posix_memalign";
     case TYPE_MMAP:           return "mmap";
     case TYPE_MUNMAP:         return "munmap";
     case TYPE_FREE:           return "free";
-    case TYPE_MI_FREE:        return "mi_free";
-    case TYPE_JE_FREE:        return "je_free";
-    case TYPE_TC_FREE:        return "tc_free";
-    case TYPE_ZDLPV:          return "_ZdlPv";
-    case TYPE_ZDAPV:          return "_ZdaPv";
     default:                  return "UNKNOWN";
   }
 }
@@ -361,7 +325,7 @@ VOID MunmapAfter() { /* no-op */ }
 VOID ResetDepthOnMain();
 
 /* ===================================================================== */
-// ImageLoad — per-symbol fine-grained type registration (23 symbols)
+// ImageLoad — symbol registration (7 base types + alias variants)
 /* ===================================================================== */
 struct SymbolHook {
   const char* name;
@@ -370,26 +334,30 @@ struct SymbolHook {
 };
 
 static const SymbolHook all_symbols[] = {
+  // malloc-like (family MALLOC)
   {"malloc",     TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"mi_malloc",  TYPE_MI_MALLOC,  SymbolHook::MALLOC},
-  {"je_malloc",  TYPE_JE_MALLOC,  SymbolHook::MALLOC},
-  {"tc_malloc",  TYPE_TC_MALLOC,  SymbolHook::MALLOC},
-  {"_Znwm",      TYPE_ZNWM,       SymbolHook::MALLOC},
-  {"_Znam",      TYPE_ZNAM,       SymbolHook::MALLOC},
+  {"mi_malloc",  TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"je_malloc",  TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"tc_malloc",  TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"_Znwm",      TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"_Znam",      TYPE_MALLOC,     SymbolHook::MALLOC},
+  // calloc-like
   {"calloc",     TYPE_CALLOC,     SymbolHook::CALLOC},
-  {"mi_calloc",  TYPE_MI_CALLOC,  SymbolHook::CALLOC},
-  {"je_calloc",  TYPE_JE_CALLOC,  SymbolHook::CALLOC},
-  {"tc_calloc",  TYPE_TC_CALLOC,  SymbolHook::CALLOC},
+  {"mi_calloc",  TYPE_CALLOC,     SymbolHook::CALLOC},
+  {"je_calloc",  TYPE_CALLOC,     SymbolHook::CALLOC},
+  {"tc_calloc",  TYPE_CALLOC,     SymbolHook::CALLOC},
+  // realloc-like
   {"realloc",    TYPE_REALLOC,    SymbolHook::REALLOC},
-  {"mi_realloc", TYPE_MI_REALLOC, SymbolHook::REALLOC},
-  {"je_realloc", TYPE_JE_REALLOC, SymbolHook::REALLOC},
-  {"tc_realloc", TYPE_TC_REALLOC, SymbolHook::REALLOC},
+  {"mi_realloc", TYPE_REALLOC,    SymbolHook::REALLOC},
+  {"je_realloc", TYPE_REALLOC,    SymbolHook::REALLOC},
+  {"tc_realloc", TYPE_REALLOC,    SymbolHook::REALLOC},
+  // free-like
   {"free",       TYPE_FREE,       SymbolHook::FREE},
-  {"mi_free",    TYPE_MI_FREE,    SymbolHook::FREE},
-  {"je_free",    TYPE_JE_FREE,    SymbolHook::FREE},
-  {"tc_free",    TYPE_TC_FREE,    SymbolHook::FREE},
-  {"_ZdlPv",     TYPE_ZDLPV,      SymbolHook::FREE},
-  {"_ZdaPv",     TYPE_ZDAPV,      SymbolHook::FREE},
+  {"mi_free",    TYPE_FREE,       SymbolHook::FREE},
+  {"je_free",    TYPE_FREE,       SymbolHook::FREE},
+  {"tc_free",    TYPE_FREE,       SymbolHook::FREE},
+  {"_ZdlPv",     TYPE_FREE,       SymbolHook::FREE},
+  {"_ZdaPv",     TYPE_FREE,       SymbolHook::FREE},
 };
 
 VOID ImageLoad(IMG img, VOID* v)
