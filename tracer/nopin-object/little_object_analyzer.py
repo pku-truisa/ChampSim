@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-高性能低内存流式 Memory Allocation Trace File Analyzer — v6 39-type scheme.
+高性能低内存流式 Memory Allocation Trace File Analyzer — v7 39-type scheme.
 v6: Added top-64 largest memory objects tracking with lifetime (alloc/free event count).
+v7: Added automatic legacy format detection + type code remapping for old PIN tracer traces.
 """
 
 import struct
@@ -41,36 +42,136 @@ def format_size(size):
         return "{:.2f} KiB".format(size / 1024)
     return "{} B".format(size)
 
+# ===== New 23-type code scheme (current) =====
 TYPE_MAP = {
-    1: 'malloc',
-    7: 'calloc',
-    11: 'realloc',
+    1: 'malloc', 2: 'mi_malloc', 3: 'je_malloc', 4: 'tc_malloc',
+    5: '_Znwm', 6: '_Znam',
+    7: 'calloc', 8: 'mi_calloc', 9: 'je_calloc', 10: 'tc_calloc',
+    11: 'realloc', 12: 'mi_realloc', 13: 'je_realloc', 14: 'tc_realloc',
     15: 'posix_memalign',
-    16: 'mmap',
-    17: 'munmap',
-    18: 'free',
+    16: 'mmap', 17: 'munmap',
+    18: 'free', 19: 'mi_free', 20: 'je_free', 21: 'tc_free',
+    22: '_ZdlPv', 23: '_ZdaPv',
 }
 
-_ALLOC_TYPES = {1, 7, 11, 15, 16}  # alloc types
-_FREE_TYPES = {17, 18}             # free/munmap types
+# Detect legacy type codes shown in old PIN object_tracer (pre-23-type).
+# Old scheme: 1=malloc, 2=free, 3=mmap, 4=munmap, 5=calloc, 6=realloc,
+#             8=posix_memalign, 16=realloc_inplace
+# Mapping: old_type -> new_type (for automatic remapping)
+_OLD_TYPE_REMAP = {
+    2: 18,   # free -> free
+    3: 16,   # mmap -> mmap
+    4: 17,   # munmap -> munmap
+    5: 7,    # calloc -> calloc
+    6: 11,   # realloc -> realloc
+    8: 15,   # posix_memalign -> posix_memalign
+    16: 11,  # realloc_inplace -> realloc (treat as realloc)
+}
+
+_ALLOC_TYPES = set(range(1, 17))  # 1-16
+_FREE_TYPES = {17}.union(set(range(18, 24)))  # 17-23
 
 _ALLOC_GROUPS = [
-    ("malloc",        [1]),
-    ("calloc",        [7]),
-    ("realloc",       [11]),
+    ("malloc-like",   list(range(1, 7))),
+    ("calloc",        list(range(7, 11))),
+    ("realloc",       list(range(11, 15))),
     ("posix_memalign", [15]),
     ("mmap",          [16]),
 ]
 _FREE_GROUPS = [
     ("munmap",        [17]),
-    ("free",          [18]),
+    ("free/delete",   list(range(18, 24))),
 ]
 
-def read_malloc_binary(filename):
+def detect_legacy_format(filename):
+    """
+    Read the first ~200 records from the binary trace to detect if it uses
+    the OLD PIN object_tracer format (type 2=free, type 3=mmap, etc.)
+
+    Detection heuristic: In old format, type 2 = free (arg1=ptr to user memory).
+    In new format, type 2 = mi_malloc (arg1=size, usually small < 1MB).
+    If type 2 records consistently have large arg1 values (> 1TB or >= 0x500000000000),
+    it's legacy format.
+    """
     is_xz = filename.endswith('.xz')
     open_func = lzma.open if is_xz else open
-    # 40-byte format: arg1(8) arg2(8) ret(8) caller_ip(8) type(1) reserved(7)
-    fmt = "<QQQQB7s"
+    fmt = "<QQQB7s"
+    struct_size = struct.calcsize(fmt)
+
+    sample_type2 = []
+    total_records = 0
+
+    try:
+        with open_func(filename, "rb") as f:
+            chunk = f.read(struct_size * 200)
+            offset = 0
+            while offset + struct_size <= len(chunk):
+                arg1, arg2, ret, etype, _ = struct.unpack(fmt, chunk[offset:offset+struct_size])
+                total_records += 1
+                if etype == 2:
+                    sample_type2.append(arg1)
+                offset += struct_size
+    except Exception:
+        return False  # On any error, assume new format
+
+    if not sample_type2 or total_records < 10:
+        return False  # Not enough data to decide
+
+    # Check: in legacy format, type 2 = free, arg1 is a pointer (high 16 bits non-zero)
+    # In new format, type 2 = mi_malloc, arg1 is a size (usually < 2^48, but typically < a few MB)
+    # A user-space pointer on x86_64 typically starts with 0x00005... or 0x00007...
+    # But a size > 2^32 is extremely rare for allocation size.
+    legacy_count = sum(1 for v in sample_type2 if v > 0x0000100000000000)  # > 28 TB
+    new_count = sum(1 for v in sample_type2 if v <= 0x0000100000000000)
+
+    # Also check if any type 2 arg1 is in valid pointer range (0x5555..., 0x7f7f..., 0xffff...)
+    pointer_count = sum(1 for v in sample_type2 if (v >> 44) in (0x5, 0x7, 0xf))
+
+    detected_legacy = (legacy_count > len(sample_type2) * 0.5) or (pointer_count > len(sample_type2) * 0.3)
+
+    if detected_legacy:
+        print(f"[Auto-detect] Detected OLD format trace ({len(sample_type2)} type-2 samples: "
+              f"{legacy_count} huge, {pointer_count} pointer-looking). "
+              f"Auto-remapping type codes to new scheme.")
+    return detected_legacy
+
+def remap_legacy_record(etype, arg1, arg2, ret):
+    """
+    Remap a record from old format to new format type codes.
+    Returns (new_etype, new_arg1, new_arg2, new_ret).
+    """
+    if etype == 1:
+        # malloc: unchanged
+        return 1, arg1, arg2, ret
+    elif etype == 2:
+        # old free -> new free (type 18): arg1=ptr, arg2=0, ret=0
+        return 18, arg1, 0, 0
+    elif etype == 3:
+        # old mmap -> new mmap (type 16): arg1=size, arg2=0, ret=addr
+        return 16, arg1, 0, ret
+    elif etype == 4:
+        # old munmap -> new munmap (type 17): arg1=addr, arg2=0, ret=0
+        return 17, arg1, 0, 0
+    elif etype == 5:
+        # old calloc -> new calloc (type 7): arg1=nmemb, arg2=elem_size, ret=addr
+        return 7, arg1, arg2, ret
+    elif etype == 6:
+        # old realloc -> new realloc (type 11): arg1=old_ptr, arg2=new_size, ret=addr
+        return 11, arg1, arg2, ret
+    elif etype == 8:
+        # old posix_memalign -> new posix_memalign (type 15): arg1=size, arg2=align, ret=addr
+        return 15, arg1, arg2, ret
+    elif etype == 16:
+        # old realloc_inplace -> new realloc (type 11): arg1=ptr (old==new), arg2=0, ret=addr
+        return 11, arg1, 0, ret
+    else:
+        # Unknown type - keep as-is
+        return etype, arg1, arg2, ret
+
+def read_malloc_binary(filename, legacy_mode=False):
+    is_xz = filename.endswith('.xz')
+    open_func = lzma.open if is_xz else open
+    fmt = "<QQQB7s"
     struct_size = struct.calcsize(fmt)
     with open_func(filename, "rb") as f:
         chunk_size = 32 * 1024 * 64
@@ -81,7 +182,9 @@ def read_malloc_binary(filename):
             while offset < len(chunk):
                 record = chunk[offset:offset+struct_size]
                 if len(record) < struct_size: break
-                arg1, arg2, ret, _caller_ip, etype, _ = struct.unpack(fmt, record)
+                arg1, arg2, ret, etype, _ = struct.unpack(fmt, record)
+                if legacy_mode:
+                    etype, arg1, arg2, ret = remap_legacy_record(etype, arg1, arg2, ret)
                 yield etype, arg1, arg2, ret
                 offset += struct_size
 
@@ -157,9 +260,14 @@ def process_malloc_binary(filename, objects_path=None):
     candidate_heap = []   # min-heap of (size, ptr)
     candidate_info = {}   # ptr -> {size, type, alloc_event, lifetime}
 
+    # Detect legacy format automatically
+    legacy_mode = detect_legacy_format(filename)
+    if legacy_mode:
+        print("[Auto-detect] Running in legacy mode with automatic type code remapping.")
+
     print("Streaming processing data to minimize memory footprint...")
 
-    for etype, arg1, arg2, ret in read_malloc_binary(filename):
+    for etype, arg1, arg2, ret in read_malloc_binary(filename, legacy_mode=legacy_mode):
         event_counter += 1  # Each record (alloc or free) counts as one event
         func_name = TYPE_MAP.get(etype, 'unknown')
 
@@ -249,8 +357,8 @@ def process_malloc_binary(filename, objects_path=None):
         print("\n--- Breakdown by Symbol ---")
         print(f"{'Symbol':<30} {'Code':>4}  {'Count':>14}")
         print("-" * 52)
-        for code in sorted(TYPE_MAP.keys()):
-            name = TYPE_MAP[code]
+        for code in range(1, 24):
+            name = TYPE_MAP.get(code, 'unknown')
             count = func_stats.get(name, 0)
             if count > 0:
                 print(f"{name:<30} {code:>4}  {count:>14,}")
@@ -273,7 +381,7 @@ def process_malloc_binary(filename, objects_path=None):
 
         # ===== Top-64 Largest Memory Objects =====
         if candidate_info:
-            # Sort by size descending, then by ptr ascending as tiebreaker
+            # Sort by size descending, then by alloc_event as tiebreaker
             sorted_candidates = sorted(candidate_info.values(), key=lambda x: (-x["size"], x["alloc_event"]))
 
             print("\n=== Top 64 Largest Memory Objects ===")
@@ -319,7 +427,7 @@ def process_malloc_binary(filename, objects_path=None):
         sys.stdout = sys.__stdout__
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v6 39-type, top-64 objects)')
+    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v7 39-type, top-64 objects, auto-format)')
     parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all"')
     parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report')
     args = parser.parse_args()
