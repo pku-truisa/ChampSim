@@ -44,14 +44,13 @@ def format_size(size):
 
 # ===== New 23-type code scheme (current) =====
 TYPE_MAP = {
-    1: 'malloc', 2: 'mi_malloc', 3: 'je_malloc', 4: 'tc_malloc',
-    5: '_Znwm', 6: '_Znam',
-    7: 'calloc', 8: 'mi_calloc', 9: 'je_calloc', 10: 'tc_calloc',
-    11: 'realloc', 12: 'mi_realloc', 13: 'je_realloc', 14: 'tc_realloc',
-    15: 'posix_memalign',
-    16: 'mmap', 17: 'munmap',
-    18: 'free', 19: 'mi_free', 20: 'je_free', 21: 'tc_free',
-    22: '_ZdlPv', 23: '_ZdaPv',
+    1: 'malloc/new',
+    2: 'free/delete',
+    3: 'calloc',
+    4: 'realloc',
+    5: 'posix_memalign',
+    6: 'mmap',
+    7: 'munmap',
 }
 
 # Detect legacy type codes shown in old PIN object_tracer (pre-23-type).
@@ -68,19 +67,19 @@ _OLD_TYPE_REMAP = {
     16: 11,  # realloc_inplace -> realloc (treat as realloc)
 }
 
-_ALLOC_TYPES = set(range(1, 17))  # 1-16
-_FREE_TYPES = {17}.union(set(range(18, 24)))  # 17-23
+_ALLOC_TYPES = {1, 3, 4, 5, 6}
+_FREE_TYPES = {2, 7}
 
 _ALLOC_GROUPS = [
-    ("malloc-like",   list(range(1, 7))),
-    ("calloc",        list(range(7, 11))),
-    ("realloc",       list(range(11, 15))),
-    ("posix_memalign", [15]),
-    ("mmap",          [16]),
+    ("malloc/new",    [1]),
+    ("calloc",        [3]),
+    ("realloc",       [4]),
+    ("posix_memalign", [5]),
+    ("mmap",          [6]),
 ]
 _FREE_GROUPS = [
-    ("munmap",        [17]),
-    ("free/delete",   list(range(18, 24))),
+    ("free/delete",   [2]),
+    ("munmap",        [7]),
 ]
 
 def detect_legacy_format(filename):
@@ -273,11 +272,11 @@ def process_malloc_binary(filename, objects_path=None):
 
         if etype in _ALLOC_TYPES:
             func_stats[func_name] += 1
-            size = arg2 if 11 <= etype <= 14 else arg1
+            size = arg2 if etype == 4 else arg1
 
             if ret != 0:
                 # Handle realloc old pointer free (realloc is a single event)
-                if 11 <= etype <= 14 and arg1 != 0 and arg1 in active_heap:
+                if etype == 4 and arg1 != 0 and arg1 in active_heap:
                     old_sz, old_alloc_ev, _ = active_heap.pop(arg1)
                     original_current_size -= old_sz
                     # Compute lifetime for old pointer freed by realloc
@@ -354,10 +353,10 @@ def process_malloc_binary(filename, objects_path=None):
             if group_total > 0:
                 print(f"{group_name:<18} {len(codes):>12}  {group_total:>14,}")
 
-        print("\n--- Breakdown by Symbol ---")
-        print(f"{'Symbol':<30} {'Code':>4}  {'Count':>14}")
+        print("\n--- Breakdown by Type ---")
+        print(f"{'Type':<30} {'Code':>4}  {'Count':>14}")
         print("-" * 52)
-        for code in range(1, 24):
+        for code in sorted(TYPE_MAP.keys()):
             name = TYPE_MAP.get(code, 'unknown')
             count = func_stats.get(name, 0)
             if count > 0:

@@ -23,9 +23,9 @@ typedef struct {
 } __attribute__((packed)) malloc_record_t;
 
 enum {
-  TYPE_MALLOC = 1, TYPE_CALLOC = 7, TYPE_REALLOC = 11,
-  TYPE_POSIX_MEMALIGN = 15, TYPE_MMAP = 16, TYPE_MUNMAP = 17, TYPE_FREE = 18,
-  TYPE_ZNWM = 1, TYPE_ZNAM = 1, TYPE_ZDLPV = 18, TYPE_ZDAPV = 18,
+  TYPE_MALLOC = 1, TYPE_FREE = 2, TYPE_CALLOC = 3, TYPE_REALLOC = 4,
+  TYPE_POSIX_MEMALIGN = 5, TYPE_MMAP = 6, TYPE_MUNMAP = 7,
+  TYPE_ZNWM = 1, TYPE_ZNAM = 1, TYPE_ZDLPV = 2, TYPE_ZDAPV = 2,
 };
 
 static int trace_fd = -1;

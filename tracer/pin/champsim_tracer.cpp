@@ -582,28 +582,21 @@ void WriteToSet(T* begin, T* end, UINT32 r)
 static const char* malloc_type_name(unsigned char t)
 {
   switch (t) {
-    case 1:   return "malloc";
-    case 7:   return "calloc";
-    case 11:  return "realloc";
-    case 15:  return "posix_memalign";
-    case 16:  return "mmap";
-    case 17:  return "munmap";
-    case 18:  return "free";
+    case 1:   return "malloc/new";
+    case 2:   return "free/delete";
+    case 3:   return "calloc";
+    case 4:   return "realloc";
+    case 5:   return "posix_memalign";
+    case 6:   return "mmap";
+    case 7:   return "munmap";
     default:  return "UNKNOWN";
   }
 }
 
-/* Map fine-grained type to coarse type used by instruction trace instr_info field. */
+/* Map fine-grained type (1-7) to coarse type used by instruction trace instr_info field. */
 static unsigned char coarse_type(unsigned char fine_type)
 {
-  if (fine_type == 1)  return 1;  // malloc
-  if (fine_type == 7)  return 5;  // calloc
-  if (fine_type == 11) return 6;  // realloc
-  if (fine_type == 15) return 8;  // posix_memalign
-  if (fine_type == 16) return 3;  // mmap
-  if (fine_type == 17) return 4;  // munmap
-  if (fine_type == 18) return 2;  // free
-  return 0;
+  return fine_type;  // 1:1 mapping, type code is the coarse type
 }
 
 // --- Helper: outermost BEFORE for depth-protected alloc family ---
@@ -721,7 +714,7 @@ VOID AllocAfter(ADDRINT ret)
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
 
   int alloc_type = ts->pending.type;
-  bool is_realloc = (alloc_type >= 11 && alloc_type <= 14);
+  bool is_realloc = (alloc_type == 4);
 
   if (is_realloc) {
     ADDRINT old_ptr  = ts->pending.size;
@@ -769,7 +762,7 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size, ADDRIN
     return;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, alignment, 15, memptr, 0};
+  ts->pending = PendingAlloc{size, alignment, 5, memptr, 0};
 }
 
 VOID PosixMemalignAfter(ADDRINT status)
@@ -787,8 +780,8 @@ VOID PosixMemalignAfter(ADDRINT status)
     if (real_addr != 0 && real_addr != (ADDRINT)-1) {
       if (compat_mode) return;
       PIN_GetLock(&malloc_lock, PIN_ThreadId());
-      record_alloc_event(8, ts->pending.size, ts->pending.arg2, real_addr,
-                         ts->pending.size, 8, ts->pending.caller_ip);
+      record_alloc_event(5, ts->pending.size, ts->pending.arg2, real_addr,
+                         ts->pending.size, 5, ts->pending.caller_ip);
       tracked_addresses.insert(real_addr);
       PIN_ReleaseLock(&malloc_lock);
     }
@@ -842,8 +835,8 @@ VOID MmapAfter(ADDRINT ret)
   if (ret != 0 && ret != (ADDRINT)-1) {
     if (compat_mode) return;
     PIN_GetLock(&malloc_lock, PIN_ThreadId());
-      record_alloc_event(3, ts->mmap_pending_size, 0, ret,
-                       ts->mmap_pending_size, 3, 0);
+      record_alloc_event(6, ts->mmap_pending_size, 0, ret,
+                       ts->mmap_pending_size, 6, 0);
     tracked_addresses.insert(ret);
     PIN_ReleaseLock(&malloc_lock);
   }
@@ -859,12 +852,12 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT caller_ip)
   auto it = tracked_addresses.find(addr);
   if (it != tracked_addresses.end()) {
     if (embedded_alloc_mode) {
-      pending_instr_malloc.type = 4;
+      pending_instr_malloc.type = 7;
       pending_instr_malloc.arg1 = (unsigned long long)addr;
       pending_instr_malloc.arg2 = (unsigned long long)length;
       pending_instr_malloc.ret = 0;
     } else if (alloc_only_mode) {
-      write_alloc_record_locked(4, (unsigned long long)addr, (unsigned long long)length, 0, 0);
+      write_alloc_record_locked(7, (unsigned long long)addr, (unsigned long long)length, 0, 0);
     }
     tracked_addresses.erase(it);
   }
@@ -933,30 +926,22 @@ struct SymbolHook {
 };
 
 static const SymbolHook all_symbols[] = {
-  // malloc-like (all mapped to type 1)
-  {"malloc",     1,  SymbolHook::MALLOC},
-  {"mi_malloc",  1,  SymbolHook::MALLOC},
-  {"je_malloc",  1,  SymbolHook::MALLOC},
-  {"tc_malloc",  1,  SymbolHook::MALLOC},
-  {"_Znwm",      1,  SymbolHook::MALLOC},
-  {"_Znam",      1,  SymbolHook::MALLOC},
-  // calloc-like (all mapped to type 7)
-  {"calloc",     7,  SymbolHook::CALLOC},
-  {"mi_calloc",  7,  SymbolHook::CALLOC},
-  {"je_calloc",  7,  SymbolHook::CALLOC},
-  {"tc_calloc",  7,  SymbolHook::CALLOC},
-  // realloc-like (all mapped to type 11)
-  {"realloc",    11, SymbolHook::REALLOC},
-  {"mi_realloc", 11, SymbolHook::REALLOC},
-  {"je_realloc", 11, SymbolHook::REALLOC},
-  {"tc_realloc", 11, SymbolHook::REALLOC},
-  // free-like (all mapped to type 18)
-  {"free",       18, SymbolHook::FREE},
-  {"mi_free",    18, SymbolHook::FREE},
-  {"je_free",    18, SymbolHook::FREE},
-  {"tc_free",    18, SymbolHook::FREE},
-  {"_ZdlPv",     18, SymbolHook::FREE},
-  {"_ZdaPv",     18, SymbolHook::FREE},
+  // malloc-like (type 1)
+  {"malloc",                          1, SymbolHook::MALLOC},
+  {"_Znwm",                           1, SymbolHook::MALLOC},
+  {"_Znam",                           1, SymbolHook::MALLOC},
+  {"_ZnwmSt11align_val_t",            1, SymbolHook::MALLOC},
+  {"_ZnamSt11align_val_t",            1, SymbolHook::MALLOC},
+  // calloc (type 3)
+  {"calloc",                          3, SymbolHook::CALLOC},
+  // realloc (type 4)
+  {"realloc",                         4, SymbolHook::REALLOC},
+  // free-like (type 2)
+  {"free",                            2, SymbolHook::FREE},
+  {"_ZdlPv",                          2, SymbolHook::FREE},
+  {"_ZdaPv",                          2, SymbolHook::FREE},
+  {"_ZdlPvSt11align_val_t",           2, SymbolHook::FREE},
+  {"_ZdaPvSt11align_val_t",           2, SymbolHook::FREE},
 };
 
 /* ===================================================================== */

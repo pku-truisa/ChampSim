@@ -34,13 +34,13 @@
 // Malloc type codes (7 base types)
 /* ===================================================================== */
 enum MallocType : unsigned char {
-  TYPE_MALLOC                      = 1,
-  TYPE_CALLOC                      = 7,
-  TYPE_REALLOC                     = 11,
-  TYPE_POSIX_MEMALIGN              = 15,
-  TYPE_MMAP                        = 16,
-  TYPE_MUNMAP                      = 17,
-  TYPE_FREE                        = 18,
+  TYPE_MALLOC         = 1,
+  TYPE_FREE           = 2,
+  TYPE_CALLOC         = 3,
+  TYPE_REALLOC        = 4,
+  TYPE_POSIX_MEMALIGN = 5,
+  TYPE_MMAP           = 6,
+  TYPE_MUNMAP         = 7,
 };
 
 /* ===================================================================== */
@@ -125,13 +125,13 @@ INT32 Usage()
 static const char* type_name(unsigned char t)
 {
   switch (t) {
-    case TYPE_MALLOC:         return "malloc";
+    case TYPE_MALLOC:         return "malloc/new";
+    case TYPE_FREE:           return "free/delete";
     case TYPE_CALLOC:         return "calloc";
     case TYPE_REALLOC:        return "realloc";
     case TYPE_POSIX_MEMALIGN: return "posix_memalign";
     case TYPE_MMAP:           return "mmap";
     case TYPE_MUNMAP:         return "munmap";
-    case TYPE_FREE:           return "free";
     default:                  return "UNKNOWN";
   }
 }
@@ -217,7 +217,7 @@ VOID AllocAfter(ADDRINT ret)
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
 
   int alloc_type = ts->pending.type;
-  if (alloc_type >= 11 && alloc_type <= 14) {
+  if (alloc_type == TYPE_REALLOC) {
     ADDRINT old_ptr = ts->pending.size;
     ADDRINT new_size = ts->pending.arg2;
     write_malloc_instr_locked((unsigned char)alloc_type, old_ptr, new_size, ret, ts->pending.caller_ip);
@@ -334,30 +334,22 @@ struct SymbolHook {
 };
 
 static const SymbolHook all_symbols[] = {
-  // malloc-like (family MALLOC)
-  {"malloc",     TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"mi_malloc",  TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"je_malloc",  TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"tc_malloc",  TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"_Znwm",      TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"_Znam",      TYPE_MALLOC,     SymbolHook::MALLOC},
-  // calloc-like
-  {"calloc",     TYPE_CALLOC,     SymbolHook::CALLOC},
-  {"mi_calloc",  TYPE_CALLOC,     SymbolHook::CALLOC},
-  {"je_calloc",  TYPE_CALLOC,     SymbolHook::CALLOC},
-  {"tc_calloc",  TYPE_CALLOC,     SymbolHook::CALLOC},
-  // realloc-like
-  {"realloc",    TYPE_REALLOC,    SymbolHook::REALLOC},
-  {"mi_realloc", TYPE_REALLOC,    SymbolHook::REALLOC},
-  {"je_realloc", TYPE_REALLOC,    SymbolHook::REALLOC},
-  {"tc_realloc", TYPE_REALLOC,    SymbolHook::REALLOC},
-  // free-like
-  {"free",       TYPE_FREE,       SymbolHook::FREE},
-  {"mi_free",    TYPE_FREE,       SymbolHook::FREE},
-  {"je_free",    TYPE_FREE,       SymbolHook::FREE},
-  {"tc_free",    TYPE_FREE,       SymbolHook::FREE},
-  {"_ZdlPv",     TYPE_FREE,       SymbolHook::FREE},
-  {"_ZdaPv",     TYPE_FREE,       SymbolHook::FREE},
+  // malloc-like (type 1)
+  {"malloc",                          TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"_Znwm",                           TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"_Znam",                           TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"_ZnwmSt11align_val_t",            TYPE_MALLOC,     SymbolHook::MALLOC},
+  {"_ZnamSt11align_val_t",            TYPE_MALLOC,     SymbolHook::MALLOC},
+  // calloc (type 3)
+  {"calloc",                          TYPE_CALLOC,     SymbolHook::CALLOC},
+  // realloc (type 4)
+  {"realloc",                         TYPE_REALLOC,    SymbolHook::REALLOC},
+  // free-like (type 2)
+  {"free",                            TYPE_FREE,       SymbolHook::FREE},
+  {"_ZdlPv",                          TYPE_FREE,       SymbolHook::FREE},
+  {"_ZdaPv",                          TYPE_FREE,       SymbolHook::FREE},
+  {"_ZdlPvSt11align_val_t",           TYPE_FREE,       SymbolHook::FREE},
+  {"_ZdaPvSt11align_val_t",           TYPE_FREE,       SymbolHook::FREE},
 };
 
 VOID ImageLoad(IMG img, VOID* v)
