@@ -91,12 +91,13 @@ static unsigned char coarse_type(unsigned char fine_type)
 }
 
 // =========================================================================
-// Mock: malloc_instr struct (32 bytes) — same as champsim_tracer.cpp
+// Mock: malloc_instr struct (40 bytes) — same as champsim_tracer.cpp
 // =========================================================================
 struct malloc_instr {
   unsigned long long arg1;
   unsigned long long arg2;
   unsigned long long ret;
+  unsigned long long caller_ip;
   unsigned char type;
   unsigned char reserved[7];
 };
@@ -163,11 +164,11 @@ void test_coarse_type_mapping() {
 }
 
 // =========================================================================
-// Test: malloc_instr struct size is exactly 32 bytes
+// Test: malloc_instr struct size is exactly 40 bytes
 // =========================================================================
 void test_malloc_instr_size() {
-  TEST("malloc_instr: struct size is exactly 32 bytes");
-  CHECK_EQ(sizeof(malloc_instr), (size_t)32, "malloc_instr must be 32 bytes");
+  TEST("malloc_instr: struct size is exactly 40 bytes");
+  CHECK_EQ(sizeof(malloc_instr), (size_t)40, "malloc_instr must be 40 bytes");
   PASS();
 }
 
@@ -323,6 +324,7 @@ void test_malloc_instr_record_format() {
   rec.arg1 = 1024;
   rec.arg2 = 0;
   rec.ret = 0xABCD;
+  rec.caller_ip = 0x7F1234567890;
   std::memset(rec.reserved, 0, sizeof(rec.reserved));
 
   // Verify struct fields
@@ -330,6 +332,7 @@ void test_malloc_instr_record_format() {
   CHECK_EQ(rec.arg1, (unsigned long long)1024, "arg1 should be 1024");
   CHECK_EQ(rec.arg2, (unsigned long long)0, "arg2 should be 0");
   CHECK_EQ(rec.ret, (unsigned long long)0xABCD, "ret should be 0xABCD");
+  CHECK_EQ(rec.caller_ip, (unsigned long long)0x7F1234567890, "caller_ip should be 0x7F1234567890");
 
   // Verify reserved is zeros
   for (int i = 0; i < 7; i++) {

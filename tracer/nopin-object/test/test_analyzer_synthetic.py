@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Synthetic test for little_object_analyzer.py v7 — covers all 7 type groups.
+Synthetic test for little_object_analyzer.py v9 — covers all 7 type groups.
+Writes 40-byte records (arg1, arg2, ret, caller_ip, type, reserved[7]).
 No PIN required.
 """
 
@@ -17,8 +18,9 @@ def check(cond, msg):
     if cond: PASS += 1; print(f"  ✅ PASS: {msg}")
     else: FAIL += 1; print(f"  ❌ FAIL: {msg}")
 
-def wr(f, t, a1, a2, r):
-    f.write(struct.pack("<QQQB7s", a1, a2, r, t, b'\x00'*7))
+def wr(f, t, a1, a2, r, ip=0):
+    """Write 40-byte record: arg1(8), arg2(8), ret(8), caller_ip(8), type(1), reserved(7)"""
+    f.write(struct.pack("<QQQQB7s", a1, a2, r, ip, t, b'\x00'*7))
 
 def gen(fp):
     with open(fp, "wb") as f:
@@ -54,7 +56,7 @@ def gen(fp):
 def main():
     global PASS, FAIL
     print("=" * 70)
-    print("7-Type Synthetic Test (v7 analyzer)")
+    print("7-Type Synthetic Test (v9 analyzer, 40-byte records)")
     print("=" * 70)
     td = os.path.dirname(os.path.abspath(__file__))
     tp = os.path.join(td, "synth.bin")
@@ -62,7 +64,7 @@ def main():
     gen(tp)
     sz = os.path.getsize(tp)
     check(sz > 0, f"Trace created ({sz} bytes)")
-    check(sz % 32 == 0, f"Multiple of 32 ({sz//32} records)")
+    check(sz % 40 == 0, f"Multiple of 40 ({sz//40} records)")
 
     r = subprocess.run(["python3", ANALYZER, "-i", tp], capture_output=True, text=True, cwd=td)
     print(r.stdout.strip()[:500] + "..." if len(r.stdout) > 500 else r.stdout)
@@ -76,18 +78,9 @@ def main():
     m = re.search(r'Total Free calls:\s+(\d+)', txt)
     total_free = int(m.group(1)) if m else 0
 
-    # Expected allocs:
-    #   malloc(1): 4(base) + 5(more) = 9
-    #   calloc(3): 1 + 3 = 4
-    #   realloc(4): 2 + 3 = 5
-    #   posix_memalign(5): 1
-    #   mmap(6): 1
-    #   Total alloc: 20
+    # Expected allocs: 9 malloc + 4 calloc + 5 realloc + 1 posix + 1 mmap = 20
     check(total_alloc == 20, f"Total Alloc = {total_alloc} (expected 20)")
-    # Expected frees:
-    #   free(2): 1 + 2 + 3 + 1 = 7
-    #   munmap(7): 1 + 1 = 2
-    #   Total free: 9
+    # Expected frees: 7 free + 2 munmap = 9
     check(total_free == 9, f"Total Free = {total_free} (expected 9)")
 
     # Verify all 7 type groups present
