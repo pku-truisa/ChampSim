@@ -468,6 +468,10 @@ void start_next_segment()
 
 void check_end_of_trace()
 {
+  // Do not consume trace_insts_left while still in fast-forward
+  if (fast_forward_insts_left > 0 || skip_dumping_instructions)
+    return;
+
   if (trace_insts_left > 0) {
     trace_insts_left -= 1;
     if (trace_insts_left == 0) {
@@ -482,11 +486,7 @@ void check_end_of_trace()
       } else {
         trace_limit_reached = true;
         std::cout << "Reaching trace length limit, terminating early.\n";
-        if (segments.empty()) {
-          // Single-segment mode: exit immediately
-          PIN_ExitApplication(0);
-        }
-        // Multi-segment mode: let program run to natural exit (Fini will handle cleanup)
+        PIN_ExitApplication(0);
       }
     }
   }
@@ -762,7 +762,7 @@ VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size, ADDRIN
     return;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, alignment, 5, memptr, 0};
+  ts->pending = PendingAlloc{size, alignment, 5, memptr, caller_ip};
 }
 
 VOID PosixMemalignAfter(ADDRINT status)
@@ -797,7 +797,7 @@ VOID FreeBefore(ADDRINT ptr, UINT32 free_type, ADDRINT caller_ip)
 
   auto it = tracked_addresses.find(ptr);
   if (it != tracked_addresses.end()) {
-    record_free_event((unsigned long long)ptr, 0);
+    record_free_event((unsigned long long)ptr, (unsigned long long)caller_ip);
     tracked_addresses.erase(it);
   }
 
@@ -821,6 +821,7 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT caller_ip)
   }
   ts->mmap_depth = 1;
   ts->mmap_pending_size = length;
+  ts->pending.caller_ip = caller_ip;
 }
 
 VOID MmapAfter(ADDRINT ret)
@@ -836,7 +837,7 @@ VOID MmapAfter(ADDRINT ret)
     if (compat_mode) return;
     PIN_GetLock(&malloc_lock, PIN_ThreadId());
       record_alloc_event(6, ts->mmap_pending_size, 0, ret,
-                       ts->mmap_pending_size, 6, 0);
+                       ts->mmap_pending_size, 6, ts->pending.caller_ip);
     tracked_addresses.insert(ret);
     PIN_ReleaseLock(&malloc_lock);
   }
@@ -856,8 +857,9 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT caller_ip)
       pending_instr_malloc.arg1 = (unsigned long long)addr;
       pending_instr_malloc.arg2 = (unsigned long long)length;
       pending_instr_malloc.ret = 0;
+      pending_instr_malloc.caller_ip = (unsigned long long)caller_ip;
     } else if (alloc_only_mode) {
-      write_alloc_record_locked(7, (unsigned long long)addr, (unsigned long long)length, 0, 0);
+      write_alloc_record_locked(7, (unsigned long long)addr, (unsigned long long)length, 0, (unsigned long long)caller_ip);
     }
     tracked_addresses.erase(it);
   }
