@@ -283,6 +283,8 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT caller_ip)
 {
   if (!(flags & MAP_ANONYMOUS)) return;
   ThreadState* ts = get_tls();
+  // Skip if we're inside a malloc/calloc/realloc — this mmap is an internal glibc detail
+  if (ts->alloc_depth > 0) return;
   if (ts->mmap_depth > 0) {
     if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
     else ts->mmap_overflow++;
