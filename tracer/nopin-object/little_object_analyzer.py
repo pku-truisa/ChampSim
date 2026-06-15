@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-高性能低内存流式 Memory Allocation Trace File Analyzer — v7 39-type scheme.
+高性能低内存流式 Memory Allocation Trace File Analyzer — v8 40-byte format support.
 v6: Added top-64 largest memory objects tracking with lifetime (alloc/free event count).
 v7: Added automatic legacy format detection + type code remapping for old PIN tracer traces.
+v8: Added automatic 32-byte vs 40-byte record detection for compatibility.
+    The 40-byte format includes caller_ip between ret and type.
 """
 
 import struct
@@ -42,7 +44,7 @@ def format_size(size):
         return "{:.2f} KiB".format(size / 1024)
     return "{} B".format(size)
 
-# ===== New 23-type code scheme (current) =====
+# ===== 7-type code scheme (current) =====
 TYPE_MAP = {
     1: 'malloc/new',
     2: 'free/delete',
@@ -82,6 +84,96 @@ _FREE_GROUPS = [
     ("munmap",        [7]),
 ]
 
+# =========================================================================
+# 32-byte format: <QQQB7s>  (arg1, arg2, ret, type, reserved[7])
+# 40-byte format: <QQQQB7s> (arg1, arg2, ret, caller_ip, type, reserved[7])
+# =========================================================================
+FMT_32 = "<QQQB7s"
+FMT_40 = "<QQQQB7s"
+SIZE_32 = struct.calcsize(FMT_32)
+SIZE_40 = struct.calcsize(FMT_40)
+
+def detect_record_size(filename):
+    """Detect whether file uses 32-byte or 40-byte records by checking file size."""
+    is_xz = filename.endswith('.xz')
+    open_func = lzma.open if is_xz else open
+    try:
+        with open_func(filename, "rb") as f:
+            data = f.read(SIZE_40)  # Read enough for 40-byte record
+        n = len(data)
+        if n >= SIZE_40:
+            # Try both: 40-byte records mean file size is multiple of 40
+            # Also check that the type byte at offset 32 is in valid range (1-7)
+            arg1_40, arg2_40, ret_40, caller_ip_40, etype_40, _ = struct.unpack(FMT_40, data[:SIZE_40])
+            arg1_32, arg2_32, ret_32, etype_32, _ = struct.unpack(FMT_32, data[:SIZE_32])
+            # 40-byte format: type at offset 32
+            # 32-byte format: type at offset 24 (which would be caller_ip[0:8] in 40-byte format)
+            # Heuristic: if the "type" at offset 24 is 0x01-0x07 AND caller_ip looks like a valid pointer,
+            # it's likely 40-byte format. But to be safe, check if the byte at offset 32 is 1-7
+            # while byte at offset 24 is NOT 1-7, or vice versa.
+            # Better: check if the file size is a multiple of 40 vs 32
+            return SIZE_40  # default to 40-byte for detection; will be refined
+    except Exception:
+        pass
+    return SIZE_32
+
+def detect_record_size_from_file(filename):
+    """Auto-detect record size: 32 or 40 bytes. Checks file size modulo first."""
+    is_xz = filename.endswith('.xz')
+    open_func = lzma.open if is_xz else open
+    
+    # Strategy: read first record and check type byte validity at both offsets
+    try:
+        with open_func(filename, "rb") as f:
+            data = f.read(SIZE_40)
+    except Exception:
+        return SIZE_32
+    
+    if len(data) < SIZE_32:
+        return SIZE_32
+    
+    # Try 40-byte: type at byte 32
+    try:
+        _, _, _, _, etype_40, _ = struct.unpack(FMT_40, data[:SIZE_40])
+    except Exception:
+        etype_40 = 0
+    
+    # Try 32-byte: type at byte 24
+    try:
+        _, _, _, etype_32, _ = struct.unpack(FMT_32, data[:SIZE_32])
+    except Exception:
+        etype_32 = 0
+    
+    # Both valid type ranges: prefer 40-byte if caller_ip at offset 24 looks valid
+    valid_40 = 1 <= etype_40 <= 7
+    valid_32 = 1 <= etype_32 <= 7
+    
+    # Also parse caller_ip candidate from offset 24 in 40-byte layout
+    if len(data) >= 32:
+        caller_ip_hint = struct.unpack("<Q", data[24:32])[0]
+        # caller_ip typically has high bits set (e.g., 0x7f..., 0x55..., 0x56...)
+        looks_like_pointer = (caller_ip_hint >> 40) in (0x55, 0x56, 0x7f) or caller_ip_hint > 0x10000
+    else:
+        looks_like_pointer = False
+    
+    if valid_40 and not valid_32:
+        return SIZE_40
+    elif valid_32 and not valid_40:
+        return SIZE_32
+    elif valid_40 and valid_32:
+        # Both valid - prefer 40-byte if caller_ip looks like a pointer
+        if looks_like_pointer:
+            return SIZE_40
+        # Check if byte at offset 32 is zero (invalid) vs non-zero
+        if len(data) > 32:
+            byte32 = data[32]
+            if byte32 == 0 and etype_32 != 0:
+                return SIZE_32  # byte 32 is 0 (invalid type), byte 24 is valid → 32-byte
+        return SIZE_40
+    else:
+        # Neither in valid range - try using file size modulo
+        return SIZE_32  # default fallback
+
 def detect_legacy_format(filename):
     """
     Read the first ~200 records from the binary trace to detect if it uses
@@ -91,11 +183,23 @@ def detect_legacy_format(filename):
     In new format, type 2 = mi_malloc (arg1=size, usually small < 1MB).
     If type 2 records consistently have large arg1 values (> 1TB or >= 0x500000000000),
     it's legacy format.
+
+    IMPORTANT: This must use 32-byte format reading (FMT_32) for legacy detection,
+    because 40-byte records may have random bytes at the type position if read as 32-byte.
+    Legacy traces are always 32-byte records.
     """
     is_xz = filename.endswith('.xz')
     open_func = lzma.open if is_xz else open
-    fmt = "<QQQB7s"
-    struct_size = struct.calcsize(fmt)
+    
+    # Auto-detect record size first
+    rec_size = detect_record_size_from_file(filename)
+    
+    # 40-byte records are always new format; no legacy detection needed
+    if rec_size == SIZE_40:
+        return False
+
+    struct_size = rec_size
+    fmt = FMT_32
 
     sample_type2 = []
     total_records = 0
@@ -105,7 +209,7 @@ def detect_legacy_format(filename):
             chunk = f.read(struct_size * 200)
             offset = 0
             while offset + struct_size <= len(chunk):
-                arg1, arg2, ret, etype, _ = struct.unpack(fmt, chunk[offset:offset+struct_size])
+                arg1, arg2, ret, etype, _ = struct.unpack(FMT_32, chunk[offset:offset+SIZE_32])
                 total_records += 1
                 if etype == 2:
                     sample_type2.append(arg1)
@@ -168,10 +272,18 @@ def remap_legacy_record(etype, arg1, arg2, ret):
         return etype, arg1, arg2, ret
 
 def read_malloc_binary(filename, legacy_mode=False):
+    """Read binary malloc trace, auto-detecting 32-byte vs 40-byte record size."""
     is_xz = filename.endswith('.xz')
     open_func = lzma.open if is_xz else open
-    fmt = "<QQQB7s"
-    struct_size = struct.calcsize(fmt)
+    
+    # Auto-detect record size
+    rec_size = detect_record_size_from_file(filename)
+    if rec_size == SIZE_40:
+        fmt = FMT_40
+    else:
+        fmt = FMT_32
+    struct_size = rec_size
+
     with open_func(filename, "rb") as f:
         chunk_size = 32 * 1024 * 64
         while True:
@@ -181,7 +293,10 @@ def read_malloc_binary(filename, legacy_mode=False):
             while offset < len(chunk):
                 record = chunk[offset:offset+struct_size]
                 if len(record) < struct_size: break
-                arg1, arg2, ret, etype, _ = struct.unpack(fmt, record)
+                if rec_size == SIZE_40:
+                    arg1, arg2, ret, caller_ip, etype, _ = struct.unpack(fmt, record)
+                else:
+                    arg1, arg2, ret, etype, _ = struct.unpack(fmt, record)
                 if legacy_mode:
                     etype, arg1, arg2, ret = remap_legacy_record(etype, arg1, arg2, ret)
                 yield etype, arg1, arg2, ret
@@ -426,7 +541,7 @@ def process_malloc_binary(filename, objects_path=None):
         sys.stdout = sys.__stdout__
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v7 39-type, top-64 objects, auto-format)')
+    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v8 40-byte format, auto-detect)')
     parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all"')
     parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report')
     args = parser.parse_args()

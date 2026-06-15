@@ -168,24 +168,40 @@ struct TraceBuffer {
 static TraceBuffer<4096> trace_buffer;
 
 /* ===================================================================== */
-// Helper: write a 64-byte alloc-only record directly to outfile
+// 40-byte malloc_instr format — compatible with object_tracer_wrapper.cpp
+// and little_object_analyzer.py (v8+ auto-detects 32 vs 40 byte records).
+// Fields: arg1, arg2, ret, caller_ip, type, reserved[7]
 /* ===================================================================== */
-static void write_alloc_record_locked(unsigned char coarse_type,
+struct malloc_instr {
+  unsigned long long arg1;
+  unsigned long long arg2;
+  unsigned long long ret;
+  unsigned long long caller_ip;
+  unsigned char type;
+  unsigned char reserved[7];
+};
+static_assert(sizeof(malloc_instr) == 40, "malloc_instr must be exactly 40 bytes");
+
+/* ===================================================================== */
+// Helper: write a 40-byte malloc_instr record directly to outfile
+// Compatible with object_tracer_wrapper.cpp and little_object_analyzer.py formats.
+/* ===================================================================== */
+static void write_alloc_record_locked(unsigned char mtype,
                                       unsigned long long arg1,
                                       unsigned long long arg2,
                                       unsigned long long ret,
                                       unsigned long long caller_ip)
 {
-  trace_instr_format_t rec = {};
-  rec.instr_type = 2;
-  rec.instr_info = coarse_type;
-  rec.source_memory[0] = arg1;
-  rec.source_memory[1] = arg2;
-  rec.destination_memory[0] = ret;
-  rec.destination_memory[1] = caller_ip;
-  trace_buffer.push(rec, outfile);
+  malloc_instr rec;
+  rec.type = mtype;
+  rec.arg1 = arg1;
+  rec.arg2 = arg2;
+  rec.ret = ret;
+  rec.caller_ip = caller_ip;
+  std::memset(rec.reserved, 0, sizeof(rec.reserved));
+  outfile.write(reinterpret_cast<std::ofstream::char_type*>(&rec), sizeof(malloc_instr));
   PIN_GetLock(&stats_lock, PIN_ThreadId());
-  type_counts[coarse_type]++;
+  type_counts[mtype]++;
   PIN_ReleaseLock(&stats_lock);
 }
 
@@ -241,8 +257,8 @@ INT32 Usage()
             << "    Output: -o <file> (default: champsim.trace)" << std::endl
             << "" << std::endl
             << "  Alloc-only mode (-m -a <file>):" << std::endl
-            << "    Produces ONLY allocation events (64-byte input_instr records" << std::endl
-            << "    with instr_type=2), no instruction trace." << std::endl
+            << "    Produces ONLY allocation events (40-byte malloc_instr records" << std::endl
+            << "    with caller_ip, compatible with little_object_analyzer.py), no instruction trace." << std::endl
             << "    Output: <file> specified by -a" << std::endl
             << "" << std::endl
             << "Options:" << std::endl
@@ -580,7 +596,7 @@ void WriteToSet(T* begin, T* end, UINT32 r)
 // Three modes:
 //   compat_mode:         skip all allocation recording
 //   embedded_alloc_mode: embed via pending_instr_malloc (then into instruction trace)
-//   alloc_only_mode:     write 64-byte input_instr with instr_type=2 directly to outfile
+//   alloc_only_mode:     write 32-byte malloc_instr directly to outfile
 // =========================================================================
 
 /* Type name lookup for statistics display. */
@@ -672,6 +688,7 @@ VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size, UINT32 alloc_type, ADDRINT
 }
 
 // Helper: record an allocation event (used by both embedded and alloc-only modes)
+// Note: caller_ip is stored in the 40-byte malloc_instr for analysis purposes
 static void record_alloc_event(unsigned char coarse, unsigned long long arg1,
                                unsigned long long arg2, unsigned long long ret,
                                ADDRINT size_for_tracking, unsigned char coarse_for_tracking,
