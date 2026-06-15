@@ -13,7 +13,7 @@ Verifies the core logic of `tracer/pin/champsim_tracer.cpp` without requiring In
 | `test_fast_forward.cpp` | 2 | WriteCurrentInstruction skip during fast-forward, baseline dump of all active allocations at transition |
 | `test_writetoset.cpp` | 3 | WriteToSet normal insertion, dedup, array-at-capacity |
 | `test_malloc_threshold.cpp` | 15 | Malloc threshold (-k): threshold filtering for malloc/calloc/realloc/posix_memalign/mmap, boundary and custom values |
-| `test_malloc_only_mode.cpp` | **8** | Malloc-only mode (-m): `malloc_type_name` (23 types), `coarse_type` mapping, `malloc_instr` struct, no-threshold alloc, dual-mode realloc distinction, FreeBefore using `tracked_addresses` |
+| `test_malloc_only_mode.cpp` | **8** | Malloc-only mode (-m -a): `malloc_type_name` (7 types), type mapping, `malloc_instr` struct (40 bytes), no-threshold alloc, dual-mode realloc distinction, FreeBefore using `tracked_addresses` |
 
 ## Build & Run
 
@@ -38,10 +38,10 @@ The `test_malloc_only_mode.cpp` test file (8 tests) covers the new -m functional
 | Test | Description |
 |------|-------------|
 | `test_malloc_type_name_all_types` | Verifies `malloc_type_name()` returns correct names for type codes 0-24 |
-| `test_coarse_type_mapping` | Verifies fine-grained (1-23) to coarse type mapping |
-| `test_malloc_instr_size` | Verifies `malloc_instr` struct is exactly 32 bytes |
-| `test_malloc_only_mode_no_threshold` | Verifies all sizes (including 1 byte) are recorded in -m mode |
+| `test_coarse_type_mapping` | Verifies fine-grained type mapping |
+| `test_malloc_instr_size` | Verifies `malloc_instr` struct is exactly 40 bytes |
+| `test_malloc_only_mode_no_threshold` | Verifies all sizes (including 1 byte) are recorded in alloc-only mode |
 | `test_instr_trace_mode_threshold` | Verifies allocs below threshold are filtered in instruction trace mode |
-| `test_malloc_only_mode_free_filter` | Verifies FreeBefore uses `tracked_addresses` set in -m mode |
-| `test_malloc_instr_record_format` | Verifies `malloc_instr` binary record field correctness |
-| `test_malloc_only_mode_realloc` | Verifies realloc keeps fine-grained type (11-14) in -m mode vs coarse type (6/16) in instr mode |
+| `test_malloc_only_mode_free_filter` | Verifies FreeBefore uses `tracked_addresses` set in alloc-only mode |
+| `test_malloc_instr_record_format` | Verifies `malloc_instr` binary record field correctness (40 bytes, includes caller_ip) |
+| `test_malloc_only_mode_realloc` | Verifies realloc records fine-grained type in alloc-only mode vs coarse type in instr mode |

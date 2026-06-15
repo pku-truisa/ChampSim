@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-高性能低内存流式 Memory Allocation Trace File Analyzer — v10 40-byte only + caller_ip stats.
+High-performance low-memory streaming Memory Allocation Trace File Analyzer — v10 40-byte only + caller_ip stats.
 v6: Added top-64 largest memory objects tracking with lifetime (alloc/free event count).
 v7: Added automatic legacy format detection + type code remapping for old PIN tracer traces.
 v8: Added automatic 32-byte vs 40-byte record detection for compatibility.

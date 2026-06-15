@@ -110,21 +110,19 @@ $SDE_BUILD_KIT/sde64 -skl -replay \
 
 ## Tracked Allocation Functions
 
-The tracer hooks the following functions in all loaded shared libraries:
+The tracer hooks the following functions in all loaded shared libraries (7-type scheme):
 
 | Function                 | Type | Description                              |
 |--------------------------|------|------------------------------------------|
-| `malloc`                 | 1    | Standard memory allocation               |
-| `free`                   | 2    | Memory deallocation                      |
-| `mmap`                   | 3    | Anonymous memory mapping                 |
-| `munmap`                 | 4    | Unmap memory region                      |
-| `calloc`                 | 5    | Allocate and zero-initialize array       |
-| `realloc` (搬迁)          | 6    | Reallocate to a new address              |
-| `posix_memalign`         | 8    | POSIX aligned allocation                 |
-| `fortran_alloc`          | 10   | Fortran ALLOCATE (gfortran)              |
-| `realloc` (原地)          | 16   | Realloc expanding/shrinking in-place     |
+| `malloc`, `_Znwm`, `_Znam` | 1  | Standard memory allocation / C++ new     |
+| `free`, `_ZdlPv`, `_ZdaPv` | 2  | Memory deallocation / C++ delete         |
+| `calloc`                 | 3    | Allocate and zero-initialize array       |
+| `realloc`                | 4    | Reallocation (move or in-place)          |
+| `posix_memalign`         | 5    | POSIX aligned allocation                 |
+| `mmap`                   | 6    | Anonymous memory mapping                 |
+| `munmap`                 | 7    | Unmap memory region                      |
 
-> **Note:** `aligned_alloc` (C11), `memalign`, and `valloc` in glibc are thin wrappers that internally call `malloc` or `mmap`.  The tracer captures them correctly through the standard `malloc`/`mmap` hooks as **type=1** or **type=3**, rather than instrumenting them directly (to avoid tail-call deadlocks).  Similarly, C++ `operator new`/`operator new[]` and `operator delete`/`operator delete[]` are tracked through `_Znwm`/`_Znam` and `_ZdlPv`/`_ZdaPv` hooks, mapped to type=1 and type=2 respectively.
+> **Note:** `aligned_alloc` (C11), `memalign`, and `valloc` in glibc are thin wrappers that internally call `malloc` or `mmap`. The tracer captures them correctly through the standard `malloc`/`mmap` hooks as **type=1** or **type=6**, rather than instrumenting them directly (to avoid tail-call deadlocks). Similarly, C++ `operator new`/`operator new[]` and `operator delete`/`operator delete[]` are tracked through `_Znwm`/`_Znam` and `_ZdlPv`/`_ZdaPv` hooks, mapped to type=1 and type=2 respectively.
 
 All events are recorded to a single binary file. Free/munmap events are only recorded for addresses that were previously tracked from an allocation/mmap call.
 
@@ -145,19 +143,17 @@ struct malloc_instr {
 
 ### Field semantics by event type
 
+All events use the 7-type scheme (1=malloc, 2=free, 3=calloc, 4=realloc, 5=posix_memalign, 6=mmap, 7=munmap). C++ `operator new`/`delete` and allocator-variant symbols (mi_malloc, je_malloc, etc.) are all mapped to their corresponding base type.
+
 | Type | Event               | `arg1`                    | `arg2`                    | `ret`               |
 |------|---------------------|---------------------------|---------------------------|---------------------|
-| 1    | malloc              | size                      | 0                         | allocated address   |
-| 2    | free                | pointer to free           | 0                         | 0                   |
-| 3    | mmap                | length                    | 0                         | mapped address      |
-| 4    | munmap              | address to unmap          | length                    | 0                   |
-| 5    | calloc              | nmemb × size              | 0                         | allocated address   |
-| 6    | realloc (搬迁)       | old pointer               | new size                  | new address         |
-| 8    | posix_memalign      | size                      | alignment                 | aligned address     |
-| 10   | fortran_alloc       | size                      | 0                         | allocated address   |
-| 16   | realloc (原地)       | old pointer (= ret)       | new size                  | old address (same)  |
-
-> **realloc 类型区分:** 当 `realloc` 返回的地址与旧指针不同时为 **type=6**（搬迁），相同时为 **type=16**（原地扩展/缩减）。两者均使用 `arg2` 存储新大小。
+| 1    | malloc / C++ new    | size                      | 0                         | allocated address   |
+| 2    | free / C++ delete   | pointer to free           | 0                         | 0                   |
+| 3    | calloc              | nmemb × size              | 0                         | allocated address   |
+| 4    | realloc             | old pointer               | new size                  | new or same address |
+| 5    | posix_memalign      | size                      | alignment                 | aligned address     |
+| 6    | mmap                | length                    | 0                         | mapped address      |
+| 7    | munmap              | address to unmap          | length                    | 0                   |
 
 ## Analyzing Memory Allocation Traces
 

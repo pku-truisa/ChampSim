@@ -43,9 +43,9 @@ records. This allows the simulator to reconstruct the dynamic memory allocation 
 
 ### 3. Alloc-only mode (`-m -a <file>`)
 
-Produces **only** allocation events (64-byte input_instr records with instr_type=2).
-No instruction trace is generated. This mode has no threshold filtering — all allocation
-events are recorded regardless of size.
+Produces **only** allocation events (40-byte malloc_instr records compatible with
+`little_object_analyzer.py`). No instruction trace is generated. This mode has no
+threshold filtering — all allocation events are recorded regardless of size.
 
     $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -m -a alloc_trace.bin -- ./my_program
 
@@ -82,9 +82,10 @@ allocation events are mixed into the instruction trace output.
 With -a, operates in alloc-only mode. See "Three Operation Modes" above.
 
 -a <filename>
-(Requires -m) Alloc-only mode. Output only allocation events (64-byte input_instr
-records with instr_type=2) to the specified file. No instruction trace is generated.
-All allocation events are recorded regardless of size (-k is ignored).
+(Requires -m) Alloc-only mode. Output only allocation events (40-byte malloc_instr
+records compatible with little_object_analyzer.py) to the specified file.
+No instruction trace is generated. All allocation events are recorded regardless
+of size (-k is ignored).
 ```
 
 ## Usage Examples
@@ -125,29 +126,32 @@ Output is a sequence of 64-byte `input_instr` records:
 
 ### Alloc-only mode
 
-Output is also a sequence of 64-byte `input_instr` records, but every record has
-`instr_type=2`. The memory fields encode allocation parameters:
+Output is a sequence of 40-byte `malloc_instr` records, compatible with
+`little_object_analyzer.py`:
 
-| Field | Content |
-|-------|---------|
-| instr_type | Always 2 (allocation event) |
-| instr_info | Coarse type code (see table below) |
-| destination_memory[0] | Returned address (allocated/freed) |
-| source_memory[0] | Size (for alloc) or pointer (for free) |
-| source_memory[1] | Alignment (for posix_memalign) or new_size (for realloc) |
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0..7   | arg1  | Size (alloc) / old pointer (realloc) |
+| 8..15  | arg2  | 0 (alloc) / new size (realloc) / alignment (posix_memalign) |
+| 16..23 | ret   | Returned address (allocated/freed pointer) |
+| 24..31 | caller_ip | Caller instruction pointer |
+| 32     | type  | Allocation type code (see table below) |
+| 33..39 | reserved | Zero padding |
 
-### Coarse allocation type codes
+### Allocation type codes (7-type scheme)
+
+All allocator-variant symbols (mi_malloc, je_malloc, tc_malloc, C++ new/delete)
+are mapped to their corresponding base type.
 
 | Code | Type | Meaning |
 |------|------|---------|
-| 1 | malloc-like | malloc, mi_malloc, je_malloc, tc_malloc, _Znwm, _Znam |
-| 2 | free-like | free, mi_free, je_free, tc_free, _ZdlPv, _ZdaPv |
-| 3 | mmap | Anonymous memory mapping |
-| 4 | munmap | Unmap memory region |
-| 5 | calloc-like | calloc, mi_calloc, je_calloc, tc_calloc |
-| 6 | realloc-like | realloc, mi_realloc, je_realloc, tc_realloc |
-| 8 | posix_memalign | POSIX aligned allocation |
-| 16 | realloc_inplace | realloc with same address (in-place resize) |
+| 1 | malloc / C++ new | malloc, mi/je/tc_malloc, _Znwm, _Znam |
+| 2 | free / C++ delete | free, mi/je/tc_free, _ZdlPv, _ZdaPv |
+| 3 | calloc | calloc, mi/je/tc_calloc |
+| 4 | realloc | realloc, mi/je/tc_realloc |
+| 5 | posix_memalign | POSIX aligned allocation |
+| 6 | mmap | Anonymous memory mapping |
+| 7 | munmap | Unmap memory region |
 
 ## Unit Tests
 

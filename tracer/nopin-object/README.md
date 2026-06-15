@@ -1,162 +1,161 @@
 # Object Tracer Wrapper (LD_PRELOAD)
 
-`libobject_tracer_wrapper.so` 是一个轻量级的 LD_PRELOAD 拦截库，**无需 PIN** 即可提取任意程序的 malloc trace，生成与 `little_object_analyzer.py` 完全兼容的二进制 trace 文件。
+`libobject_tracer_wrapper.so` is a lightweight LD_PRELOAD interception library that extracts malloc traces from any program **without PIN**, generating binary trace files fully compatible with `little_object_analyzer.py`.
 
-## 与 PIN + object_tracer 方案对比
+## Comparison with PIN + object_tracer
 
-| 特性 | PIN + object_tracer.so | LD_PRELOAD wrapper |
-|------|----------------------|-------------------|
-| 需要 PIN 工具 | ✅ 需要安装 PIN | ❌ 不需要 |
-| 性能开销 | 较大（指令级插桩） | 极小（仅拦截分配函数） |
-| 替换分配器 | ❌ 不支持（mimalloc/jemalloc/tcmalloc） | ✅ 完全支持 |
-| 多线程安全 | ✅ | ✅ `pwrite()` + 原子偏移 |
-| new/delete 拦截 | ✅ | ✅ |
+| Feature | PIN + object_tracer.so | LD_PRELOAD wrapper |
+|---------|------------------------|--------------------|
+| Requires PIN | ✅ PIN must be installed | ❌ Not required |
+| Performance overhead | High (instruction-level instrumentation) | Minimal (intercepts allocation functions only) |
+| Allocator replacement | ❌ Not supported (mimalloc/jemalloc/tcmalloc) | ✅ Fully supported |
+| Thread safety | ✅ | ✅ `pwrite()` + atomic offset |
+| new/delete interception | ✅ | ✅ |
 | aligned_alloc/memalign | ✅ | ✅ |
-| 兼容已有分析器 | ✅ `malloc.bin` | ✅ 同一格式 |
+| Compatible with existing analyzer | ✅ `malloc.bin` | ✅ Same format |
 
-## 编译
+## Build
 
 ```bash
 gcc -shared -fPIC -o libobject_tracer_wrapper.so object_tracer_wrapper.cpp -ldl
 ```
 
-## 用法
+## Usage
 
-### 1. 基本用法（glibc 默认分配器）
+### 1. Basic usage (glibc default allocator)
 
 ```bash
 TRACE_FILE=my_trace.bin LD_PRELOAD=./libobject_tracer_wrapper.so ./your_program
 ```
 
-### 2. 替换为 mimalloc
+### 2. Using mimalloc
 
 ```bash
 TRACE_FILE=my_trace.bin LD_PRELOAD=./libobject_tracer_wrapper.so:/usr/local/lib/libmimalloc.so ./your_program
 ```
 
-### 3. 替换为 jemalloc
+### 3. Using jemalloc
 
 ```bash
 TRACE_FILE=my_trace.bin LD_PRELOAD=./libobject_tracer_wrapper.so:/path/to/libjemalloc.so ./your_program
 ```
 
-### 4. 替换为 tcmalloc
+### 4. Using tcmalloc
 
 ```bash
 TRACE_FILE=my_trace.bin LD_PRELOAD=./libobject_tracer_wrapper.so:/path/to/libtcmalloc.so ./your_program
 ```
 
-### 5. 使用默认输出文件名
+### 5. Using default output filename
 
 ```bash
 LD_PRELOAD=./libobject_tracer_wrapper.so ./your_program
-# 输出到 trace_wrapper.bin
+# Output to trace_wrapper.bin
 ```
 
-### 6. 分析 trace
+### 6. Analyze trace
 
 ```bash
 python3 little_object_analyzer.py -i my_trace.bin -o my_trace.objects.log
 ```
 
-## 环境变量
+## Environment Variables
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `TRACE_FILE` | `trace_wrapper.bin` | 二进制 trace 输出路径 |
-| `TRACE_LOG` | `trace_wrapper.log` | 文本日志输出路径 |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRACE_FILE` | `trace_wrapper.bin` | Binary trace output path |
+| `TRACE_LOG` | `trace_wrapper.log` | Text log output path |
 
-## 拦截的分配类型
+## Intercepted Allocation Types (7-type scheme)
 
-| 类型码 | 符号 | 说明 |
-|--------|------|------|
-| 1 | `malloc`, `aligned_alloc`, `memalign` | 标准/对齐 malloc |
-| 5 | `_Znwm` | C++ `operator new` |
-| 6 | `_Znam` | C++ `operator new[]` |
-| 7 | `calloc` | 清零分配 |
-| 11 | `realloc` | 重新分配 |
-| 15 | `posix_memalign` | 对齐分配 |
-| 16 | `mmap` | 内存映射 |
-| 17 | `munmap` | 解除映射 |
-| 18 | `free` | 标准释放 |
-| 22 | `_ZdlPv` | C++ `operator delete` |
-| 23 | `_ZdaPv` | C++ `operator delete[]` |
+All allocator-variant symbols (mi_malloc, je_malloc, tc_malloc, C++ new/delete) are mapped to their corresponding base type.
 
-## 二进制 trace 格式
+| Type Code | Symbols | Description |
+|-----------|---------|-------------|
+| 1 | `malloc`, `aligned_alloc`, `memalign`, `_Znwm`, `_Znam` | malloc / C++ new |
+| 2 | `free`, `_ZdlPv`, `_ZdaPv` | free / C++ delete |
+| 3 | `calloc` | Zero-initialized allocation |
+| 4 | `realloc` | Reallocation |
+| 5 | `posix_memalign` | Aligned allocation |
+| 6 | `mmap` | Memory mapping |
+| 7 | `munmap` | Unmap memory |
 
-每条记录 32 字节，与 object_tracer v5 完全兼容：
+## Binary Trace Format
+
+Each record is 40 bytes, compatible with `object_tracer.cpp` and analyzable by `little_object_analyzer.py` v10+:
 
 ```
 struct malloc_record {
-  unsigned long long arg1;   // 大小（alloc）/ 旧地址（realloc）
-  unsigned long long arg2;   // 0（alloc）/ 新大小（realloc）/ 对齐（posix_memalign）
-  unsigned long long ret;    // 返回地址
-  unsigned char      type;   // 类型码（1-23）
+  unsigned long long arg1;      // size (alloc) / old ptr (realloc)
+  unsigned long long arg2;      // 0 (alloc) / new size (realloc) / alignment (posix_memalign)
+  unsigned long long ret;       // return address (allocated pointer)
+  unsigned long long caller_ip; // caller instruction pointer
+  unsigned char      type;      // type code (1-7)
   unsigned char      reserved[7];
 };
 ```
 
-## 测试验证
+## Test Results
 
-### 4 种分配器对比结果
+### Comparison across 4 allocators
 
-对同一个 `test/test_malloc` 程序（25 次分配 + 10 次释放），分别使用 glibc、tcmalloc、mimalloc、jemalloc 运行，结果汇总如下：
+Results for the same `test/test_malloc` program (25 allocations + 10 frees) using glibc, tcmalloc, mimalloc, and jemalloc:
 
-| 指标 | glibc | tcmalloc | mimalloc | jemalloc |
-|------|-------|----------|----------|----------|
-| 兼容性 | ✅ | ✅ | ✅ | ✅ |
-| Trace 文件大小 | 1,152 B | 1,216 B | 1,024 B | 1,024 B |
-| 记录操作数 | 36 (26A+10F) | 38 (30A+8F) | 32 (24A+8F) | 32 (24A+8F) |
-| 物理峰值内存 | 2.09 MiB | 2.09 MiB | 2.09 MiB | 2.09 MiB |
-| 对齐开销 | 58,398 B (2.66%) | **58,838 B (2.68%)** | 58,398 B (2.66%) | 58,398 B (2.66%) |
-| 执行时间（real） | **0.001s** | 0.004s | 0.002s | 0.002s |
-| malloc 调用数 | 13 | **15**（+2 初始化） | 11 | 11 |
-| realloc 调用数 | 5 | **7**（+2 初始化） | 5 | 5 |
+| Metric | glibc | tcmalloc | mimalloc | jemalloc |
+|--------|-------|----------|----------|----------|
+| Compatibility | ✅ | ✅ | ✅ | ✅ |
+| Trace file size | 1,440 B | 1,480 B | 1,280 B | 1,280 B |
+| Record count | 36 (26A+10F) | 38 (30A+8F) | 32 (24A+8F) | 32 (24A+8F) |
+| Peak physical memory | 2.09 MiB | 2.09 MiB | 2.09 MiB | 2.09 MiB |
+| Alignment overhead | 58,398 B (2.66%) | **58,838 B (2.68%)** | 58,398 B (2.66%) | 58,398 B (2.66%) |
+| Real execution time | **0.001s** | 0.004s | 0.002s | 0.002s |
+| malloc calls | 13 | **15** (+2 init) | 11 | 11 |
+| realloc calls | 5 | **7** (+2 init) | 5 | 5 |
 
-- **glibc**：基线，最快，无额外开销
-- **tcmalloc**：线程缓存初始化增加少量内部 malloc/realloc 调用，对齐开销略高 0.02%；对大并发场景优势明显
-- **mimalloc** / **jemalloc**：初始化简洁，开销与 glibc 相当，内存对齐效率高
+- **glibc**: Baseline, fastest, no extra overhead
+- **tcmalloc**: Thread cache initialization adds minor internal malloc/realloc calls, slightly higher alignment overhead (+0.02%); significant advantage in high-concurrency scenarios
+- **mimalloc** / **jemalloc**: Minimal initialization, overhead comparable to glibc, efficient memory alignment
 
-### 测试命令速查
+### Quick Test Commands
 
 ```bash
-# 编译
+# Build
 make wrapper test
 
-# glibc 基线测试
+# glibc baseline test
 TRACE_FILE=test/glibc.bin LD_PRELOAD=./libobject_tracer_wrapper.so ./test/test_malloc
 
-# tcmalloc 测试（系统已安装）
+# tcmalloc test (system installed)
 TRACE_FILE=test/tcmalloc.bin LD_PRELOAD=./libobject_tracer_wrapper.so:/usr/lib/x86_64-linux-gnu/libtcmalloc.so ./test/test_malloc
 
-# mimalloc 测试
+# mimalloc test
 TRACE_FILE=test/mimalloc.bin LD_PRELOAD=./libobject_tracer_wrapper.so:/usr/local/lib/libmimalloc.so ./test/test_malloc
 
-# jemalloc 测试（系统已安装）
+# jemalloc test (system installed)
 TRACE_FILE=test/jemalloc.bin LD_PRELOAD=./libobject_tracer_wrapper.so:/usr/lib/x86_64-linux-gnu/libjemalloc.so ./test/test_malloc
 
-# 分析 trace
+# Analyze trace
 python3 little_object_analyzer.py -i test/glibc.bin
 python3 little_object_analyzer.py -i test/tcmalloc.bin
 python3 little_object_analyzer.py -i test/mimalloc.bin
 python3 little_object_analyzer.py -i test/jemalloc.bin
 ```
 
-### 已验证的测试文件
+### Verified Test Files
 
 - `verify_new.bin` / `verify_new.result.log` — C++ test_malloc + glibc
 - `verify_fortran.bin` / `verify_fortran.result.log` — Fortran test_fortran + mimalloc
 - `fortran_glibc_fixed.bin` / `fortran_glibc_fixed.result.log` — Fortran + glibc
 - `fortran_mimalloc_fixed.bin` / `fortran_mimalloc_fixed.result.log` — Fortran + mimalloc
-- `trace_wrapper_glibc.*` — C++ test_malloc + glibc（第一版）
-- `trace_wrapper_mimalloc.*` — C++ test_malloc + mimalloc（第一版）
-- `glibc.bin/result.log` — test_malloc + glibc（完整对比版）
+- `trace_wrapper_glibc.*` — C++ test_malloc + glibc (v1)
+- `trace_wrapper_mimalloc.*` — C++ test_malloc + mimalloc (v1)
+- `glibc.bin/result.log` — test_malloc + glibc (full comparison)
 - `tcmalloc.bin/result.log` — test_malloc + tcmalloc
 - `mimalloc.bin/result.log` — test_malloc + mimalloc
 - `jemalloc.bin/result.log` — test_malloc + jemalloc
 
-## 注意事项
+## Notes
 
-1. **递归保护**：wrapper 使用 `__thread int in_trace` 防止 `write()/pwrite()` 内部触发 `malloc` 导致的无限递归
-2. **线程安全**：多线程写入使用 `pwrite()` + 原子 `__sync_fetch_and_add`，确保记录不错位
-3. **符号解析**：使用 `dlsym(RTLD_NEXT)` 找到实际的分配器函数，支持各种 LD_PRELOAD 链
+1. **Recursion protection**: The wrapper uses `__thread int in_trace` to prevent infinite recursion caused by `write()/pwrite()` internally triggering `malloc`
+2. **Thread safety**: Multi-threaded writes use `pwrite()` + atomic `__sync_fetch_and_add` to ensure records are not corrupted
+3. **Symbol resolution**: Uses `dlsym(RTLD_NEXT)` to locate the actual allocator functions, supporting various LD_PRELOAD chains
