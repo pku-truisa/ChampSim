@@ -512,7 +512,10 @@ void insert_instrumentation(TRACE trace, void* v)
     for_ins_in_trace(trace, [](const INS& ins) {
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
-      insert_analysis_functions(ins);
+      // Skip expensive analysis callbacks while still in per-insn fast-forward
+      if (!skip_dumping_instructions) {
+        insert_analysis_functions(ins);
+      }
     });
   }
 }
@@ -562,6 +565,8 @@ template <typename T>
 void WriteToSet(T* begin, T* end, UINT32 r)
 {
   auto set_end = std::find(begin, end, 0);
+  // If the set is full (no zero slot found), do nothing
+  if (set_end == end) return;
   auto found_reg = std::find(begin, set_end, r);
   *found_reg = r;
 }
@@ -789,7 +794,7 @@ VOID PosixMemalignAfter(ADDRINT status)
 }
 
 // --- FREE (type=18-23) — only write if tracked (suppresses glibc-internal free) ---
-VOID FreeBefore(ADDRINT ptr, UINT32 free_type, ADDRINT caller_ip)
+VOID FreeBefore(ADDRINT ptr, ADDRINT caller_ip)
 {
   if (ptr == 0 || compat_mode) return;
 
@@ -1005,7 +1010,6 @@ VOID ImageLoad(IMG img, VOID* v)
       case SymbolHook::FREE:
         RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
                        IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                       IARG_UINT32, sym.type,
                        IARG_RETURN_IP, IARG_END);
         RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
         break;
