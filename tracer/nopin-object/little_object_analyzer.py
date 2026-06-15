@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-High-performance low-memory streaming Memory Allocation Trace File Analyzer — v10 40-byte only + caller_ip stats.
+High-performance low-memory streaming Memory Allocation Trace File Analyzer — v11
 v6: Added top-64 largest memory objects tracking with lifetime (alloc/free event count).
 v7: Added automatic legacy format detection + type code remapping for old PIN tracer traces.
 v8: Added automatic 32-byte vs 40-byte record detection for compatibility.
 v9: Removed 32-byte support entirely. Only 40-byte format is supported.
 v10: Added per-caller_ip statistics (alloc count, avg size, total size, avg lifetime).
-    Format: <QQQQB7s> (arg1, arg2, ret, caller_ip, type, reserved[7])
+v11: Added defensive caller_ip filtering in display: caller_ip <= 4096 grouped as "unknown/invalid".
+     Format: <QQQQB7s> (arg1, arg2, ret, caller_ip, type, reserved[7])
 """
 
 import struct
@@ -18,6 +19,8 @@ import argparse
 import bisect
 import heapq
 from collections import defaultdict
+
+INVALID_CALLER_IP_MAX = 4096  # caller_ip addresses at or below this are considered invalid
 
 class Tee:
     def __init__(self, *files):
@@ -83,17 +86,29 @@ def read_malloc_binary(filename):
     open_func = lzma.open if is_xz else open
 
     with open_func(filename, "rb") as f:
-        chunk_size = 32 * 1024 * 64
+        # IMPORTANT: chunk_size must be a multiple of RECORD_SIZE (40),
+        # otherwise record boundaries get misaligned at chunk boundaries.
+        # 2^21 / 40 = 52428.8, so we floor to nearest multiple of 40:
+        chunk_raw_size = 32 * 1024 * 64  # 2,097,152 = 52428.8 records
+        chunk_size = (chunk_raw_size // RECORD_SIZE) * RECORD_SIZE  # 2,097,120 = 52428 records exactly
+        remainder = b''
         while True:
-            chunk = f.read(chunk_size)
-            if not chunk: break
+            data = f.read(chunk_size)
+            if not data:
+                if remainder:
+                    # Process any remaining bytes that didn't form a full record
+                    pass
+                break
+            frame = remainder + data
             offset = 0
-            while offset < len(chunk):
-                record = chunk[offset:offset+RECORD_SIZE]
-                if len(record) < RECORD_SIZE: break
+            frame_len = len(frame)
+            # Process whole records only
+            while offset + RECORD_SIZE <= frame_len:
+                record = frame[offset:offset+RECORD_SIZE]
                 arg1, arg2, ret, caller_ip, etype, _ = struct.unpack(RECORD_FMT, record)
                 yield etype, arg1, arg2, ret, caller_ip
                 offset += RECORD_SIZE
+            remainder = frame[offset:]
 
 def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, ge_counts, n, size, pow2, split_idx):
     for i in range(split_idx):
@@ -162,6 +177,7 @@ def process_malloc_binary(filename, objects_path=None):
 
     # Per-caller_ip statistics: { caller_ip -> {cnt, tot_sz, tot_lt, types: {type: count}} }
     caller_stats = {}
+    invalid_caller_count = 0  # counter for caller_ip <= INVALID_CALLER_IP_MAX
 
     print("Streaming processing data to minimize memory footprint...")
 
@@ -174,13 +190,16 @@ def process_malloc_binary(filename, objects_path=None):
             size = arg2 if etype == 4 else arg1
 
             # Track per-caller_ip stats for allocations
-            if caller_ip not in caller_stats:
-                caller_stats[caller_ip] = {"cnt": 0, "tot_sz": 0, "tot_lt": 0, "types": {}}
-            caller_stats[caller_ip]["cnt"] += 1
-            caller_stats[caller_ip]["tot_sz"] += size
-            if etype not in caller_stats[caller_ip]["types"]:
-                caller_stats[caller_ip]["types"][etype] = 0
-            caller_stats[caller_ip]["types"][etype] += 1
+            if caller_ip <= INVALID_CALLER_IP_MAX:
+                invalid_caller_count += 1
+            else:
+                if caller_ip not in caller_stats:
+                    caller_stats[caller_ip] = {"cnt": 0, "tot_sz": 0, "tot_lt": 0, "types": {}}
+                caller_stats[caller_ip]["cnt"] += 1
+                caller_stats[caller_ip]["tot_sz"] += size
+                if etype not in caller_stats[caller_ip]["types"]:
+                    caller_stats[caller_ip]["types"][etype] = 0
+                caller_stats[caller_ip]["types"][etype] += 1
 
             if ret != 0:
                 if etype == 4 and arg1 != 0 and arg1 in active_heap:
@@ -190,7 +209,7 @@ def process_malloc_binary(filename, objects_path=None):
                         candidate_info[arg1]["lifetime"] = event_counter - old_alloc_ev
                     # Accumulate lifetime to the original allocator's caller_ip
                     lifetime = event_counter - old_alloc_ev
-                    if old_caller_ip in caller_stats:
+                    if old_caller_ip > INVALID_CALLER_IP_MAX and old_caller_ip in caller_stats:
                         caller_stats[old_caller_ip]["tot_lt"] += lifetime
                     old_pow2 = next_power_of_2(old_sz)
                     old_idx = bisect.bisect_right(thresholds, old_sz)
@@ -221,7 +240,7 @@ def process_malloc_binary(filename, objects_path=None):
                 original_current_size -= old_sz
                 # Accumulate lifetime to the original allocator's caller_ip
                 lifetime = event_counter - old_alloc_ev
-                if old_caller_ip in caller_stats:
+                if old_caller_ip > INVALID_CALLER_IP_MAX and old_caller_ip in caller_stats:
                     caller_stats[old_caller_ip]["tot_lt"] += lifetime
                 if ptr in candidate_info:
                     candidate_info[ptr]["lifetime"] = event_counter - old_alloc_ev
@@ -296,14 +315,16 @@ def process_malloc_binary(filename, objects_path=None):
             print_count = min(64, len(sorted_candidates))
             for i in range(print_count):
                 obj = sorted_candidates[i]
-                print(f"{i+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  0x{obj['caller_ip']:016x}")
+                caller_ip_str = "unknown/invalid" if obj['caller_ip'] <= INVALID_CALLER_IP_MAX else f"0x{obj['caller_ip']:016x}"
+                print(f"{i+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  {caller_ip_str}")
 
             if len(sorted_candidates) > 64:
                 last_size = sorted_candidates[63]["size"]
                 for j in range(64, len(sorted_candidates)):
                     if sorted_candidates[j]["size"] == last_size:
                         obj = sorted_candidates[j]
-                        print(f"{j+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  0x{obj['caller_ip']:016x}")
+                        caller_ip_str = "unknown/invalid" if obj['caller_ip'] <= INVALID_CALLER_IP_MAX else f"0x{obj['caller_ip']:016x}"
+                        print(f"{j+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  {caller_ip_str}")
                     else:
                         break
 
@@ -313,9 +334,33 @@ def process_malloc_binary(filename, objects_path=None):
             print("(No objects >= 4KB found)")
 
         # ===== Caller IP Statistics =====
-        if caller_stats:
+        if caller_stats or invalid_caller_count > 0:
             # Build list of (avg_size, caller_ip, count, total_size, avg_lifetime, primary_type)
             caller_list = []
+
+            # Aggregate invalid caller IPs into one row
+            if invalid_caller_count > 0:
+                # We need to get total size and types for invalid entries.
+                # Since we didn't store them individually, we'll note them separately.
+                # Re-scan to collect invalid stats more precisely.
+                # Start by re-reading the file for invalid IP stats only.
+                invalid_tot_sz = 0
+                invalid_types = {}
+                invalid_cnt = 0
+                for etype, arg1, arg2, ret, caller_ip in read_malloc_binary(filename):
+                    if caller_ip <= INVALID_CALLER_IP_MAX and etype in _ALLOC_TYPES:
+                        size = arg2 if etype == 4 else arg1
+                        invalid_cnt += 1
+                        invalid_tot_sz += size
+                        if etype not in invalid_types:
+                            invalid_types[etype] = 0
+                        invalid_types[etype] += 1
+                if invalid_cnt > 0:
+                    avg_sz = invalid_tot_sz / invalid_cnt if invalid_cnt > 0 else 0
+                    primary_type = max(invalid_types, key=invalid_types.get) if invalid_types else 0
+                    type_name = TYPE_MAP.get(primary_type, 'unknown')
+                    caller_list.append((avg_sz, 0, invalid_cnt, invalid_tot_sz, 0.0, type_name))
+
             for ip, info in caller_stats.items():
                 cnt = info["cnt"]
                 tot_sz = info["tot_sz"]
@@ -334,8 +379,14 @@ def process_malloc_binary(filename, objects_path=None):
             print(f"{'Caller IP':<20} {'Type':<14}  {'Alloc Count':>12}  {'Avg Size':>12}  {'Total Size':>14}  {'Avg Lifetime':>12}")
             print("-" * 86)
             for avg_sz, ip, cnt, tot_sz, avg_lt, type_name in caller_list:
-                print(f"0x{ip:016x}  {type_name:<14}  {cnt:>12,}  {avg_sz:>12,.1f}  {tot_sz:>14,}  {avg_lt:>12,.1f}")
-            print(f"\n(Total unique caller IPs: {len(caller_list)})")
+                if ip == 0:
+                    ip_str = "unknown/invalid"
+                else:
+                    ip_str = f"0x{ip:016x}"
+                print(f"{ip_str:<20}  {type_name:<14}  {cnt:>12,}  {avg_sz:>12,.1f}  {tot_sz:>14,}  {avg_lt:>12,.1f}")
+            print(f"\n(Total unique caller IPs: {len(caller_list) - (1 if invalid_caller_count > 0 else 0)})")
+            if invalid_caller_count > 0:
+                print(f"(Records with invalid caller_ip <= {INVALID_CALLER_IP_MAX}: {invalid_caller_count})")
         else:
             print("\n=== Caller IP Statistics ===")
             print("(No allocation events found)")
@@ -358,7 +409,7 @@ def process_malloc_binary(filename, objects_path=None):
         sys.stdout = sys.__stdout__
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v10, 40-byte, caller_ip stats)')
+    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v11, 40-byte, caller_ip stats)')
     parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all"')
     parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report')
     args = parser.parse_args()
