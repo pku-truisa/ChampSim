@@ -277,6 +277,11 @@ def process_malloc_binary(filename, objects_path=None):
             print(f"{t:>9}  {increase:>27,}  {inc_pct:>9.2f}%  {delta:>16,}  {obj_pct:>15.2f}%  {desc_overhead:>13,}  {desc_pct:>15.2f}%")
             prev = threshold_object_counts[i]
 
+        # >=128K row (cumulative object count)
+        ge128k_objs = total_alloc - threshold_object_counts[-1]
+        ge128k_pct = (ge128k_objs / total_alloc * 100) if total_alloc > 0 else 0
+        print(f"{'>=128K':>9}  {0:>27,}  {0:>9.2f}%  {ge128k_objs:>16,}  {ge128k_pct:>15.2f}%  {0:>13,}  {0:>15.2f}%")
+
         if candidate_info:
             # Filter to objects >= 4KB (4096 bytes)
             sorted_candidates = sorted(
