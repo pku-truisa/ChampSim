@@ -160,7 +160,7 @@ def process_malloc_binary(filename, objects_path=None):
     candidate_heap = []
     candidate_info = {}
 
-    # Per-caller_ip statistics: { caller_ip -> (count, total_size, total_lifetime) }
+    # Per-caller_ip statistics: { caller_ip -> {cnt, tot_sz, tot_lt, types: {type: count}} }
     caller_stats = {}
 
     print("Streaming processing data to minimize memory footprint...")
@@ -175,9 +175,12 @@ def process_malloc_binary(filename, objects_path=None):
 
             # Track per-caller_ip stats for allocations
             if caller_ip not in caller_stats:
-                caller_stats[caller_ip] = [0, 0, 0]  # count, total_size, total_lifetime
-            caller_stats[caller_ip][0] += 1
-            caller_stats[caller_ip][1] += size
+                caller_stats[caller_ip] = {"cnt": 0, "tot_sz": 0, "tot_lt": 0, "types": {}}
+            caller_stats[caller_ip]["cnt"] += 1
+            caller_stats[caller_ip]["tot_sz"] += size
+            if etype not in caller_stats[caller_ip]["types"]:
+                caller_stats[caller_ip]["types"][etype] = 0
+            caller_stats[caller_ip]["types"][etype] += 1
 
             if ret != 0:
                 if etype == 4 and arg1 != 0 and arg1 in active_heap:
@@ -188,7 +191,7 @@ def process_malloc_binary(filename, objects_path=None):
                     # Accumulate lifetime to the original allocator's caller_ip
                     lifetime = event_counter - old_alloc_ev
                     if old_caller_ip in caller_stats:
-                        caller_stats[old_caller_ip][2] += lifetime
+                        caller_stats[old_caller_ip]["tot_lt"] += lifetime
                     old_pow2 = next_power_of_2(old_sz)
                     old_idx = bisect.bisect_right(thresholds, old_sz)
                     _update_sizes_on_free(current_sizes, current_ge_counts, n, old_sz, old_pow2, old_idx)
@@ -219,7 +222,7 @@ def process_malloc_binary(filename, objects_path=None):
                 # Accumulate lifetime to the original allocator's caller_ip
                 lifetime = event_counter - old_alloc_ev
                 if old_caller_ip in caller_stats:
-                    caller_stats[old_caller_ip][2] += lifetime
+                    caller_stats[old_caller_ip]["tot_lt"] += lifetime
                 if ptr in candidate_info:
                     candidate_info[ptr]["lifetime"] = event_counter - old_alloc_ev
                 old_pow2 = next_power_of_2(old_sz)
@@ -249,17 +252,6 @@ def process_malloc_binary(filename, objects_path=None):
         print(f"Total Free calls:  {total_dealloc}")
         print(f"Active objects remaining in memory: {len(active_heap)}")
 
-        print("\n--- Breakdown by Type Group ---")
-        print(f"{'Group':<18} {'Types':>12}  {'Count':>14}")
-        print("-" * 48)
-        for group_name, codes in _ALLOC_GROUPS + _FREE_GROUPS:
-            group_total = 0
-            for c in codes:
-                name = TYPE_MAP.get(c, 'unknown')
-                group_total += func_stats.get(name, 0)
-            if group_total > 0:
-                print(f"{group_name:<18} {len(codes):>12}  {group_total:>14,}")
-
         print("\n--- Breakdown by Type ---")
         print(f"{'Type':<30} {'Code':>4}  {'Count':>14}")
         print("-" * 52)
@@ -270,7 +262,7 @@ def process_malloc_binary(filename, objects_path=None):
                 print(f"{name:<30} {code:>4}  {count:>14,}")
 
         print("\n=== Peak Memory Usage Summary ===")
-        print(f"Original Physical Peak: {format_size(original_peak_size)}")
+        print(f"Original Peak Memory: {format_size(original_peak_size)}")
         print("\n Threshold   Aligned Increase               Increase %   Objects (interval)   % of Total Objs   Desc Overhead   Desc Overhead %")
         print("-" * 137)
         prev = 0
@@ -286,48 +278,58 @@ def process_malloc_binary(filename, objects_path=None):
             prev = threshold_object_counts[i]
 
         if candidate_info:
-            sorted_candidates = sorted(candidate_info.values(), key=lambda x: (-x["size"], x["alloc_event"]))
+            # Filter to objects >= 4KB (4096 bytes)
+            sorted_candidates = sorted(
+                [c for c in candidate_info.values() if c["size"] >= 4096],
+                key=lambda x: (-x["size"], x["alloc_event"])
+            )
 
-            print("\n=== Top 64 Largest Memory Objects ===")
-            print(f"{'#':>4}  {'Size':>12}  {'Type':<18}  {'Lifetime':>10}")
-            print("-" * 48)
+            print("\n=== Top 64 Largest Memory Objects (>=4KB) ===")
+            print(f"{'#':>4}  {'Alloc@':>8}  {'Size':>12}  {'Type':<18}  {'Lifetime':>10}")
+            print("-" * 56)
 
             print_count = min(64, len(sorted_candidates))
             for i in range(print_count):
                 obj = sorted_candidates[i]
-                print(f"{i+1:>4}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}")
+                print(f"{i+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}")
 
             if len(sorted_candidates) > 64:
                 last_size = sorted_candidates[63]["size"]
                 for j in range(64, len(sorted_candidates)):
                     if sorted_candidates[j]["size"] == last_size:
                         obj = sorted_candidates[j]
-                        print(f"{j+1:>4}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}")
+                        print(f"{j+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}")
                     else:
                         break
 
             print(f"\n(Total unique candidate objects in top-64 set: {len(sorted_candidates)})")
         else:
-            print("\n=== Top 64 Largest Memory Objects ===")
-            print("(No alloc events found)")
+            print("\n=== Top 64 Largest Memory Objects (>=4KB) ===")
+            print("(No objects >= 4KB found)")
 
         # ===== Caller IP Statistics =====
         if caller_stats:
-            # Build list of (avg_size, caller_ip, count, total_size, total_lifetime)
+            # Build list of (avg_size, caller_ip, count, total_size, avg_lifetime, primary_type)
             caller_list = []
-            for ip, (cnt, tot_sz, tot_lt) in caller_stats.items():
+            for ip, info in caller_stats.items():
+                cnt = info["cnt"]
+                tot_sz = info["tot_sz"]
+                tot_lt = info["tot_lt"]
                 avg_sz = tot_sz / cnt if cnt > 0 else 0
                 avg_lt = tot_lt / cnt if cnt > 0 else 0
-                caller_list.append((avg_sz, ip, cnt, tot_sz, avg_lt))
+                # Determine primary type (most frequent)
+                primary_type = max(info["types"], key=info["types"].get) if info["types"] else 0
+                type_name = TYPE_MAP.get(primary_type, 'unknown')
+                caller_list.append((avg_sz, ip, cnt, tot_sz, avg_lt, type_name))
 
             # Sort by avg size descending
             caller_list.sort(key=lambda x: -x[0])
 
             print("\n=== Caller IP Statistics (sorted by avg size) ===")
-            print(f"{'Caller IP':<20} {'Alloc Count':>12}  {'Avg Size':>12}  {'Total Size':>14}  {'Avg Lifetime':>12}")
-            print("-" * 72)
-            for avg_sz, ip, cnt, tot_sz, avg_lt in caller_list:
-                print(f"0x{ip:016x}  {cnt:>12,}  {avg_sz:>12,.1f}  {tot_sz:>14,}  {avg_lt:>12,.1f}")
+            print(f"{'Caller IP':<20} {'Type':<14}  {'Alloc Count':>12}  {'Avg Size':>12}  {'Total Size':>14}  {'Avg Lifetime':>12}")
+            print("-" * 86)
+            for avg_sz, ip, cnt, tot_sz, avg_lt, type_name in caller_list:
+                print(f"0x{ip:016x}  {type_name:<14}  {cnt:>12,}  {avg_sz:>12,.1f}  {tot_sz:>14,}  {avg_lt:>12,.1f}")
             print(f"\n(Total unique caller IPs: {len(caller_list)})")
         else:
             print("\n=== Caller IP Statistics ===")
