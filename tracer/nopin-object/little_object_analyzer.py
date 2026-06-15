@@ -112,14 +112,14 @@ def _update_sizes_on_free(current_sizes, ge_counts, n, old_sz, pow2, split_idx):
     for i in range(split_idx, n):
         current_sizes[i] -= pow2
 
-def _maybe_add_candidate(candidate_heap, candidate_info, size, ptr, alloc_event, func_name):
+def _maybe_add_candidate(candidate_heap, candidate_info, size, ptr, alloc_event, func_name, caller_ip):
     """Try to add object to top-64 candidate set. Returns False if not added."""
     while candidate_heap and candidate_heap[0][1] not in candidate_info:
         heapq.heappop(candidate_heap)
 
     if len(candidate_info) < 64:
         heapq.heappush(candidate_heap, (size, ptr))
-        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None}
+        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None, "caller_ip": caller_ip}
         return True
 
     if candidate_heap and size > candidate_heap[0][0]:
@@ -127,14 +127,14 @@ def _maybe_add_candidate(candidate_heap, candidate_info, size, ptr, alloc_event,
         if min_ptr in candidate_info:
             del candidate_info[min_ptr]
         heapq.heappush(candidate_heap, (size, ptr))
-        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None}
+        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None, "caller_ip": caller_ip}
         return True
     elif candidate_heap and size == candidate_heap[0][0] and ptr < candidate_heap[0][1]:
         min_size, min_ptr = heapq.heappop(candidate_heap)
         if min_ptr in candidate_info:
             del candidate_info[min_ptr]
         heapq.heappush(candidate_heap, (size, ptr))
-        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None}
+        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None, "caller_ip": caller_ip}
         return True
 
     return False
@@ -201,7 +201,7 @@ def process_malloc_binary(filename, objects_path=None):
                 if size >= 32768:
                     all_large_objects.append((ret, size, func_name))
 
-                _maybe_add_candidate(candidate_heap, candidate_info, size, ret, event_counter, func_name)
+                _maybe_add_candidate(candidate_heap, candidate_info, size, ret, event_counter, func_name, caller_ip)
 
                 pow2 = next_power_of_2(size)
                 split_idx = bisect.bisect_right(thresholds, size)
@@ -290,20 +290,20 @@ def process_malloc_binary(filename, objects_path=None):
             )
 
             print("\n=== Top 64 Largest Memory Objects (>=4KB) ===")
-            print(f"{'#':>4}  {'Alloc@':>8}  {'Size':>12}  {'Type':<18}  {'Lifetime':>10}")
-            print("-" * 56)
+            print(f"{'#':>4}  {'Alloc@':>8}  {'Size':>12}  {'Type':<18}  {'Lifetime':>10}  {'Caller IP':<20}")
+            print("-" * 78)
 
             print_count = min(64, len(sorted_candidates))
             for i in range(print_count):
                 obj = sorted_candidates[i]
-                print(f"{i+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}")
+                print(f"{i+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  0x{obj['caller_ip']:016x}")
 
             if len(sorted_candidates) > 64:
                 last_size = sorted_candidates[63]["size"]
                 for j in range(64, len(sorted_candidates)):
                     if sorted_candidates[j]["size"] == last_size:
                         obj = sorted_candidates[j]
-                        print(f"{j+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}")
+                        print(f"{j+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  0x{obj['caller_ip']:016x}")
                     else:
                         break
 
