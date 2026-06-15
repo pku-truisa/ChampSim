@@ -1,28 +1,30 @@
 /*
  * trace_wrapper.c - LD_PRELOAD malloc trace wrapper for ALL SPEC programs
- * v4: Added tracked_addresses + depth counter + size + caller_ip sanity
+ * v5: std::unordered_set for tracked addresses (reliable, automatic rehashing)
  *     - track_addresses set: only record free/realloc for known allocations
  *     - depth counter: prevent recording nested allocator calls
  *     - mmap depth: skip mmap when inside another alloc (glibc internal)
  *     - SIZE SANITY CHECK: allocations > 128 MiB are treated as glibc internal noise
  *     - CALLER_IP CHECK: caller_ip <= 4096 is invalid (__builtin_return_address failure),
  *       skip recording such allocations entirely (but still track addresses for free).
- *     - thread-safe: uses pwrite with atomic byte counter + mutex
- *     - Uses C-style simple hash table (no C++ STL to avoid LD_PRELOAD init issues)
+ *     - Thread-safe: uses pwrite with atomic byte counter + std::mutex
+ *     - Build with g++ (requires C++ std::unordered_set)
  *
- * Build: gcc -shared -fPIC -o libobject_tracer_wrapper.so object_tracer_wrapper.cpp -ldl -lpthread
+ * Build: g++ -shared -fPIC -o libobject_tracer_wrapper.so object_tracer_wrapper.cpp -ldl -lpthread
  */
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
-#include <stdint.h>
+#include <cstdint>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
-#include <stdio.h>
+#include <cstdio>
+#include <unordered_set>
+#include <mutex>
+#include <new>
 
 // ---- Constants ----
 typedef struct {
@@ -48,70 +50,21 @@ enum {
 #define MAX_REASONABLE_ALLOC_SIZE (128ULL * 1024ULL * 1024ULL)  // 128 MiB
 #define MAX_INVALID_CALLER_IP     4096ULL  // caller_ip <= 4096 is invalid
 
-// Simple open-addressing hash table for tracked addresses (C-style, no C++ STL)
-#define HASH_TABLE_SIZE 262144  // 2^18 slots
+// Tracked addresses: use pointer + placement new to avoid static init order issues
+// with LD_PRELOAD (std::unordered_set constructor can crash before glibc is ready)
+typedef std::unordered_set<unsigned long long> TrackedSet;
+static char tracked_addrs_buf[sizeof(TrackedSet)];
+static TrackedSet* tracked_addrs = nullptr;
+static std::mutex tracked_mutex;
 
-static unsigned long long hash_table_keys[HASH_TABLE_SIZE];
-static int hash_table_vals[HASH_TABLE_SIZE];  // 0 = empty, 1 = present
-
-static pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void hash_init(void) {
-  static int initialized = 0;
-  if (initialized) return;
-  pthread_mutex_lock(&hash_mutex);
-  if (!initialized) {
-    memset(hash_table_keys, 0, sizeof(hash_table_keys));
-    memset(hash_table_vals, 0, sizeof(hash_table_vals));
-    initialized = 1;
-  }
-  pthread_mutex_unlock(&hash_mutex);
-}
-
-static unsigned long hash_fn(unsigned long long key) {
-  key ^= key >> 33;
-  key *= 0xff51afd7ed558ccdULL;
-  key ^= key >> 33;
-  key *= 0xc4ceb9fe1a85ec53ULL;
-  key ^= key >> 33;
-  return (unsigned long)(key % HASH_TABLE_SIZE);
-}
-
-static void track_add(unsigned long long addr) {
-  if (addr == 0) return;
-  hash_init();
-  unsigned long idx = hash_fn(addr);
-  while (hash_table_vals[idx]) {
-    if (hash_table_keys[idx] == addr) return;
-    idx = (idx + 1) % HASH_TABLE_SIZE;
-  }
-  hash_table_keys[idx] = addr;
-  hash_table_vals[idx] = 1;
-}
-
-static void track_erase(unsigned long long addr) {
-  if (addr == 0) return;
-  hash_init();
-  unsigned long idx = hash_fn(addr);
-  while (hash_table_vals[idx]) {
-    if (hash_table_keys[idx] == addr) {
-      hash_table_vals[idx] = 0;
-      hash_table_keys[idx] = 0;
-      return;
+static void ensure_tracked_init() {
+    if (__builtin_expect(tracked_addrs != nullptr, 1)) return;
+    std::lock_guard<std::mutex> lock(tracked_mutex);
+    if (tracked_addrs == nullptr) {
+        // Placement new: construct unordered_set in pre-allocated buffer
+        // This is safe because we're already inside in_trace=1 at first call
+        tracked_addrs = new (tracked_addrs_buf) TrackedSet();
     }
-    idx = (idx + 1) % HASH_TABLE_SIZE;
-  }
-}
-
-static int track_contains(unsigned long long addr) {
-  if (addr == 0) return 0;
-  hash_init();
-  unsigned long idx = hash_fn(addr);
-  while (hash_table_vals[idx]) {
-    if (hash_table_keys[idx] == addr) return 1;
-    idx = (idx + 1) % HASH_TABLE_SIZE;
-  }
-  return 0;
 }
 
 // ---- Global State ----
@@ -185,14 +138,39 @@ static void write_rec(unsigned char t, unsigned long long a1,
   pwrite(trace_fd, &rec, sizeof(rec), off);
 }
 
-// Check if a size is reasonable
+// Helper: check caller_ip validity
+static inline int caller_ip_is_valid(unsigned long long ip) {
+  return (ip > MAX_INVALID_CALLER_IP) ? 1 : 0;
+}
+
+// Helper: check size reasonableness
 static inline int size_is_reasonable(unsigned long long size) {
   return (size <= MAX_REASONABLE_ALLOC_SIZE) ? 1 : 0;
 }
 
-// Check if caller_ip is valid (not a glibc internal or __builtin_return_address failure)
-static inline int caller_ip_is_valid(unsigned long long ip) {
-  return (ip > MAX_INVALID_CALLER_IP) ? 1 : 0;
+// Tracked address helpers — using std::unordered_set
+// NOTE: These are called while in_trace == 1, so any internal malloc from
+// unordered_set will be bypassed safely through real_malloc.
+
+static void track_add(unsigned long long addr) {
+  if (addr == 0) return;
+  ensure_tracked_init();
+  std::lock_guard<std::mutex> lock(tracked_mutex);
+  tracked_addrs->insert(addr);
+}
+
+static void track_erase(unsigned long long addr) {
+  if (addr == 0) return;
+  ensure_tracked_init();
+  std::lock_guard<std::mutex> lock(tracked_mutex);
+  tracked_addrs->erase(addr);
+}
+
+static int track_contains(unsigned long long addr) {
+  if (addr == 0) return 0;
+  ensure_tracked_init();
+  std::lock_guard<std::mutex> lock(tracked_mutex);
+  return (tracked_addrs->find(addr) != tracked_addrs->end()) ? 1 : 0;
 }
 
 /* Standard C allocation */

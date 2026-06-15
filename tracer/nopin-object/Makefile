@@ -15,7 +15,7 @@ all: wrapper
 wrapper: libobject_tracer_wrapper.so
 
 libobject_tracer_wrapper.so: object_tracer_wrapper.cpp
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lpthread
+	$(CXX) $(CFLAGS) -std=c++11 -o $@ $< $(LDFLAGS) -lpthread
 
 # ================================================================
 # Test programs
