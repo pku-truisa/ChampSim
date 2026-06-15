@@ -44,7 +44,7 @@ enum MallocType : unsigned char {
 };
 
 /* ===================================================================== */
-// Binary malloc trace record (32 bytes)
+// Binary malloc trace record (40 bytes)
 /* ===================================================================== */
 struct malloc_instr {
   unsigned long long arg1;
@@ -271,7 +271,7 @@ VOID FreeBefore(ADDRINT ptr, UINT32 free_type, ADDRINT caller_ip)
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
   auto it = tracked_addresses.find(ptr);
   if (it != tracked_addresses.end()) {
-    write_malloc_instr_locked((unsigned char)free_type, (unsigned long long)ptr, 0, 0, 0);
+    write_malloc_instr_locked((unsigned char)free_type, (unsigned long long)ptr, 0, 0, (unsigned long long)caller_ip);
     tracked_addresses.erase(it);
   }
   PIN_ReleaseLock(&malloc_lock);
@@ -290,6 +290,7 @@ VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT caller_ip)
   }
   ts->mmap_depth = 1;
   ts->mmap_pending_size = length;
+  ts->pending.caller_ip = caller_ip;
 }
 
 VOID MmapAfter(ADDRINT ret)
@@ -302,7 +303,7 @@ VOID MmapAfter(ADDRINT ret)
 
   if (ret != 0 && ret != (ADDRINT)-1) {
     PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    write_malloc_instr_locked(TYPE_MMAP, ts->mmap_pending_size, 0, ret, 0);
+    write_malloc_instr_locked(TYPE_MMAP, ts->mmap_pending_size, 0, ret, ts->pending.caller_ip);
     tracked_addresses.insert(ret);
     PIN_ReleaseLock(&malloc_lock);
   }
@@ -314,7 +315,7 @@ VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT caller_ip)
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
   auto it = tracked_addresses.find(addr);
   if (it != tracked_addresses.end()) {
-    write_malloc_instr_locked(TYPE_MUNMAP, (unsigned long long)addr, (unsigned long long)length, 0, 0);
+    write_malloc_instr_locked(TYPE_MUNMAP, (unsigned long long)addr, (unsigned long long)length, 0, (unsigned long long)caller_ip);
     tracked_addresses.erase(it);
   }
   PIN_ReleaseLock(&malloc_lock);
