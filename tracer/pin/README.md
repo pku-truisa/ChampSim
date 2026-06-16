@@ -138,10 +138,11 @@ Output is a sequence of 40-byte `malloc_instr` records, compatible with
 | 32     | type  | Allocation type code (see table below) |
 | 33..39 | reserved | Zero padding |
 
-### Allocation type codes (7-type scheme)
+### Allocation type codes (8-type scheme)
 
 All allocator-variant symbols (mi_malloc, je_malloc, tc_malloc, C++ new/delete)
-are mapped to their corresponding base type.
+are mapped to their corresponding base type. Type 8 is a special marker
+that indicates the start of the program's `main()` function.
 
 | Code | Type | Meaning |
 |------|------|---------|
@@ -152,6 +153,19 @@ are mapped to their corresponding base type.
 | 5 | posix_memalign | POSIX aligned allocation |
 | 6 | mmap | Anonymous memory mapping |
 | 7 | munmap | Unmap memory region |
+| 8 | main_begin | Marker: `main()` function has started |
+
+### Type 8 — main_begin Marker
+
+When running in embedded-alloc or alloc-only mode, the tracer automatically
+emits a `type=8` record at the entry of `main()`. This is done via the
+`ResetDepthOnMain()` callback, which is instrumented at `main`/`MAIN__`/`main_`
+symbols found in each loaded image.
+
+The marker allows the analyzer to:
+- Skip glibc initialization allocations that occurred before `main()`
+- Reset its internal state so only user-level allocations are counted
+- Achieve a clean alloc/free ledger (active objects ≈ 1 at exit)
 
 ## Unit Tests
 

@@ -24,6 +24,8 @@ def wr(f, t, a1, a2, r, ip=0):
 
 def gen(fp):
     with open(fp, "wb") as f:
+        # main_begin marker (type=8) — analyzer resets state and starts counting after this
+        wr(f, 8, 0, 0, 0, 0)
         # Phase 1: malloc/free basics (type 1 = malloc/new, type 2 = free/delete)
         wr(f, 1, 100, 0, 0x1000); wr(f, 1, 200, 0, 0x2000)
         wr(f, 1, 50, 0, 0x3000);  wr(f, 2, 0x1000, 0, 0)

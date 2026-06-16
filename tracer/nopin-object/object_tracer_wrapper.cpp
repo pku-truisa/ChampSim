@@ -47,7 +47,10 @@ enum {
 };
 
 // Sanity limits
-#define MAX_REASONABLE_ALLOC_SIZE (128ULL * 1024ULL * 1024ULL)  // 128 MiB
+// NOTE: 128 MiB limit would silently drop legitimate large allocations
+// (e.g., dedup's 193 MiB allocation). Disable by using ULLONG_MAX.
+// To restore the 128 MiB filter, set this to (128ULL * 1024ULL * 1024ULL).
+#define MAX_REASONABLE_ALLOC_SIZE ((unsigned long long)-1)  // disabled: allow all sizes
 #define MAX_INVALID_CALLER_IP     4096ULL  // caller_ip <= 4096 is invalid
 
 // Tracked addresses: use pointer + placement new to avoid static init order issues
@@ -97,6 +100,7 @@ static void* (*real_new)(size_t) = NULL;
 static void* (*real_new_arr)(size_t) = NULL;
 static void  (*real_delete)(void*) = NULL;
 static void  (*real_delete_arr)(void*) = NULL;
+static int   (*real_libc_start_main)(int (*)(int,char**,char**), int, char**, void (*)(void), void (*)(void), void (*)(void), void*) = NULL;
 
 static void open_files(void) {
   if (opened) return;
@@ -123,6 +127,7 @@ static void resolve_syms(void) {
   real_new_arr        = (void* (*)(size_t))           dlsym(RTLD_NEXT, "_Znam");
   real_delete         = (void  (*)(void*))            dlsym(RTLD_NEXT, "_ZdlPv");
   real_delete_arr     = (void  (*)(void*))            dlsym(RTLD_NEXT, "_ZdaPv");
+  real_libc_start_main = (int (*)(int (*)(int,char**,char**), int, char**, void (*)(void), void (*)(void), void (*)(void), void*)) dlsym(RTLD_NEXT, "__libc_start_main");
 
   if (!real_malloc || !real_free) _exit(1);
   open_files();
@@ -251,7 +256,7 @@ void* realloc(void* p, size_t sz) {
   void* a = real_realloc(p, sz);
   if (a) {
     if (old_ptr != 0) track_erase(old_ptr);
-    if ((unsigned long long)a != old_ptr) track_add((unsigned long long)a);
+    track_add((unsigned long long)a);  // always re-add (matching PIN behavior)
     if (should_record) {
       write_rec(TYPE_REALLOC, old_ptr, sz, (unsigned long long)a, ip);
     }
@@ -441,6 +446,14 @@ void* mmap(void* a, size_t l, int p, int f, int fd, off_t o) {
   resolve_syms();
   in_trace = 1;
 
+  // Only intercept anonymous mmap (MAP_ANONYMOUS), matching PIN tracer behavior.
+  // Non-anonymous (file-backed) mmaps are forwarded directly without recording.
+  if (!(f & MAP_ANONYMOUS)) {
+    void* r = real_mmap(a, l, p, f, fd, o);
+    in_trace = 0;
+    return r;
+  }
+
   if (alloc_depth > 0) {
     void* r = real_mmap(a, l, p, f, fd, o);
     in_trace = 0;
@@ -480,4 +493,43 @@ int munmap(void* a, size_t l) {
   int r = real_munmap(a, l);
   in_trace = 0;
   return r;
+}
+
+// --- __libc_start_main intercept ---
+// Emit a main-begin marker (type=8) at the entry of main() itself,
+// matching PIN tracer behavior (PIN instruments the main function).
+// This way, init-phase allocations (global constructors, etc.) are
+// still recorded in the trace but will be skipped by the analyzer.
+
+// Store the original main pointer so main_wrapper can call it
+static int (*g_real_main)(int, char**, char**) = NULL;
+
+// Wrapper for main(): resets depth counters (like PIN ResetDepthOnMain),
+// then writes type=8 marker, then calls real main()
+static int main_wrapper(int argc, char** argv, char** envp)
+{
+  // Reset depth counters: glibc init may have left them non-zero
+  alloc_depth = 0;
+  mmap_depth = 0;
+
+  // Emit type=8 marker: user's main() has started
+  write_rec(8, 0, 0, 0, 0);
+
+  // Call the real main (stored by __libc_start_main)
+  return g_real_main(argc, argv, envp);
+}
+
+extern "C" int __libc_start_main(int (*main)(int,char**,char**), int argc, char **argv,
+                                 void (*init)(void), void (*fini)(void),
+                                 void (*rtld_fini)(void), void *stack_end)
+{
+  // Resolve symbols if not already done
+  resolve_syms();
+
+  // Store the real main pointer for main_wrapper
+  g_real_main = main;
+
+  // Call the real __libc_start_main with our wrapper instead of main
+  // The wrapper will emit type=8 marker at main() entry
+  return real_libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
 }

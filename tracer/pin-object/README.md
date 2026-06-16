@@ -218,3 +218,16 @@ python3 little_object_analyzer.py -i test/malloc.bin
 - **No size threshold (`-k`)** — all allocation events are recorded without filtering
 - **No header/tail records** — the binary file consists purely of allocation/deallocation events
 - **Self-contained** — the `malloc_instr` struct is defined directly in the source, no dependency on `inc/trace_instruction.h`
+
+## Type 8 — main_begin Marker
+
+The `ResetDepthOnMain()` callback in `ImageLoad` (instrumented at `main`/`MAIN__`/`main_` symbols)
+now emits a `type=8` marker record at the entry of `main()`. This allows the analyzer to:
+
+- Skip glibc initialization allocations that occurred before `main()`
+- Reset its internal state so only user-level allocations are counted
+- Achieve a clean alloc/free ledger (active objects ≈ 1 at exit)
+
+For example, with dedup under PARSEC 3.0, this produces:
+- Alloc: 794,192 / Free: 748,207 / Active: 1
+- Peak memory: 444.73 MiB

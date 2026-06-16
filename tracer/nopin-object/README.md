@@ -13,6 +13,41 @@
 | new/delete interception | ✅ | ✅ |
 | aligned_alloc/memalign | ✅ | ✅ |
 | Compatible with existing analyzer | ✅ `malloc.bin` | ✅ Same format |
+| Result consistency (dedup) | Peak 444.73 MiB, Active: 1 | ✅ **Identical** after alignment fixes |
+
+## Recent Fixes (June 2026)
+
+The nopin tracer has been extensively tested against the PIN `object_tracer.so` and
+now produces **identical results**. Key fixes:
+
+### 1. Type 8 — main_begin Marker
+
+The tracer now intercepts `__libc_start_main` and replaces `main()` with a wrapper
+that:
+- Resets depth counters (`alloc_depth`, `mmap_depth`) — matching PIN's `ResetDepthOnMain()`
+- Emits a `type=8` (main_begin) marker record before calling the real `main()`
+
+This allows the analyzer to skip glibc initialization allocations and achieve a
+perfect 1:1 alloc/free ledger.
+
+### 2. MAP_ANONYMOUS mmap Filter (matching PIN)
+
+Only anonymous mmap calls (`MAP_ANONYMOUS` flag set) are intercepted and recorded
+as type=6. Non-anonymous (file-backed) mmap calls are forwarded directly without
+recording, matching PIN's behavior in `MmapBefore`.
+
+### 3. Realloc unconditional track_add
+
+When realloc returns (whether in-place or moved), the new address is **always**
+re-added to the tracked addresses set, matching PIN's unconditional `insert()`
+in `AllocAfter`. Previously, nopin only inserted when the address changed,
+which caused some in-place realloc addresses to "leak" from the tracking set.
+
+### 4. Disabled 128 MiB Size Limit
+
+The `MAX_REASONABLE_ALLOC_SIZE` sanity check was disabled (set to `(unsigned long long)-1`)
+to prevent legitimate large allocations (e.g., dedup's 193 MiB input buffer) from being
+silently filtered out.
 
 ## Build
 

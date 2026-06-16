@@ -82,6 +82,16 @@ Peak memory is approximately 4.05 MiB (during the large allocation phase in Phas
 | 6 | mmap | MAP_ANONYMOUS |
 | 7 | munmap | Direct call |
 
+## main_begin Marker (type=8)
+
+The `test_analyzer_synthetic.py` test now begins generated traces with a `type=8` (main_begin)
+marker to simulate the tracer behavior. The analyzer resets state when encountering this marker,
+skipping any events that occurred before `main()` started. Both synthetic test scripts
+(`nopin-object/test/test_analyzer_synthetic.py` and this one) have been updated to include
+this marker.
+
+The synthetic test expects 20 allocs + 9 frees from events after the type=8 marker.
+
 ## Known Issues
 
 ### Fixed Bugs (2026-06)

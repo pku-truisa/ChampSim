@@ -1075,6 +1075,7 @@ VOID ImageLoad(IMG img, VOID* v)
 }
 
 // --- Reset depth counters at program entry (after glibc init) ---
+// Also emits a type=8 marker record so analyzers know main() has started.
 VOID ResetDepthOnMain()
 {
   ThreadState* ts = get_tls();
@@ -1082,6 +1083,18 @@ VOID ResetDepthOnMain()
   ts->alloc_overflow = 0;
   ts->mmap_depth = 0;
   ts->mmap_overflow = 0;
+
+  // Emit a main-begin marker (type=8) into the trace
+  if (alloc_only_mode) {
+    write_alloc_record_locked(8, 0, 0, 0, 0);
+  } else if (embedded_alloc_mode) {
+    pending_instr_malloc.type = 8;
+    pending_instr_malloc.arg1 = 0;
+    pending_instr_malloc.arg2 = 0;
+    pending_instr_malloc.ret = 0;
+    pending_instr_malloc.caller_ip = 0;
+  }
+  // compat_mode: no allocation event support, skip marker
 }
 
 /* ===================================================================== */

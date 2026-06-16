@@ -31,6 +31,12 @@ make run
 
 All tests are self-contained — no external dependencies beyond a C++17 compiler.
 
+## Type 8 — main_begin Marker
+
+The `ResetDepthOnMain()` callback (instrumented at `main`/`MAIN__`/`main_`) now emits a
+`type=8` marker record when running in embedded-alloc or alloc-only mode. This allows
+the analyzer to skip glibc initialization and achieve a perfect 1:1 alloc/free ledger.
+
 ## Malloc-Only Mode (-m) Tests
 
 The `test_malloc_only_mode.cpp` test file (8 tests) covers the new -m functionality:

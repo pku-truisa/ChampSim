@@ -455,6 +455,9 @@ VOID ResetDepthOnMain()
   ThreadState* ts = get_tls();
   ts->alloc_depth = 0; ts->alloc_overflow = 0;
   ts->mmap_depth = 0; ts->mmap_overflow = 0;
+
+  // Emit a main-begin marker (type=8) into the trace
+  write_malloc_instr_locked(8, 0, 0, 0, 0);
 }
 
 /* ===================================================================== */

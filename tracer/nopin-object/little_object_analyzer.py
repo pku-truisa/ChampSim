@@ -59,6 +59,7 @@ TYPE_MAP = {
     5: 'posix_memalign',
     6: 'mmap',
     7: 'munmap',
+    8: 'main_begin',
 }
 
 _ALLOC_TYPES = {1, 3, 4, 5, 6}
@@ -179,11 +180,42 @@ def process_malloc_binary(filename, objects_path=None):
     caller_stats = {}
     invalid_caller_count = 0  # counter for caller_ip <= INVALID_CALLER_IP_MAX
 
+    # main_begin marker handling: skip all events before type=8 marker
+    in_main = False
+    saw_main_begin = False
+
     print("Streaming processing data to minimize memory footprint...")
 
     for etype, arg1, arg2, ret, caller_ip in read_malloc_binary(filename):
         event_counter += 1
         func_name = TYPE_MAP.get(etype, 'unknown')
+
+        # Check for main_begin marker (type=8)
+        if etype == 8:
+            # Reset all analysis state so we only count events after main()
+            func_stats = {k: 0 for k in TYPE_MAP.values()}
+            active_heap.clear()
+            current_sizes = [0] * n
+            peak_sizes = [0] * n
+            peak_moment_sizes = [0] * n
+            threshold_object_counts = [0] * n
+            current_ge_counts = [0] * n
+            peak_moment_ge_counts = [0] * n
+            original_current_size = 0
+            original_peak_size = 0
+            all_large_objects.clear()
+            event_counter = 0
+            candidate_heap.clear()
+            candidate_info.clear()
+            caller_stats.clear()
+            invalid_caller_count = 0
+            in_main = True
+            saw_main_begin = True
+            continue  # skip the marker itself (don't treat as alloc/free)
+
+        # Before main() is reached, skip all events
+        if not in_main:
+            continue
 
         if etype in _ALLOC_TYPES:
             func_stats[func_name] += 1
