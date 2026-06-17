@@ -1,14 +1,13 @@
 /*
  * trace_wrapper.c - LD_PRELOAD malloc trace wrapper for ALL SPEC programs
- * v5: std::unordered_set for tracked addresses (reliable, automatic rehashing)
- *     - track_addresses set: only record free/realloc for known allocations
- *     - depth counter: prevent recording nested allocator calls
- *     - mmap depth: skip mmap when inside another alloc (glibc internal)
- *     - SIZE SANITY CHECK: allocations > 128 MiB are treated as glibc internal noise
- *     - CALLER_IP CHECK: caller_ip <= 4096 is invalid (__builtin_return_address failure),
- *       skip recording such allocations entirely (but still track addresses for free).
- *     - Thread-safe: uses pwrite with atomic byte counter + std::mutex
- *     - Build with g++ (requires C++ std::unordered_set)
+ * v6: Aligned with champsim_tracer.cpp type encoding:
+ *     1=malloc,2=calloc,3=realloc,4=free,5=mmap,6=mmap64,7=mremap,8=munmap,9=main_begin
+ *     - Removed posix_memalign, aligned_alloc, memalign (thin wrappers)
+ *     - Removed C++ new/delete operators (internal calls to malloc/free)
+ *     - Added mmap64 and mremap intercepts
+ *     - realloc(ptr,0) special handling (recorded as free)
+ *     - mmap: no longer filters MAP_ANONYMOUS only (records all writable mmaps)
+ *     - main_begin marker changed from type=8 to type=9
  *
  * Build: g++ -shared -fPIC -o libobject_tracer_wrapper.so object_tracer_wrapper.cpp -ldl -lpthread
  */
@@ -17,6 +16,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <cstdint>
+#include <cstdarg>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
@@ -37,19 +37,17 @@ typedef struct {
 } __attribute__((packed)) malloc_record_t;
 
 enum {
-  TYPE_MALLOC         = 1,
-  TYPE_FREE           = 2,
-  TYPE_CALLOC         = 3,
-  TYPE_REALLOC        = 4,
-  TYPE_POSIX_MEMALIGN = 5,
-  TYPE_MMAP           = 6,
-  TYPE_MUNMAP         = 7,
+  TYPE_MALLOC  = 1,
+  TYPE_CALLOC  = 2,
+  TYPE_REALLOC = 3,
+  TYPE_FREE    = 4,
+  TYPE_MMAP    = 5,
+  TYPE_MMAP64  = 6,
+  TYPE_MREMAP  = 7,
+  TYPE_MUNMAP  = 8,
 };
 
 // Sanity limits
-// NOTE: 128 MiB limit would silently drop legitimate large allocations
-// (e.g., dedup's 193 MiB allocation). Disable by using ULLONG_MAX.
-// To restore the 128 MiB filter, set this to (128ULL * 1024ULL * 1024ULL).
 #define MAX_REASONABLE_ALLOC_SIZE ((unsigned long long)-1)  // disabled: allow all sizes
 #define MAX_INVALID_CALLER_IP     4096ULL  // caller_ip <= 4096 is invalid
 
@@ -65,7 +63,6 @@ static void ensure_tracked_init() {
     std::lock_guard<std::mutex> lock(tracked_mutex);
     if (tracked_addrs == nullptr) {
         // Placement new: construct unordered_set in pre-allocated buffer
-        // This is safe because we're already inside in_trace=1 at first call
         tracked_addrs = new (tracked_addrs_buf) TrackedSet();
     }
 }
@@ -84,6 +81,8 @@ static const int MAX_ALLOC_DEPTH = 16;
 static __thread int mmap_depth = 0;
 static __thread unsigned long long mmap_pending_size = 0;
 static __thread unsigned long long mmap_pending_caller_ip = 0;
+static __thread unsigned long long mmap_pending_old_addr = 0;
+static __thread unsigned long long mmap_pending_old_len = 0;
 static const int MAX_MMAP_DEPTH = 16;
 
 /* Real function pointers */
@@ -91,15 +90,10 @@ static void* (*real_malloc)(size_t) = NULL;
 static void* (*real_calloc)(size_t, size_t) = NULL;
 static void* (*real_realloc)(void*, size_t) = NULL;
 static void  (*real_free)(void*) = NULL;
-static int   (*real_posix_memalign)(void**, size_t, size_t) = NULL;
-static void* (*real_aligned_alloc)(size_t, size_t) = NULL;
-static void* (*real_memalign)(size_t, size_t) = NULL;
 static void* (*real_mmap)(void*, size_t, int, int, int, off_t) = NULL;
+static void* (*real_mmap64)(void*, size_t, int, int, int, off64_t) = NULL;
+static void* (*real_mremap)(void*, size_t, size_t, int, ...) = NULL;
 static int   (*real_munmap)(void*, size_t) = NULL;
-static void* (*real_new)(size_t) = NULL;
-static void* (*real_new_arr)(size_t) = NULL;
-static void  (*real_delete)(void*) = NULL;
-static void  (*real_delete_arr)(void*) = NULL;
 static int   (*real_libc_start_main)(int (*)(int,char**,char**), int, char**, void (*)(void), void (*)(void), void (*)(void), void*) = NULL;
 
 static void open_files(void) {
@@ -118,15 +112,10 @@ static void resolve_syms(void) {
   real_calloc         = (void* (*)(size_t,size_t))    dlsym(RTLD_NEXT, "calloc");
   real_realloc        = (void* (*)(void*,size_t))     dlsym(RTLD_NEXT, "realloc");
   real_free           = (void  (*)(void*))            dlsym(RTLD_NEXT, "free");
-  real_posix_memalign = (int   (*)(void**,size_t,size_t)) dlsym(RTLD_NEXT, "posix_memalign");
-  real_aligned_alloc  = (void* (*)(size_t,size_t))    dlsym(RTLD_NEXT, "aligned_alloc");
-  real_memalign       = (void* (*)(size_t,size_t))    dlsym(RTLD_NEXT, "memalign");
   real_mmap           = (void* (*)(void*,size_t,int,int,int,off_t)) dlsym(RTLD_NEXT, "mmap");
+  real_mmap64         = (void* (*)(void*,size_t,int,int,int,off64_t)) dlsym(RTLD_NEXT, "mmap64");
+  real_mremap         = (void* (*)(void*,size_t,size_t,int,...))     dlsym(RTLD_NEXT, "mremap");
   real_munmap         = (int   (*)(void*,size_t))     dlsym(RTLD_NEXT, "munmap");
-  real_new            = (void* (*)(size_t))           dlsym(RTLD_NEXT, "_Znwm");
-  real_new_arr        = (void* (*)(size_t))           dlsym(RTLD_NEXT, "_Znam");
-  real_delete         = (void  (*)(void*))            dlsym(RTLD_NEXT, "_ZdlPv");
-  real_delete_arr     = (void  (*)(void*))            dlsym(RTLD_NEXT, "_ZdaPv");
   real_libc_start_main = (int (*)(int (*)(int,char**,char**), int, char**, void (*)(void), void (*)(void), void (*)(void), void*)) dlsym(RTLD_NEXT, "__libc_start_main");
 
   if (!real_malloc || !real_free) _exit(1);
@@ -154,9 +143,6 @@ static inline int size_is_reasonable(unsigned long long size) {
 }
 
 // Tracked address helpers — using std::unordered_set
-// NOTE: These are called while in_trace == 1, so any internal malloc from
-// unordered_set will be bypassed safely through real_malloc.
-
 static void track_add(unsigned long long addr) {
   if (addr == 0) return;
   ensure_tracked_init();
@@ -254,13 +240,26 @@ void* realloc(void* p, size_t sz) {
   if (old_ptr != 0 && !track_contains(old_ptr)) should_record = 0;
 
   void* a = real_realloc(p, sz);
+
+  // realloc(ptr, 0) = free(ptr): record as TYPE_FREE
+  if (sz == 0 && p != NULL) {
+    if (old_ptr != 0) track_erase(old_ptr);
+    if (should_record) {
+      write_rec(TYPE_FREE, old_ptr, 0, 0, ip);
+    }
+    alloc_depth = 0;
+    in_trace = 0;
+    return a;  // real_realloc returned NULL, caller must not use old_ptr
+  }
+
   if (a) {
     if (old_ptr != 0) track_erase(old_ptr);
-    track_add((unsigned long long)a);  // always re-add (matching PIN behavior)
+    track_add((unsigned long long)a);
     if (should_record) {
       write_rec(TYPE_REALLOC, old_ptr, sz, (unsigned long long)a, ip);
     }
   }
+  // realloc failure: do nothing, old_ptr remains tracked
   alloc_depth = 0;
   in_trace = 0;
   return a;
@@ -280,179 +279,11 @@ void free(void* p) {
   in_trace = 0;
 }
 
-/* Aligned allocation */
-int posix_memalign(void** mp, size_t al, size_t sz) {
-  if (in_trace) return real_posix_memalign ? real_posix_memalign(mp, al, sz) : ENOMEM;
-  resolve_syms();
-  in_trace = 1;
-  if (alloc_depth > 0) {
-    if (alloc_depth < MAX_ALLOC_DEPTH) alloc_depth++;
-    int r = real_posix_memalign(mp, al, sz);
-    alloc_depth--;
-    in_trace = 0;
-    return r;
-  }
-  alloc_depth = 1;
-
-  int r = real_posix_memalign(mp, al, sz);
-  if (r == 0 && mp && *mp) {
-    unsigned long long ip = (unsigned long long)__builtin_return_address(0);
-    if (size_is_reasonable(sz) && caller_ip_is_valid(ip)) {
-      write_rec(TYPE_POSIX_MEMALIGN, sz, al, (unsigned long long)*mp, ip);
-    }
-    track_add((unsigned long long)*mp);
-  }
-  alloc_depth = 0;
-  in_trace = 0;
-  return r;
-}
-
-void* aligned_alloc(size_t al, size_t sz) {
-  if (in_trace) return real_aligned_alloc ? real_aligned_alloc(al, sz) : NULL;
-  resolve_syms();
-  in_trace = 1;
-  if (alloc_depth > 0) {
-    if (alloc_depth < MAX_ALLOC_DEPTH) alloc_depth++;
-    void* a = real_aligned_alloc(al, sz);
-    alloc_depth--;
-    in_trace = 0;
-    return a;
-  }
-  alloc_depth = 1;
-
-  void* a = real_aligned_alloc(al, sz);
-  if (a) {
-    unsigned long long ip = (unsigned long long)__builtin_return_address(0);
-    if (size_is_reasonable(sz) && caller_ip_is_valid(ip)) {
-      write_rec(TYPE_MALLOC, sz, al, (unsigned long long)a, ip);
-    }
-    track_add((unsigned long long)a);
-  }
-  alloc_depth = 0;
-  in_trace = 0;
-  return a;
-}
-
-void* memalign(size_t al, size_t sz) {
-  if (in_trace) return real_memalign ? real_memalign(al, sz) : NULL;
-  resolve_syms();
-  in_trace = 1;
-  if (alloc_depth > 0) {
-    if (alloc_depth < MAX_ALLOC_DEPTH) alloc_depth++;
-    void* a = real_memalign(al, sz);
-    alloc_depth--;
-    in_trace = 0;
-    return a;
-  }
-  alloc_depth = 1;
-
-  void* a = real_memalign(al, sz);
-  if (a) {
-    unsigned long long ip = (unsigned long long)__builtin_return_address(0);
-    if (size_is_reasonable(sz) && caller_ip_is_valid(ip)) {
-      write_rec(TYPE_MALLOC, sz, al, (unsigned long long)a, ip);
-    }
-    track_add((unsigned long long)a);
-  }
-  alloc_depth = 0;
-  in_trace = 0;
-  return a;
-}
-
-/* C++ operators */
-void* _Znwm(size_t sz) {
-  if (in_trace) return real_new ? real_new(sz) : NULL;
-  resolve_syms();
-  in_trace = 1;
-  if (alloc_depth > 0) {
-    if (alloc_depth < MAX_ALLOC_DEPTH) alloc_depth++;
-    void* a = real_new(sz);
-    alloc_depth--;
-    in_trace = 0;
-    return a;
-  }
-  alloc_depth = 1;
-
-  void* a = real_new(sz);
-  if (a) {
-    unsigned long long ip = (unsigned long long)__builtin_return_address(0);
-    if (size_is_reasonable(sz) && caller_ip_is_valid(ip)) {
-      write_rec(TYPE_MALLOC, sz, 0, (unsigned long long)a, ip);
-    }
-    track_add((unsigned long long)a);
-  }
-  alloc_depth = 0;
-  in_trace = 0;
-  return a;
-}
-
-void* _Znam(size_t sz) {
-  if (in_trace) return real_new_arr ? real_new_arr(sz) : NULL;
-  resolve_syms();
-  in_trace = 1;
-  if (alloc_depth > 0) {
-    if (alloc_depth < MAX_ALLOC_DEPTH) alloc_depth++;
-    void* a = real_new_arr(sz);
-    alloc_depth--;
-    in_trace = 0;
-    return a;
-  }
-  alloc_depth = 1;
-
-  void* a = real_new_arr(sz);
-  if (a) {
-    unsigned long long ip = (unsigned long long)__builtin_return_address(0);
-    if (size_is_reasonable(sz) && caller_ip_is_valid(ip)) {
-      write_rec(TYPE_MALLOC, sz, 0, (unsigned long long)a, ip);
-    }
-    track_add((unsigned long long)a);
-  }
-  alloc_depth = 0;
-  in_trace = 0;
-  return a;
-}
-
-void _ZdlPv(void* p) {
-  if (!p) return;
-  if (in_trace) { if (real_delete) real_delete(p); return; }
-  resolve_syms();
-  in_trace = 1;
-  if (track_contains((unsigned long long)p)) {
-    write_rec(TYPE_FREE, (unsigned long long)p, 0, 0,
-              (unsigned long long)__builtin_return_address(0));
-    track_erase((unsigned long long)p);
-  }
-  real_delete(p);
-  in_trace = 0;
-}
-
-void _ZdaPv(void* p) {
-  if (!p) return;
-  if (in_trace) { if (real_delete_arr) real_delete_arr(p); return; }
-  resolve_syms();
-  in_trace = 1;
-  if (track_contains((unsigned long long)p)) {
-    write_rec(TYPE_FREE, (unsigned long long)p, 0, 0,
-              (unsigned long long)__builtin_return_address(0));
-    track_erase((unsigned long long)p);
-  }
-  real_delete_arr(p);
-  in_trace = 0;
-}
-
 /* mmap / munmap */
 void* mmap(void* a, size_t l, int p, int f, int fd, off_t o) {
   if (in_trace) return real_mmap ? real_mmap(a, l, p, f, fd, o) : MAP_FAILED;
   resolve_syms();
   in_trace = 1;
-
-  // Only intercept anonymous mmap (MAP_ANONYMOUS), matching PIN tracer behavior.
-  // Non-anonymous (file-backed) mmaps are forwarded directly without recording.
-  if (!(f & MAP_ANONYMOUS)) {
-    void* r = real_mmap(a, l, p, f, fd, o);
-    in_trace = 0;
-    return r;
-  }
 
   if (alloc_depth > 0) {
     void* r = real_mmap(a, l, p, f, fd, o);
@@ -481,6 +312,80 @@ void* mmap(void* a, size_t l, int p, int f, int fd, off_t o) {
   return r;
 }
 
+void* mmap64(void* a, size_t l, int p, int f, int fd, off64_t o) {
+  if (in_trace) return real_mmap64 ? real_mmap64(a, l, p, f, fd, o) : MAP_FAILED;
+  resolve_syms();
+  in_trace = 1;
+
+  if (alloc_depth > 0) {
+    void* r = real_mmap64(a, l, p, f, fd, o);
+    in_trace = 0;
+    return r;
+  }
+
+  if (mmap_depth > 0) {
+    if (mmap_depth < MAX_MMAP_DEPTH) mmap_depth++;
+    void* r = real_mmap64(a, l, p, f, fd, o);
+    if (mmap_depth > 0) mmap_depth--;
+    in_trace = 0;
+    return r;
+  }
+  mmap_depth = 1;
+  mmap_pending_size = l;
+  mmap_pending_caller_ip = (unsigned long long)__builtin_return_address(0);
+
+  void* r = real_mmap64(a, l, p, f, fd, o);
+  if (r != MAP_FAILED) {
+    write_rec(TYPE_MMAP64, l, 0, (unsigned long long)r, mmap_pending_caller_ip);
+    track_add((unsigned long long)r);
+  }
+  mmap_depth = 0;
+  in_trace = 0;
+  return r;
+}
+
+void* mremap(void* old_addr, size_t old_len, size_t new_len, int flags, ...) {
+  if (in_trace) return real_mremap ? real_mremap(old_addr, old_len, new_len, flags) : MAP_FAILED;
+  resolve_syms();
+  in_trace = 1;
+
+  va_list ap;
+  va_start(ap, flags);
+  void* new_addr = (flags & MREMAP_FIXED) ? va_arg(ap, void*) : NULL;
+  va_end(ap);
+
+  if (alloc_depth > 0) {
+    void* r = real_mremap(old_addr, old_len, new_len, flags, new_addr);
+    in_trace = 0;
+    return r;
+  }
+
+  if (mmap_depth > 0) {
+    if (mmap_depth < MAX_MMAP_DEPTH) mmap_depth++;
+    void* r = real_mremap(old_addr, old_len, new_len, flags, new_addr);
+    if (mmap_depth > 0) mmap_depth--;
+    in_trace = 0;
+    return r;
+  }
+  mmap_depth = 1;
+  mmap_pending_size = new_len;
+  mmap_pending_old_addr = (unsigned long long)old_addr;
+  mmap_pending_old_len = old_len;
+  mmap_pending_caller_ip = (unsigned long long)__builtin_return_address(0);
+
+  void* r = real_mremap(old_addr, old_len, new_len, flags, new_addr);
+  if (r != MAP_FAILED) {
+    write_rec(TYPE_MREMAP, (unsigned long long)old_addr, old_len, (unsigned long long)r, mmap_pending_caller_ip);
+    track_add((unsigned long long)r);
+    if (mmap_pending_old_addr != 0) {
+      track_erase(mmap_pending_old_addr);
+    }
+  }
+  mmap_depth = 0;
+  in_trace = 0;
+  return r;
+}
+
 int munmap(void* a, size_t l) {
   if (in_trace) return real_munmap ? real_munmap(a, l) : -1;
   resolve_syms();
@@ -496,24 +401,22 @@ int munmap(void* a, size_t l) {
 }
 
 // --- __libc_start_main intercept ---
-// Emit a main-begin marker (type=8) at the entry of main() itself,
+// Emit a main-begin marker (type=9) at the entry of main() itself,
 // matching PIN tracer behavior (PIN instruments the main function).
-// This way, init-phase allocations (global constructors, etc.) are
-// still recorded in the trace but will be skipped by the analyzer.
 
 // Store the original main pointer so main_wrapper can call it
 static int (*g_real_main)(int, char**, char**) = NULL;
 
 // Wrapper for main(): resets depth counters (like PIN ResetDepthOnMain),
-// then writes type=8 marker, then calls real main()
+// then writes type=9 marker, then calls real main()
 static int main_wrapper(int argc, char** argv, char** envp)
 {
   // Reset depth counters: glibc init may have left them non-zero
   alloc_depth = 0;
   mmap_depth = 0;
 
-  // Emit type=8 marker: user's main() has started
-  write_rec(8, 0, 0, 0, 0);
+  // Emit type=9 marker: user's main() has started
+  write_rec(9, 0, 0, 0, 0);
 
   // Call the real main (stored by __libc_start_main)
   return g_real_main(argc, argv, envp);
@@ -530,6 +433,6 @@ extern "C" int __libc_start_main(int (*main)(int,char**,char**), int argc, char 
   g_real_main = main;
 
   // Call the real __libc_start_main with our wrapper instead of main
-  // The wrapper will emit type=8 marker at main() entry
+  // The wrapper will emit type=9 marker at main() entry
   return real_libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
 }

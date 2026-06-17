@@ -15,9 +15,9 @@
  */
 
 /*! @file
- * Object Tracer — allocation events with caller IP.
- * 7 base type codes; allocator-variant symbols (mi/je/tc, C++ new/delete)
- * are all mapped to their corresponding base type.
+ *  Object Tracer — allocation events with caller IP.
+ *  9 type codes aligned with champsim_tracer.cpp:
+ *  1=malloc,2=calloc,3=realloc,4=free,5=mmap,6=mmap64,7=mremap,8=munmap,9=main_begin
  */
 
 #include <fstream>
@@ -31,16 +31,18 @@
 #include "pin.H"
 
 /* ===================================================================== */
-// Malloc type codes (7 base types)
+// Malloc type codes (9 types)
 /* ===================================================================== */
 enum MallocType : unsigned char {
   TYPE_MALLOC         = 1,
-  TYPE_FREE           = 2,
-  TYPE_CALLOC         = 3,
-  TYPE_REALLOC        = 4,
-  TYPE_POSIX_MEMALIGN = 5,
-  TYPE_MMAP           = 6,
-  TYPE_MUNMAP         = 7,
+  TYPE_CALLOC         = 2,
+  TYPE_REALLOC        = 3,
+  TYPE_FREE           = 4,
+  TYPE_MMAP           = 5,
+  TYPE_MMAP64         = 6,
+  TYPE_MREMAP         = 7,
+  TYPE_MUNMAP         = 8,
+  TYPE_MAIN_BEGIN     = 9,
 };
 
 /* ===================================================================== */
@@ -76,7 +78,6 @@ struct PendingAlloc {
   ADDRINT size = 0;
   ADDRINT arg2 = 0;
   int type = 0;
-  ADDRINT posix_memptr = 0;
   ADDRINT caller_ip = 0;
 };
 
@@ -116,7 +117,7 @@ KNOB<std::string> KnobMallocOutputFile(KNOB_MODE_WRITEONCE, "pintool", "m", "mal
 /* ===================================================================== */
 INT32 Usage()
 {
-  std::cerr << "Object Tracer — allocation trace with caller IP. 7 base types." << std::endl
+  std::cerr << "Object Tracer — allocation trace with caller IP. 9 types." << std::endl
             << "Usage: pin -t object_tracer.so -m malloc.bin -- <program>" << std::endl;
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
   return -1;
@@ -125,14 +126,16 @@ INT32 Usage()
 static const char* type_name(unsigned char t)
 {
   switch (t) {
-    case TYPE_MALLOC:         return "malloc/new";
-    case TYPE_FREE:           return "free/delete";
-    case TYPE_CALLOC:         return "calloc";
-    case TYPE_REALLOC:        return "realloc";
-    case TYPE_POSIX_MEMALIGN: return "posix_memalign";
-    case TYPE_MMAP:           return "mmap";
-    case TYPE_MUNMAP:         return "munmap";
-    default:                  return "UNKNOWN";
+    case TYPE_MALLOC:    return "malloc";
+    case TYPE_CALLOC:    return "calloc";
+    case TYPE_REALLOC:   return "realloc";
+    case TYPE_FREE:      return "free";
+    case TYPE_MMAP:      return "mmap";
+    case TYPE_MMAP64:    return "mmap64";
+    case TYPE_MREMAP:    return "mremap";
+    case TYPE_MUNMAP:    return "munmap";
+    case TYPE_MAIN_BEGIN: return "main-begin";
+    default:             return "UNKNOWN";
   }
 }
 
@@ -166,7 +169,7 @@ static bool depth_outermost_before(ThreadState* ts, int alloc_type,
     return false;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, arg2, alloc_type, 0, caller_ip};
+  ts->pending = PendingAlloc{size, arg2, alloc_type, caller_ip};
   return true;
 }
 
@@ -203,7 +206,13 @@ VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size, UINT32 alloc_type, ADDRINT
     return;
   }
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{old_ptr, new_size, (int)alloc_type, 0, caller_ip};
+  ts->pending = PendingAlloc{old_ptr, new_size, (int)alloc_type, caller_ip};
+}
+
+// Helper: record a free event
+static void record_free_event(unsigned long long ptr, unsigned long long caller_ip)
+{
+  write_malloc_instr_locked(TYPE_FREE, ptr, 0, 0, caller_ip);
 }
 
 VOID AllocAfter(ADDRINT ret)
@@ -220,9 +229,20 @@ VOID AllocAfter(ADDRINT ret)
   if (alloc_type == TYPE_REALLOC) {
     ADDRINT old_ptr = ts->pending.size;
     ADDRINT new_size = ts->pending.arg2;
-    write_malloc_instr_locked((unsigned char)alloc_type, old_ptr, new_size, ret, ts->pending.caller_ip);
-    if (old_ptr != 0) tracked_addresses.erase(old_ptr);
-    if (ret != 0 && ret != (ADDRINT)-1) tracked_addresses.insert(ret);
+
+    if (new_size == 0 && old_ptr != 0) {
+      // realloc(ptr, 0) = free(ptr) — record as TYPE_FREE
+      tracked_addresses.erase(old_ptr);
+      record_free_event((unsigned long long)old_ptr, (unsigned long long)ts->pending.caller_ip);
+    } else if (ret != 0 && ret != (ADDRINT)-1) {
+      // Successful realloc
+      if (old_ptr != 0) {
+        tracked_addresses.erase(old_ptr);
+      }
+      write_malloc_instr_locked((unsigned char)alloc_type, old_ptr, new_size, ret, ts->pending.caller_ip);
+      tracked_addresses.insert(ret);
+    }
+    // realloc failure: do nothing, old_ptr remains tracked
   } else {
     if (ret != 0 && ret != (ADDRINT)-1) {
       write_malloc_instr_locked((unsigned char)alloc_type,
@@ -231,38 +251,6 @@ VOID AllocAfter(ADDRINT ret)
     }
   }
   PIN_ReleaseLock(&malloc_lock);
-}
-
-VOID PosixMemalignBefore(ADDRINT memptr, ADDRINT alignment, ADDRINT size, ADDRINT caller_ip)
-{
-  ThreadState* ts = get_tls();
-  if (ts->alloc_depth > 0) {
-    if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
-    else ts->alloc_overflow++;
-    return;
-  }
-  ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, alignment, TYPE_POSIX_MEMALIGN, memptr, caller_ip};
-}
-
-VOID PosixMemalignAfter(ADDRINT status)
-{
-  ThreadState* ts = get_tls();
-  if (ts->alloc_overflow > 0) { ts->alloc_overflow--; return; }
-  if (ts->alloc_depth == 0) return;
-  if (ts->alloc_depth > 1) { ts->alloc_depth--; return; }
-  ts->alloc_depth = 0;
-
-  if (status == 0 && ts->pending.posix_memptr != 0) {
-    ADDRINT real_addr = 0;
-    PIN_SafeCopy(&real_addr, (void*)ts->pending.posix_memptr, sizeof(ADDRINT));
-    if (real_addr != 0 && real_addr != (ADDRINT)-1) {
-      PIN_GetLock(&malloc_lock, PIN_ThreadId());
-      write_malloc_instr_locked(TYPE_POSIX_MEMALIGN, ts->pending.size, ts->pending.arg2, real_addr, ts->pending.caller_ip);
-      tracked_addresses.insert(real_addr);
-      PIN_ReleaseLock(&malloc_lock);
-    }
-  }
 }
 
 VOID FreeBefore(ADDRINT ptr, UINT32 free_type, ADDRINT caller_ip)
@@ -281,7 +269,6 @@ VOID FreeAfter() { /* no-op */ }
 
 VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT caller_ip)
 {
-  if (!(flags & MAP_ANONYMOUS)) return;
   ThreadState* ts = get_tls();
   // Skip if we're inside a malloc/calloc/realloc — this mmap is an internal glibc detail
   if (ts->alloc_depth > 0) return;
@@ -311,6 +298,41 @@ VOID MmapAfter(ADDRINT ret)
   }
 }
 
+VOID MremapBefore(ADDRINT old_addr, ADDRINT old_len, ADDRINT new_len, ADDRINT flags, ADDRINT caller_ip)
+{
+  ThreadState* ts = get_tls();
+  if (ts->alloc_depth > 0) return;
+  if (ts->mmap_depth > 0) {
+    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
+    else ts->mmap_overflow++;
+    return;
+  }
+  ts->mmap_depth = 1;
+  ts->mmap_pending_size = new_len;
+  ts->pending.size = old_addr;
+  ts->pending.arg2 = old_len;
+  ts->pending.caller_ip = caller_ip;
+}
+
+VOID MremapAfter(ADDRINT ret)
+{
+  ThreadState* ts = get_tls();
+  if (ts->mmap_overflow > 0) { ts->mmap_overflow--; return; }
+  if (ts->mmap_depth == 0) return;
+  if (ts->mmap_depth > 1) { ts->mmap_depth--; return; }
+  ts->mmap_depth = 0;
+
+  if (ret != 0 && ret != (ADDRINT)-1) {
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    write_malloc_instr_locked(TYPE_MREMAP, ts->pending.size, ts->pending.arg2, ret, ts->pending.caller_ip);
+    tracked_addresses.insert(ret);
+    if (ts->pending.size != 0) {
+      tracked_addresses.erase(ts->pending.size);
+    }
+    PIN_ReleaseLock(&malloc_lock);
+  }
+}
+
 VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT caller_ip)
 {
   if (addr == 0 || addr == (ADDRINT)-1) return;
@@ -328,7 +350,7 @@ VOID MunmapAfter() { /* no-op */ }
 VOID ResetDepthOnMain();
 
 /* ===================================================================== */
-// ImageLoad — symbol registration (7 base types + alias variants)
+// ImageLoad — symbol registration (8 core functions)
 /* ===================================================================== */
 struct SymbolHook {
   const char* name;
@@ -337,22 +359,14 @@ struct SymbolHook {
 };
 
 static const SymbolHook all_symbols[] = {
-  // malloc-like (type 1)
+  // malloc (type 1)
   {"malloc",                          TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"_Znwm",                           TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"_Znam",                           TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"_ZnwmSt11align_val_t",            TYPE_MALLOC,     SymbolHook::MALLOC},
-  {"_ZnamSt11align_val_t",            TYPE_MALLOC,     SymbolHook::MALLOC},
-  // calloc (type 3)
+  // calloc (type 2)
   {"calloc",                          TYPE_CALLOC,     SymbolHook::CALLOC},
-  // realloc (type 4)
+  // realloc (type 3)
   {"realloc",                         TYPE_REALLOC,    SymbolHook::REALLOC},
-  // free-like (type 2)
+  // free (type 4)
   {"free",                            TYPE_FREE,       SymbolHook::FREE},
-  {"_ZdlPv",                          TYPE_FREE,       SymbolHook::FREE},
-  {"_ZdaPv",                          TYPE_FREE,       SymbolHook::FREE},
-  {"_ZdlPvSt11align_val_t",           TYPE_FREE,       SymbolHook::FREE},
-  {"_ZdaPvSt11align_val_t",           TYPE_FREE,       SymbolHook::FREE},
 };
 
 VOID ImageLoad(IMG img, VOID* v)
@@ -360,42 +374,7 @@ VOID ImageLoad(IMG img, VOID* v)
   if (!IMG_Valid(img)) return;
   RTN rtn;
 
-  rtn = RTN_FindByName(img, "posix_memalign");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)PosixMemalignBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)PosixMemalignAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  rtn = RTN_FindByName(img, "mmap");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  rtn = RTN_FindByName(img, "munmap");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
-    RTN_Close(rtn);
-  }
-
+  // malloc/calloc/realloc/free
   for (const auto& sym : all_symbols) {
     rtn = RTN_FindByName(img, sym.name);
     if (!RTN_Valid(rtn)) continue;
@@ -438,6 +417,59 @@ VOID ImageLoad(IMG img, VOID* v)
     RTN_Close(rtn);
   }
 
+  // mmap
+  rtn = RTN_FindByName(img, "mmap");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                   IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // munmap
+  rtn = RTN_FindByName(img, "munmap");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // mmap64
+  rtn = RTN_FindByName(img, "mmap64");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                   IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
+  // mremap
+  rtn = RTN_FindByName(img, "mremap");
+  if (RTN_Valid(rtn)) {
+    RTN_Open(rtn);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MremapBefore,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                   IARG_RETURN_IP, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MremapAfter,
+                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+    RTN_Close(rtn);
+  }
+
   for (const char* entry : {"main", "MAIN__", "main_"}) {
     rtn = RTN_FindByName(img, entry);
     if (RTN_Valid(rtn)) {
@@ -447,7 +479,7 @@ VOID ImageLoad(IMG img, VOID* v)
     }
   }
 
-  std::cout << "[Object Tracer v5] Instrumented: " << IMG_Name(img) << std::endl;
+  std::cout << "[Object Tracer] Instrumented: " << IMG_Name(img) << std::endl;
 }
 
 VOID ResetDepthOnMain()
@@ -456,22 +488,22 @@ VOID ResetDepthOnMain()
   ts->alloc_depth = 0; ts->alloc_overflow = 0;
   ts->mmap_depth = 0; ts->mmap_overflow = 0;
 
-  // Emit a main-begin marker (type=8) into the trace
-  write_malloc_instr_locked(8, 0, 0, 0, 0);
+  // Emit a main-begin marker (type=9) into the trace
+  write_malloc_instr_locked(TYPE_MAIN_BEGIN, 0, 0, 0, 0);
 }
 
 /* ===================================================================== */
 VOID Fini(INT32 code, VOID* v)
 {
   malloc_binfile.close();
-  std::cout << "\n[Object Tracer v5] === Type Statistics ===" << std::endl;
+  std::cout << "\n[Object Tracer] === Type Statistics ===" << std::endl;
   unsigned long long total = 0;
   for (const auto& [t, count] : type_counts) {
     std::cout << "  type " << (int)t << " (" << type_name(t) << "): " << count << std::endl;
     total += count;
   }
   std::cout << "  TOTAL: " << total << " records" << std::endl;
-  std::cout << "[Object Tracer v5] Active tracked: " << tracked_addresses.size() << std::endl;
+  std::cout << "[Object Tracer] Active tracked: " << tracked_addresses.size() << std::endl;
 }
 
 /* ===================================================================== */
