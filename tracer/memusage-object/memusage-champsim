@@ -6,7 +6,8 @@
 #
 # Modified to support -c,--champsim-trace=FILE for 40-byte malloc_instr output.
 
-memusageso='./libmemusage-champsim.so'
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+memusageso="$SCRIPT_DIR/libmemusage-champsim.so"
 TEXTDOMAIN=libc
 
 do_usage() {
