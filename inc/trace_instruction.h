@@ -62,28 +62,30 @@ constexpr std::size_t NUM_INSTR_SOURCES = 4;            // Both use 4 source slo
 //   When instr_type == 0 (normal):  unused (value 0)
 //   When instr_type == 1 (branch):  0 = not taken, 1 = taken
 //   When instr_type == 2 (alloc):   allocation type code:
-//      1 = malloc/new    — source_memory[0]: size,
-//                           destination_memory[0]: allocated addr,
-//                           destination_memory[1]: caller IP
-//      2 = free/delete   — source_memory[0]: pointer to free,
-//                           destination_memory[1]: caller IP
-//      3 = calloc        — source_memory[0]: total_size (nmemb x elem_size),
-//                           destination_memory[0]: allocated addr,
-//                           destination_memory[1]: caller IP
-//      4 = realloc       — source_memory[0]: old_ptr,
-//                           source_memory[1]: new_size,
-//                           destination_memory[0]: new_ptr (or same ptr if in-place),
-//                           destination_memory[1]: caller IP
-//      5 = posix_memalign — source_memory[0]: size,
-//                            source_memory[1]: alignment,
-//                            destination_memory[0]: allocated addr,
-//                            destination_memory[1]: caller IP
-//      6 = mmap          — source_memory[0]: length,
-//                           destination_memory[0]: mapped addr,
-//                           destination_memory[1]: caller IP
-//      7 = munmap        — source_memory[0]: addr,
-//                           source_memory[1]: length,
-//                           destination_memory[1]: caller IP
+//      1 = malloc       — source_memory[0]: size,
+//                          destination_memory[0]: allocated addr,
+//                          destination_memory[1]: caller IP
+//      2 = calloc       — source_memory[0]: total_size (nmemb x elem_size),
+//                          destination_memory[0]: allocated addr,
+//                          destination_memory[1]: caller IP
+//      3 = realloc      — source_memory[0]: old_ptr,
+//                          source_memory[1]: new_size,
+//                          destination_memory[0]: new_ptr,
+//                          destination_memory[1]: caller IP
+//      4 = free         — source_memory[0]: pointer to free,
+//                          destination_memory[1]: caller IP
+//      5 = mmap         — source_memory[0]: length,
+//                          destination_memory[0]: mapped addr,
+//                          destination_memory[1]: caller IP
+//      6 = mmap64       — same as mmap (5)
+//      7 = mremap       — source_memory[0]: old_addr,
+//                          source_memory[1]: old_size,
+//                          destination_memory[0]: new_addr,
+//                          destination_memory[1]: caller_ip
+//      8 = munmap       — source_memory[0]: addr,
+//                          source_memory[1]: length,
+//                          destination_memory[1]: caller IP
+//      9 = main-begin   — marker record, all fields 0
 // ==========================================================================
 
 struct input_instr {
