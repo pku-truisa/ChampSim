@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-High-performance low-memory streaming Memory Allocation Trace File Analyzer — v11
+High-performance low-memory streaming Memory Allocation Trace File Analyzer — v12
 v6: Added top-64 largest memory objects tracking with lifetime (alloc/free event count).
 v7: Added automatic legacy format detection + type code remapping for old PIN tracer traces.
 v8: Added automatic 32-byte vs 40-byte record detection for compatibility.
 v9: Removed 32-byte support entirely. Only 40-byte format is supported.
 v10: Added per-caller_ip statistics (alloc count, avg size, total size, avg lifetime).
 v11: Added defensive caller_ip filtering in display: caller_ip <= 4096 grouped as "unknown/invalid".
+v12: Updated type codes to match champsim_tracer.cpp: 1=malloc,2=calloc,3=realloc,4=free,
+     5=mmap,6=mmap64,7=mremap,8=munmap,9=main_begin.
      Format: <QQQQB7s> (arg1, arg2, ret, caller_ip, type, reserved[7])
 """
 
@@ -50,31 +52,33 @@ def format_size(size):
         return "{:.2f} KiB".format(size / 1024)
     return "{} B".format(size)
 
-# ===== 7-type code scheme =====
+# ===== 9-type code scheme (aligned with champsim_tracer.cpp) =====
 TYPE_MAP = {
-    1: 'malloc/new',
-    2: 'free/delete',
-    3: 'calloc',
-    4: 'realloc',
-    5: 'posix_memalign',
-    6: 'mmap',
-    7: 'munmap',
-    8: 'main_begin',
+    1: 'malloc',
+    2: 'calloc',
+    3: 'realloc',
+    4: 'free',
+    5: 'mmap',
+    6: 'mmap64',
+    7: 'mremap',
+    8: 'munmap',
+    9: 'main_begin',
 }
 
-_ALLOC_TYPES = {1, 3, 4, 5, 6}
-_FREE_TYPES = {2, 7}
+_ALLOC_TYPES = {1, 2, 3, 5, 6, 7}
+_FREE_TYPES = {4, 8}
 
 _ALLOC_GROUPS = [
-    ("malloc/new",    [1]),
-    ("calloc",        [3]),
-    ("realloc",       [4]),
-    ("posix_memalign", [5]),
-    ("mmap",          [6]),
+    ("malloc",        [1]),
+    ("calloc",        [2]),
+    ("realloc",       [3]),
+    ("mmap",          [5]),
+    ("mmap64",        [6]),
+    ("mremap",        [7]),
 ]
 _FREE_GROUPS = [
-    ("free/delete",   [2]),
-    ("munmap",        [7]),
+    ("free",          [4]),
+    ("munmap",        [8]),
 ]
 
 # 40-byte format: <QQQQB7s> (arg1, arg2, ret, caller_ip, type, reserved[7])
@@ -155,7 +159,7 @@ def _maybe_add_candidate(candidate_heap, candidate_info, size, ptr, alloc_event,
 
     return False
 
-def process_malloc_binary(filename, objects_path=None):
+def process_malloc_binary(filename, objects_path=None, from_main=False):
     func_stats = {k: 0 for k in TYPE_MAP.values()}
     active_heap = {}
 
@@ -180,8 +184,8 @@ def process_malloc_binary(filename, objects_path=None):
     caller_stats = {}
     invalid_caller_count = 0  # counter for caller_ip <= INVALID_CALLER_IP_MAX
 
-    # main_begin marker handling: skip all events before type=8 marker
-    in_main = False
+    # main_begin marker handling: if from_main=True, skip events before type=9 marker
+    in_main = not from_main
     saw_main_begin = False
 
     print("Streaming processing data to minimize memory footprint...")
@@ -190,28 +194,30 @@ def process_malloc_binary(filename, objects_path=None):
         event_counter += 1
         func_name = TYPE_MAP.get(etype, 'unknown')
 
-        # Check for main_begin marker (type=8)
-        if etype == 8:
-            # Reset all analysis state so we only count events after main()
-            func_stats = {k: 0 for k in TYPE_MAP.values()}
-            active_heap.clear()
-            current_sizes = [0] * n
-            peak_sizes = [0] * n
-            peak_moment_sizes = [0] * n
-            threshold_object_counts = [0] * n
-            current_ge_counts = [0] * n
-            peak_moment_ge_counts = [0] * n
-            original_current_size = 0
-            original_peak_size = 0
-            all_large_objects.clear()
-            event_counter = 0
-            candidate_heap.clear()
-            candidate_info.clear()
-            caller_stats.clear()
-            invalid_caller_count = 0
-            in_main = True
-            saw_main_begin = True
-            continue  # skip the marker itself (don't treat as alloc/free)
+        # Check for main_begin marker (type=9)
+        if etype == 9:
+            if from_main:
+                # Reset all analysis state so we only count events after main()
+                func_stats = {k: 0 for k in TYPE_MAP.values()}
+                active_heap.clear()
+                current_sizes = [0] * n
+                peak_sizes = [0] * n
+                peak_moment_sizes = [0] * n
+                threshold_object_counts = [0] * n
+                current_ge_counts = [0] * n
+                peak_moment_ge_counts = [0] * n
+                original_current_size = 0
+                original_peak_size = 0
+                all_large_objects.clear()
+                event_counter = 0
+                candidate_heap.clear()
+                candidate_info.clear()
+                caller_stats.clear()
+                invalid_caller_count = 0
+                in_main = True
+                saw_main_begin = True
+            # skip the marker itself (don't treat as alloc/free)
+            continue
 
         # Before main() is reached, skip all events
         if not in_main:
@@ -219,7 +225,7 @@ def process_malloc_binary(filename, objects_path=None):
 
         if etype in _ALLOC_TYPES:
             func_stats[func_name] += 1
-            size = arg2 if etype == 4 else arg1
+            size = arg2 if etype == 3 else arg1  # realloc (type=3): size in arg2
 
             # Track per-caller_ip stats for allocations
             if caller_ip <= INVALID_CALLER_IP_MAX:
@@ -234,7 +240,8 @@ def process_malloc_binary(filename, objects_path=None):
                 caller_stats[caller_ip]["types"][etype] += 1
 
             if ret != 0:
-                if etype == 4 and arg1 != 0 and arg1 in active_heap:
+                if etype == 3 and arg1 != 0 and arg1 in active_heap:
+                    # realloc: remove old pointer before adding new
                     old_sz, old_alloc_ev, _, old_caller_ip = active_heap.pop(arg1)
                     original_current_size -= old_sz
                     if arg1 in candidate_info:
@@ -372,16 +379,13 @@ def process_malloc_binary(filename, objects_path=None):
 
             # Aggregate invalid caller IPs into one row
             if invalid_caller_count > 0:
-                # We need to get total size and types for invalid entries.
-                # Since we didn't store them individually, we'll note them separately.
                 # Re-scan to collect invalid stats more precisely.
-                # Start by re-reading the file for invalid IP stats only.
                 invalid_tot_sz = 0
                 invalid_types = {}
                 invalid_cnt = 0
                 for etype, arg1, arg2, ret, caller_ip in read_malloc_binary(filename):
                     if caller_ip <= INVALID_CALLER_IP_MAX and etype in _ALLOC_TYPES:
-                        size = arg2 if etype == 4 else arg1
+                        size = arg2 if etype == 3 else arg1
                         invalid_cnt += 1
                         invalid_tot_sz += size
                         if etype not in invalid_types:
@@ -396,6 +400,9 @@ def process_malloc_binary(filename, objects_path=None):
             for ip, info in caller_stats.items():
                 cnt = info["cnt"]
                 tot_sz = info["tot_sz"]
+                # Skip callers with only one allocation and total size < 4KB
+                if cnt == 1 and tot_sz < 4096:
+                    continue
                 tot_lt = info["tot_lt"]
                 avg_sz = tot_sz / cnt if cnt > 0 else 0
                 avg_lt = tot_lt / cnt if cnt > 0 else 0
@@ -441,8 +448,9 @@ def process_malloc_binary(filename, objects_path=None):
         sys.stdout = sys.__stdout__
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v11, 40-byte, caller_ip stats)')
-    parser.add_argument('-i', '--input', required=True, help='Path to malloc.bin or malloc.bin.xz, or "all"')
+    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v12, 40-byte, caller_ip stats, new type codes)')
+    parser.add_argument('input', help='Path to malloc.bin or malloc.bin.xz, or "all"')
+    parser.add_argument('-m', '--from-main', action='store_true', help='Only count events after the main_begin marker (type=9)')
     parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report')
     args = parser.parse_args()
 
@@ -459,7 +467,7 @@ if __name__ == '__main__':
                 base_name = os.path.splitext(os.path.basename(f))[0]
                 if base_name.endswith('.malloc'): base_name = base_name[:-7]
                 objs = base_name + ".objects.log"
-            process_malloc_binary(f, objects_path=objs)
+            process_malloc_binary(f, objects_path=objs, from_main=args.from_main)
         print("\nAll files processed.")
     else:
-        process_malloc_binary(args.input, objects_path=args.objects)
+        process_malloc_binary(args.input, objects_path=args.objects, from_main=args.from_main)
