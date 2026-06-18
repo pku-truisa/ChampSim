@@ -80,6 +80,15 @@ std::unordered_set<ADDRINT> tracked_addresses;
 static std::unordered_map<unsigned char, unsigned long long> type_counts;
 static PIN_LOCK stats_lock;
 
+// Real function pointers (for RTN_ReplaceSignature)
+static void* (*real_malloc)(size_t) = nullptr;
+static void* (*real_calloc)(size_t, size_t) = nullptr;
+static void* (*real_realloc)(void*, size_t) = nullptr;
+static void  (*real_free)(void*) = nullptr;
+static void* (*real_mmap)(void*, size_t, int, int, int, off_t) = nullptr;
+static int   (*real_munmap)(void*, size_t) = nullptr;
+static void* (*real_mremap)(void*, size_t, size_t, int, ...) = nullptr;
+
 // Forward declarations
 VOID insert_analysis_functions(INS ins);
 VOID ResetCurrentInstruction(VOID* ip);
@@ -94,22 +103,12 @@ static PIN_LOCK malloc_lock;
 // Maximum nesting depth before saturation.
 constexpr int MAX_DEPTH = 16;
 
-// Staged parameters held between outermost BEFORE and AFTER.
-struct PendingAlloc {
-  ADDRINT size          = 0;
-  ADDRINT arg2          = 0;   // new_size (realloc) or old_size (mremap)
-  int     type          = 0;
-  ADDRINT caller_ip     = 0;   // return address (caller IP)
-};
-
 struct ThreadState {
-  PendingAlloc pending;
   int alloc_depth         = 0;  // 0 = idle, 1 = outermost, 2..MAX_DEPTH = nested
   int alloc_overflow      = 0;  // counts lost AFTER frames beyond MAX_DEPTH
   int alloc_stuck_counter = 0;  // auto-reset when depth stays non-zero too long
 
   // mmap has its own independent depth tracking
-  ADDRINT mmap_pending_size  = 0;
   int     mmap_depth         = 0;
   int     mmap_overflow      = 0;
   int     mmap_stuck_counter = 0;
@@ -613,30 +612,6 @@ static const char* malloc_type_name(unsigned char t)
   }
 }
 
-/* Map fine-grained type (1-9) to coarse type used by instruction trace instr_info field. */
-static unsigned char coarse_type(unsigned char fine_type)
-{
-  return fine_type;  // 1:1 mapping, type code is the coarse type
-}
-
-// --- Helper: outermost BEFORE for depth-protected alloc family ---
-static bool depth_outermost_before(ThreadState* ts, int alloc_type,
-                                   ADDRINT size, ADDRINT caller_ip, ADDRINT arg2 = 0)
-{
-  if (ts->alloc_depth > 0) {
-    if (ts->alloc_depth < MAX_DEPTH) {
-      ts->alloc_depth++;      // nested — count but don't stage
-    } else {
-      ts->alloc_overflow++;   // push overflow to keep AFTER pairing
-    }
-    return false;             // not outermost
-  }
-  // Outermost: stage parameters
-  ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{size, arg2, alloc_type, caller_ip};
-  return true;
-}
-
 // --- Stuck-depth auto-reset ---
 static void try_auto_reset_depth(ThreadState* ts)
 {
@@ -653,40 +628,272 @@ static void try_auto_reset_depth(ThreadState* ts)
   }
 }
 
-// --- MALLOC (type=1) ---
-VOID AllocBefore(ADDRINT size, UINT32 alloc_type, ADDRINT caller_ip)
+// =========================================================================
+// Wrapper functions (RTN_ReplaceSignature) — from malloctrace methodology
+//
+// These functions replace the real_* functions at the instruction level,
+// ensuring we capture the return value even when the function is optimized
+// to not have a proper return instruction (e.g., tail-call optimized calloc).
+// Depth tracking is maintained to suppress glibc-internal recursive calls.
+// =========================================================================
+
+// --- Helper: record an allocation event from a wrapper function ---
+// Called inside NewMalloc, NewCalloc, NewRealloc, NewMmap, NewMremap, etc.
+// Handles: compat_mode (skip), embedded_alloc_mode (pending_instr_malloc),
+// alloc_only_mode (write 40-byte record), and tracked_addresses update.
+static void wrapper_record_alloc(unsigned char mtype,
+                                 unsigned long long arg1,
+                                 unsigned long long arg2,
+                                 ADDRINT ret,
+                                 ADDRINT size_for_tracking,
+                                 unsigned char coarse_for_tracking,
+                                 ADDRINT caller_ip)
 {
-  if (trace_limit_reached) return;
-  ThreadState* ts = get_tls();
-  try_auto_reset_depth(ts);
-  depth_outermost_before(ts, (int)alloc_type, size, caller_ip);
+  if (compat_mode) return;
+  if (ret == 0 || ret == (ADDRINT)-1) return;
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+  record_alloc_event(mtype, arg1, arg2, (unsigned long long)ret,
+                     size_for_tracking, coarse_for_tracking,
+                     (unsigned long long)caller_ip);
+  tracked_addresses.insert(ret);
+  PIN_ReleaseLock(&malloc_lock);
 }
 
-// --- CALLOC (type=2) ---
-VOID CallocBefore(ADDRINT nmemb, ADDRINT elem_size, UINT32 alloc_type, ADDRINT caller_ip)
+// --- NEW MALLOC (type=1) ---
+static void* NewMalloc(size_t size, ADDRINT caller_ip)
 {
-  if (trace_limit_reached) return;
   ThreadState* ts = get_tls();
   try_auto_reset_depth(ts);
-  depth_outermost_before(ts, (int)alloc_type, nmemb * elem_size, caller_ip);
-}
 
-// --- REALLOC (type=3) ---
-VOID ReallocBefore(ADDRINT old_ptr, ADDRINT new_size, UINT32 alloc_type, ADDRINT caller_ip)
-{
-  if (trace_limit_reached) return;
-  ThreadState* ts = get_tls();
-  try_auto_reset_depth(ts);
+  // Inside a nested alloc call: pass through without recording
   if (ts->alloc_depth > 0) {
     if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
     else ts->alloc_overflow++;
-    return;
+    return real_malloc(size);
   }
+
+  // Outermost: track depth and call real function
   ts->alloc_depth = 1;
-  ts->pending = PendingAlloc{old_ptr, new_size, (int)alloc_type, caller_ip};
+  void* ret = real_malloc(size);
+  ts->alloc_depth = 0;
+
+  wrapper_record_alloc(1, (unsigned long long)size, 0,
+                       (ADDRINT)ret, (ADDRINT)size, 1, caller_ip);
+  return ret;
 }
 
-// Helper: record an allocation event (used by both embedded and alloc-only modes)
+// --- NEW CALLOC (type=2) ---
+static void* NewCalloc(size_t nmemb, size_t elem_size, ADDRINT caller_ip)
+{
+  ThreadState* ts = get_tls();
+  try_auto_reset_depth(ts);
+
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
+    else ts->alloc_overflow++;
+    return real_calloc(nmemb, elem_size);
+  }
+
+  ts->alloc_depth = 1;
+  void* ret = real_calloc(nmemb, elem_size);
+  ts->alloc_depth = 0;
+
+  wrapper_record_alloc(2, (unsigned long long)nmemb, (unsigned long long)elem_size,
+                       (ADDRINT)ret, (ADDRINT)(nmemb * elem_size), 2, caller_ip);
+  return ret;
+}
+
+// --- NEW REALLOC (type=3) ---
+// Handles realloc(ptr, 0) → free(ptr) as type=4, realloc(NULL, size) → malloc(size),
+// and normal realloc.
+static void* NewRealloc(void* ptr, size_t new_size, ADDRINT caller_ip)
+{
+  ThreadState* ts = get_tls();
+  try_auto_reset_depth(ts);
+
+  if (ts->alloc_depth > 0) {
+    if (ts->alloc_depth < MAX_DEPTH) ts->alloc_depth++;
+    else ts->alloc_overflow++;
+    return real_realloc(ptr, new_size);
+  }
+
+  ts->alloc_depth = 1;
+  void* ret = real_realloc(ptr, new_size);
+  ts->alloc_depth = 0;
+
+  if (compat_mode) return ret;
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+
+  ADDRINT old_ptr = (ADDRINT)ptr;
+
+  if (new_size == 0 && old_ptr != 0) {
+    // realloc(ptr, 0) = free(ptr) — record as free (type=4)
+    tracked_allocations.erase(old_ptr);
+    tracked_addresses.erase(old_ptr);
+    record_free_event((unsigned long long)old_ptr, (unsigned long long)caller_ip);
+  } else if (ret != nullptr && ret != (void*)-1) {
+    // Successful realloc
+    if (old_ptr != 0) {
+      tracked_allocations.erase(old_ptr);
+      tracked_addresses.erase(old_ptr);
+    }
+    record_alloc_event(3, (unsigned long long)old_ptr, (unsigned long long)new_size,
+                       (unsigned long long)ret, (ADDRINT)new_size, 3,
+                       (unsigned long long)caller_ip);
+    tracked_addresses.insert((ADDRINT)ret);
+  }
+
+  PIN_ReleaseLock(&malloc_lock);
+  return ret;
+}
+
+// --- NEW FREE (type=4) — only free if address is tracked ---
+static void NewFree(void* ptr, ADDRINT caller_ip)
+{
+  if (ptr == nullptr || compat_mode) {
+    real_free(ptr);
+    return;
+  }
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+  ADDRINT addr = (ADDRINT)ptr;
+  auto it = tracked_addresses.find(addr);
+  if (it != tracked_addresses.end()) {
+    record_free_event((unsigned long long)addr, (unsigned long long)caller_ip);
+    tracked_addresses.erase(it);
+    tracked_allocations.erase(addr);
+  }
+  PIN_ReleaseLock(&malloc_lock);
+
+  real_free(ptr);
+}
+
+// --- NEW MMAP (type=5) ---
+static void* NewMmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset, ADDRINT caller_ip)
+{
+  ThreadState* ts = get_tls();
+
+  // Skip if we're inside a malloc/calloc/realloc — this mmap is an internal glibc detail
+  if (ts->alloc_depth > 0) {
+    return real_mmap(addr, length, prot, flags, fd, offset);
+  }
+
+  if (ts->mmap_depth > 0) {
+    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
+    else ts->mmap_overflow++;
+    return real_mmap(addr, length, prot, flags, fd, offset);
+  }
+
+  ts->mmap_depth = 1;
+  void* ret = real_mmap(addr, length, prot, flags, fd, offset);
+  ts->mmap_depth = 0;
+
+  if (ret != MAP_FAILED && !compat_mode) {
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    record_alloc_event(5, (unsigned long long)length, 0, (unsigned long long)ret,
+                       (ADDRINT)length, 5, (unsigned long long)caller_ip);
+    tracked_addresses.insert((ADDRINT)ret);
+    PIN_ReleaseLock(&malloc_lock);
+  }
+  return ret;
+}
+
+// --- NEW MMAP64 (type=6) ---
+static void* NewMmap64(void* addr, size_t length, int prot, int flags, int fd, off_t offset, ADDRINT caller_ip)
+{
+  ThreadState* ts = get_tls();
+
+  // Skip if we're inside a malloc/calloc/realloc
+  if (ts->alloc_depth > 0) {
+    return real_mmap(addr, length, prot, flags, fd, offset);
+  }
+
+  if (ts->mmap_depth > 0) {
+    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
+    else ts->mmap_overflow++;
+    return real_mmap(addr, length, prot, flags, fd, offset);
+  }
+
+  ts->mmap_depth = 1;
+  void* ret = real_mmap(addr, length, prot, flags, fd, offset);
+  ts->mmap_depth = 0;
+
+  if (ret != MAP_FAILED && !compat_mode) {
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    record_alloc_event(6, (unsigned long long)length, 0, (unsigned long long)ret,
+                       (ADDRINT)length, 6, (unsigned long long)caller_ip);
+    tracked_addresses.insert((ADDRINT)ret);
+    PIN_ReleaseLock(&malloc_lock);
+  }
+  return ret;
+}
+
+// --- NEW MREMAP (type=7) ---
+static void* NewMremap(void* old_addr, size_t old_size, size_t new_size, int flags, void* new_addr, ADDRINT caller_ip)
+{
+  ThreadState* ts = get_tls();
+
+  // Skip if we're inside a malloc/calloc/realloc
+  if (ts->alloc_depth > 0) {
+    return real_mremap(old_addr, old_size, new_size, flags, new_addr);
+  }
+
+  if (ts->mmap_depth > 0) {
+    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
+    else ts->mmap_overflow++;
+    return real_mremap(old_addr, old_size, new_size, flags, new_addr);
+  }
+
+  ts->mmap_depth = 1;
+  void* ret = real_mremap(old_addr, old_size, new_size, flags, new_addr);
+  ts->mmap_depth = 0;
+
+  if (ret != MAP_FAILED && !compat_mode) {
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    record_alloc_event(7, (unsigned long long)old_addr, (unsigned long long)old_size,
+                       (unsigned long long)ret, (ADDRINT)new_size, 7,
+                       (unsigned long long)caller_ip);
+    tracked_addresses.insert((ADDRINT)ret);
+    if ((ADDRINT)old_addr != 0) {
+      tracked_addresses.erase((ADDRINT)old_addr);
+      tracked_allocations.erase((ADDRINT)old_addr);
+    }
+    PIN_ReleaseLock(&malloc_lock);
+  }
+  return ret;
+}
+
+// --- NEW MUNMAP (type=8) — only record if address is tracked ---
+static int NewMunmap(void* addr, size_t length, ADDRINT caller_ip)
+{
+  if (addr == nullptr || addr == (void*)-1 || compat_mode) {
+    return real_munmap(addr, length);
+  }
+
+  PIN_GetLock(&malloc_lock, PIN_ThreadId());
+  ADDRINT a = (ADDRINT)addr;
+  auto it = tracked_addresses.find(a);
+  if (it != tracked_addresses.end()) {
+    record_alloc_event(8, (unsigned long long)a, (unsigned long long)length, 0, 0, 8, (unsigned long long)caller_ip);
+    tracked_addresses.erase(it);
+  }
+  PIN_ReleaseLock(&malloc_lock);
+
+  return real_munmap(addr, length);
+}
+
+// =========================================================================
+// Record helpers — embed or write allocation/free events
+//
+// record_alloc_event / record_free_event:
+//   In embedded_alloc_mode → set pending_instr_malloc (consumed by ResetCurrentInstruction).
+//   In alloc_only_mode     → write 40-byte malloc_instr directly.
+//   In compat_mode         → no-op (events not recorded).
+// =========================================================================
+
+// Helper: record an allocation event
 // Note: caller_ip is stored in the 40-byte malloc_instr for analysis purposes
 static void record_alloc_event(unsigned char coarse, unsigned long long arg1,
                                unsigned long long arg2, unsigned long long ret,
@@ -721,186 +928,9 @@ static void record_free_event(unsigned long long ptr, unsigned long long caller_
   }
 }
 
-// --- UNIFIED AFTER (all alloc families) ---
-VOID AllocAfter(ADDRINT ret)
-{
-  ThreadState* ts = get_tls();
-  if (ts->alloc_overflow > 0) { ts->alloc_overflow--; return; }
-  if (ts->alloc_depth == 0) return;
-  if (ts->alloc_depth > 1) { ts->alloc_depth--; return; }
-
-  // depth == 1: outermost — write record
-  ts->alloc_depth = 0;
-
-  PIN_GetLock(&malloc_lock, PIN_ThreadId());
-
-  int alloc_type = ts->pending.type;
-  bool is_realloc = (alloc_type == 3);
-
-  if (is_realloc) {
-    ADDRINT old_ptr  = ts->pending.size;
-    ADDRINT new_size = ts->pending.arg2;
-
-    if (compat_mode) {
-      // Skip all allocation events in compat mode
-    } else if (new_size == 0 && old_ptr != 0) {
-      // realloc(ptr, 0) = free(ptr) — record as free (type=4)
-      tracked_allocations.erase(old_ptr);
-      tracked_addresses.erase(old_ptr);
-      record_free_event((unsigned long long)old_ptr, (unsigned long long)ts->pending.caller_ip);
-    } else if (ret != 0 && ret != (ADDRINT)-1) {
-      // Successful realloc
-      if (old_ptr != 0) {
-        tracked_allocations.erase(old_ptr);
-        tracked_addresses.erase(old_ptr);
-      }
-      unsigned char coarse = coarse_type((unsigned char)alloc_type);
-      record_alloc_event(coarse, old_ptr, new_size, ret, new_size, coarse, ts->pending.caller_ip);
-      // Track the returned address
-      tracked_addresses.insert(ret);
-    }
-    // realloc failure: do nothing, old_ptr remains tracked
-  } else {
-    // Non-realloc (malloc, calloc, etc.)
-    if (ret != 0 && ret != (ADDRINT)-1) {
-      if (compat_mode) {
-        // Skip all allocation events in compat mode
-      } else {
-        unsigned char coarse = coarse_type((unsigned char)alloc_type);
-        record_alloc_event(coarse, ts->pending.size, ts->pending.arg2, ret,
-                           ts->pending.size, coarse, ts->pending.caller_ip);
-        tracked_addresses.insert(ret);
-      }
-    }
-  }
-
-  PIN_ReleaseLock(&malloc_lock);
-}
-
-// --- FREE — only write if tracked (suppresses glibc-internal free) ---
-VOID FreeBefore(ADDRINT ptr, ADDRINT caller_ip)
-{
-  if (ptr == 0 || compat_mode) return;
-
-  PIN_GetLock(&malloc_lock, PIN_ThreadId());
-
-  auto it = tracked_addresses.find(ptr);
-  if (it != tracked_addresses.end()) {
-    record_free_event((unsigned long long)ptr, (unsigned long long)caller_ip);
-    tracked_addresses.erase(it);
-  }
-
-  PIN_ReleaseLock(&malloc_lock);
-}
-
-VOID FreeAfter() { /* no-op */ }
-
-// --- MMAP (independent depth + saturation) ---
-VOID MmapBefore(ADDRINT length, ADDRINT flags, ADDRINT caller_ip)
-{
-  if (trace_limit_reached) return;
-
-  ThreadState* ts = get_tls();
-  // Skip if we're inside a malloc/calloc/realloc — this mmap is an internal glibc detail
-  if (ts->alloc_depth > 0) return;
-  if (ts->mmap_depth > 0) {
-    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
-    else ts->mmap_overflow++;
-    return;
-  }
-  ts->mmap_depth = 1;
-  ts->mmap_pending_size = length;
-  ts->pending.caller_ip = caller_ip;
-}
-
-VOID MmapAfter(ADDRINT ret)
-{
-  ThreadState* ts = get_tls();
-  if (ts->mmap_overflow > 0) { ts->mmap_overflow--; return; }
-  if (ts->mmap_depth == 0) return;
-  if (ts->mmap_depth > 1) { ts->mmap_depth--; return; }
-
-  ts->mmap_depth = 0;
-
-  if (ret != 0 && ret != (ADDRINT)-1) {
-    if (compat_mode) return;
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-      record_alloc_event(5, ts->mmap_pending_size, 0, ret,
-                       ts->mmap_pending_size, 5, ts->pending.caller_ip);
-    tracked_addresses.insert(ret);
-    PIN_ReleaseLock(&malloc_lock);
-  }
-}
-
-// --- MREMAP — independent depth tracking, similar to mmap ---
-VOID MremapBefore(ADDRINT old_addr, ADDRINT old_len, ADDRINT new_len, ADDRINT flags, ADDRINT caller_ip)
-{
-  if (trace_limit_reached) return;
-
-  ThreadState* ts = get_tls();
-  // Skip if we're inside a malloc/calloc/realloc — this mremap is an internal glibc detail
-  if (ts->alloc_depth > 0) return;
-  if (ts->mmap_depth > 0) {
-    if (ts->mmap_depth < MAX_DEPTH) ts->mmap_depth++;
-    else ts->mmap_overflow++;
-    return;
-  }
-  ts->mmap_depth = 1;
-  ts->mmap_pending_size = new_len;
-  ts->pending.size = old_addr;
-  ts->pending.arg2 = old_len;
-  ts->pending.caller_ip = caller_ip;
-}
-
-VOID MremapAfter(ADDRINT ret)
-{
-  ThreadState* ts = get_tls();
-  if (ts->mmap_overflow > 0) { ts->mmap_overflow--; return; }
-  if (ts->mmap_depth == 0) return;
-  if (ts->mmap_depth > 1) { ts->mmap_depth--; return; }
-
-  ts->mmap_depth = 0;
-
-  if (ret != 0 && ret != (ADDRINT)-1) {
-    if (compat_mode) return;
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    record_alloc_event(7, ts->pending.size, ts->pending.arg2, ret,
-                       ts->mmap_pending_size, 7, ts->pending.caller_ip);
-    tracked_addresses.insert(ret);
-    // If old_addr was tracked, remove it (mremap may replace it)
-    if (ts->pending.size != 0) {
-      tracked_addresses.erase(ts->pending.size);
-      tracked_allocations.erase(ts->pending.size);
-    }
-    PIN_ReleaseLock(&malloc_lock);
-  }
-}
-
-// --- MUNMAP — only write if tracked ---
-VOID MunmapBefore(ADDRINT addr, ADDRINT length, ADDRINT caller_ip)
-{
-  if (addr == 0 || addr == (ADDRINT)-1 || compat_mode) return;
-
-  PIN_GetLock(&malloc_lock, PIN_ThreadId());
-
-  auto it = tracked_addresses.find(addr);
-  if (it != tracked_addresses.end()) {
-    if (embedded_alloc_mode) {
-      pending_instr_malloc.type = 8;
-      pending_instr_malloc.arg1 = (unsigned long long)addr;
-      pending_instr_malloc.arg2 = (unsigned long long)length;
-      pending_instr_malloc.ret = 0;
-      pending_instr_malloc.caller_ip = (unsigned long long)caller_ip;
-    } else if (alloc_only_mode) {
-      write_alloc_record_locked(8, (unsigned long long)addr, (unsigned long long)length, 0, (unsigned long long)caller_ip);
-    }
-    tracked_addresses.erase(it);
-  }
-
-  PIN_ReleaseLock(&malloc_lock);
-}
-
-VOID MunmapAfter() { /* no-op */ }
+// =========================================================================
+// Cleanup: old BEFORE/AFTER callbacks removed (replaced by NewMalloc etc.)
+// =========================================================================
 
 // Forward declaration
 VOID ResetDepthOnMain();
@@ -953,86 +983,147 @@ VOID insert_analysis_functions(INS ins)
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)WriteCurrentInstruction, IARG_END);
 }
 
-// Symbol hook table — per-symbol fine-grained type registration
-struct SymbolHook {
-  const char* name;
-  unsigned char type;
-  enum { MALLOC, CALLOC, REALLOC, FREE } family;
-};
-
-static const SymbolHook all_symbols[] = {
-  // malloc (type 1)
-  {"malloc",                          1, SymbolHook::MALLOC},
-  // calloc (type 2)
-  {"calloc",                          2, SymbolHook::CALLOC},
-  // realloc (type 3)
-  {"realloc",                         3, SymbolHook::REALLOC},
-  // free (type 4)
-  {"free",                            4, SymbolHook::FREE},
-};
-
 /* ===================================================================== */
-// ImageLoad
-/* ===================================================================== */
+// ImageLoad — RTN_ReplaceSignature (from malloctrace methodology)
+//
+// Uses RTN_ReplaceSignature to replace all malloc/calloc/realloc/free/
+// mmap/mmap64/mremap/munmap with wrapper functions that capture return
+// values directly, avoiding IPOINT_AFTER issues with optimized functions.
+// ===================================================================== */
 VOID ImageLoad(IMG img, VOID* v)
 {
   if (!IMG_Valid(img)) return;
 
   RTN rtn;
 
-  // malloc/calloc/realloc/free
-  for (const auto& sym : all_symbols) {
-    rtn = RTN_FindByName(img, sym.name);
-    if (!RTN_Valid(rtn)) continue;
-    RTN_Open(rtn);
-    switch (sym.family) {
-      case SymbolHook::MALLOC:
-        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)AllocBefore,
-                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                       IARG_UINT32, sym.type,
-                       IARG_RETURN_IP, IARG_END);
-        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                       IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-        break;
-      case SymbolHook::CALLOC:
-        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
-                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                       IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                       IARG_UINT32, sym.type,
-                       IARG_RETURN_IP, IARG_END);
-        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                       IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-        break;
-      case SymbolHook::REALLOC:
-        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
-                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                       IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                       IARG_UINT32, sym.type,
-                       IARG_RETURN_IP, IARG_END);
-        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                       IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-        break;
-      case SymbolHook::FREE:
-        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
-                       IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                       IARG_RETURN_IP, IARG_END);
-        RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)FreeAfter, IARG_END);
-        break;
+  // --- MALLOC (type=1) ---
+  for (const char* name : {"malloc", "__libc_malloc"}) {
+    if (real_malloc != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_malloc = (void* (*)(size_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewMalloc,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
     }
-    RTN_Close(rtn);
   }
 
-  // mmap
-  rtn = RTN_FindByName(img, "mmap");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
+  // --- CALLOC (type=2) ---
+  for (const char* name : {"calloc", "__libc_calloc", "__calloc"}) {
+    if (real_calloc != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_calloc = (void* (*)(size_t, size_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewCalloc,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- REALLOC (type=3) ---
+  for (const char* name : {"realloc", "__libc_realloc"}) {
+    if (real_realloc != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_realloc = (void* (*)(void*, size_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewRealloc,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- FREE (type=4) ---
+  for (const char* name : {"free", "__libc_free"}) {
+    if (real_free != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_free = (void (*)(void*))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewFree,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- MMAP (type=5) ---
+  for (const char* name : {"mmap", "__libc_mmap"}) {
+    if (real_mmap != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_mmap = (void* (*)(void*, size_t, int, int, int, off_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewMmap,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 4,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 5,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- MMAP64 (type=6) ---
+  // Note: mmap64 uses the same real_mmap pointer (signature compatible)
+  for (const char* name : {"mmap64", "__libc_mmap64"}) {
+    if (real_mmap != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_mmap = (void* (*)(void*, size_t, int, int, int, off_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewMmap64,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 4,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 5,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- MREMAP (type=7) ---
+  for (const char* name : {"mremap", "__libc_mremap"}) {
+    if (real_mremap != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_mremap = (void* (*)(void*, size_t, size_t, int, ...))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewMremap,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 4,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- MUNMAP (type=8) ---
+  for (const char* name : {"munmap", "__libc_munmap"}) {
+    if (real_munmap != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_munmap = (int (*)(void*, size_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewMunmap,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
   }
 
   // Reset depth at entry point
@@ -1043,46 +1134,6 @@ VOID ImageLoad(IMG img, VOID* v)
       RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ResetDepthOnMain, IARG_END);
       RTN_Close(rtn);
     }
-  }
-
-  // munmap
-  rtn = RTN_FindByName(img, "munmap");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MunmapBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MunmapAfter, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // mmap64
-  rtn = RTN_FindByName(img, "mmap64");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MmapBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MmapAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
-  }
-
-  // mremap
-  rtn = RTN_FindByName(img, "mremap");
-  if (RTN_Valid(rtn)) {
-    RTN_Open(rtn);
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MremapBefore,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
-                   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
-                   IARG_RETURN_IP, IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)MremapAfter,
-                   IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-    RTN_Close(rtn);
   }
 
   std::cout << "[ChampSim Tracer] Instrumented: " << IMG_Name(img) << std::endl;
