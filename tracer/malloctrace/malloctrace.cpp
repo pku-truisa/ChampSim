@@ -1,162 +1,182 @@
-/*
- * Copyright (C) 2004-2021 Intel Corporation.
- * SPDX-License-Identifier: MIT
- */
-
 #include "pin.H"
 #include <iostream>
 #include <fstream>
-#include <cstddef>
 #include <cstring>
+
 using std::cerr;
 using std::endl;
 using std::hex;
-using std::ios;
+using std::dec;
 using std::string;
 
 /* ===================================================================== */
-/* Global Variables */
+/* 命令行参数定义 */
 /* ===================================================================== */
+KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "malloctrace.out", "specify trace file name");
 
+/* ===================================================================== */
+/* 全局变量与真实分配器指针声明 */
+/* ===================================================================== */
 std::ofstream TraceFile;
 
-/* ===================================================================== */
-/* Commandline Switches */
-/* ===================================================================== */
-
-KNOB< string > KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "malloctrace.out", "specify trace file name");
-
-/* ===================================================================== */
-
-/* Pointers to the real functions */
-static void* (*real_malloc)(size_t)           = nullptr;
-static void* (*real_calloc)(size_t, size_t)   = nullptr;
-static void* (*real_realloc)(void*, size_t)   = nullptr;
+static void* (*real_malloc)(size_t) = nullptr;
+static void* (*real_calloc)(size_t, size_t) = nullptr;
+static void* (*real_realloc)(void*, size_t) = nullptr;
+static void  (*real_free)(void*) = nullptr;
 
 /* ===================================================================== */
-/* Analysis / callback routines                                          */
+/* Replacement Analysis Routines (接管执行流的替换函数) */
 /* ===================================================================== */
 
-static VOID MallocBefore(ADDRINT size, ADDRINT ret_ip)
+// 替换 Malloc
+void* NewMalloc(size_t size, ADDRINT caller_ip)
 {
-    TraceFile << "malloc before(size=" << size << ", ret_ip=" << ret_ip << ")" << endl;
+    void* ret = real_malloc(size);
+
+    // 一处现场，同时安全打印入参、返回值和调用起源 IP
+    TraceFile << "[TRACE] Malloc  | Size: " << dec << size 
+              << " | RetPtr: 0x" << hex << (ADDRINT)ret 
+              << " | CallerIP: 0x" << caller_ip << "\n";
+
+    return ret;
 }
 
-static VOID CallocBefore(ADDRINT nmemb, ADDRINT size, ADDRINT ret_ip)
+// 替换 Calloc
+void* NewCalloc(size_t nmemb, size_t size, ADDRINT caller_ip)
 {
-    TraceFile << "calloc before(nmemb=" << nmemb << ", size=" << size << ", ret_ip=" << ret_ip << ")" << endl;
+    void* ret = real_calloc(nmemb, size);
+
+    // 参数 100% 准确，彻底闭环别名符号下的寄存器丢失隐患
+    TraceFile << "[TRACE] Calloc  | Items: " << dec << nmemb 
+              << " | Size: " << size 
+              << " | Total: " << (nmemb * size)
+              << " | RetPtr: 0x" << hex << (ADDRINT)ret 
+              << " | CallerIP: 0x" << caller_ip << "\n";
+
+    return ret;
 }
 
-static VOID ReallocBefore(ADDRINT ptr, ADDRINT size, ADDRINT ret_ip)
+// 替换 Realloc
+void* NewRealloc(void* ptr, size_t size, ADDRINT caller_ip)
 {
-    TraceFile << "realloc before(ptr=" << ptr << ", size=" << size << ", ret_ip=" << ret_ip << ")" << endl;
+    void* ret = real_realloc(ptr, size);
+
+    TraceFile << "[TRACE] Realloc | OldPtr: 0x" << hex << (ADDRINT)ptr 
+              << " | NewSize: " << dec << size 
+              << " | NewPtr: 0x" << hex << (ADDRINT)ret 
+              << " | CallerIP: 0x" << caller_ip << "\n";
+
+    return ret;
 }
 
-static VOID AllocAfter(ADDRINT ret)
+// 替换 Free
+void NewFree(void* ptr, ADDRINT caller_ip)
 {
-    TraceFile << "  after(" << ret << ")" << endl;
-}
+    real_free(ptr);
 
-static VOID FreeBefore(ADDRINT ptr)
-{
-    TraceFile << "free before(ptr=" << ptr << ")" << endl;
+    if (ptr != nullptr) {
+        TraceFile << "[TRACE] Free    | Ptr: 0x" << hex << (ADDRINT)ptr 
+                  << " | CallerIP: 0x" << caller_ip << "\n";
+    }
 }
 
 /* ===================================================================== */
-/* Instrumentation routines                                              */
+/* Instrumentation Routine (镜像加载时的动态替换绑定 - 免Open安全版) */
 /* ===================================================================== */
-
 VOID Image(IMG img, VOID* v)
 {
-    // --- malloc ---
-    {
-        RTN rtn = RTN_FindByName(img, "malloc");
-        if (RTN_Valid(rtn))
-        {
-            RTN_Open(rtn);
+    if (!IMG_Valid(img)) return;
+
+    // --- 1. 替换 MALLOC 环 ---
+    for (const char* sym : {"malloc", "__libc_malloc"}) {
+        if (real_malloc != nullptr) break; 
+
+        RTN rtn = RTN_FindByName(img, sym);
+        if (RTN_Valid(rtn)) {
+            // 【核心修复】：彻底移除 RTN_Open(rtn);
+            
             real_malloc = (void* (*)(size_t))RTN_Funptr(rtn);
 
-            RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)MallocBefore,
-                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                           IARG_RETURN_IP, IARG_END);
-            RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                           IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-
-            RTN_Close(rtn);
+            RTN_ReplaceSignature(rtn, (AFUNPTR)NewMalloc,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0,  // size
+                                 IARG_RETURN_IP,
+                                 IARG_END);
+            
+            // 【核心修复】：彻底移除 RTN_Close(rtn);
+            break; // 成功替换后，立刻跳出循环，防止为别名符号二次插桩
         }
     }
 
-    // --- calloc ---
-    {
-        RTN rtn = RTN_FindByName(img, "calloc");
-        if (RTN_Valid(rtn))
-        {
-            RTN_Open(rtn);
+    // --- 2. 替换 CALLOC 环 ---
+    for (const char* sym : {"calloc", "__libc_calloc", "__calloc"}) {
+        if (real_calloc != nullptr) break;
+
+        RTN rtn = RTN_FindByName(img, sym);
+        if (RTN_Valid(rtn)) {
             real_calloc = (void* (*)(size_t, size_t))RTN_Funptr(rtn);
 
-            RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)CallocBefore,
-                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                           IARG_RETURN_IP, IARG_END);
-            RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                           IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-
-            RTN_Close(rtn);
+            RTN_ReplaceSignature(rtn, (AFUNPTR)NewCalloc,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0,  // nmemb
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 1,  // size
+                                 IARG_RETURN_IP,
+                                 IARG_END);
+            break;
         }
     }
 
-    // --- realloc ---
-    {
-        RTN rtn = RTN_FindByName(img, "realloc");
-        if (RTN_Valid(rtn))
-        {
-            RTN_Open(rtn);
+    // --- 3. 替换 REALLOC 环 ---
+    for (const char* sym : {"realloc", "__libc_realloc"}) {
+        if (real_realloc != nullptr) break;
+
+        RTN rtn = RTN_FindByName(img, sym);
+        if (RTN_Valid(rtn)) {
             real_realloc = (void* (*)(void*, size_t))RTN_Funptr(rtn);
 
-            RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)ReallocBefore,
-                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-                           IARG_RETURN_IP, IARG_END);
-            RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)AllocAfter,
-                           IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
-
-            RTN_Close(rtn);
+            RTN_ReplaceSignature(rtn, (AFUNPTR)NewRealloc,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0,  // old_ptr
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 1,  // size
+                                 IARG_RETURN_IP,
+                                 IARG_END);
+            break;
         }
     }
 
-    // --- free ---
-    {
-        RTN rtn = RTN_FindByName(img, "free");
-        if (RTN_Valid(rtn))
-        {
-            RTN_Open(rtn);
-            RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FreeBefore,
-                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                           IARG_END);
-            RTN_Close(rtn);
+    // --- 4. 替换 FREE 环 ---
+    for (const char* sym : {"free", "__libc_free"}) {
+        if (real_free != nullptr) break;
+
+        RTN rtn = RTN_FindByName(img, sym);
+        if (RTN_Valid(rtn)) {
+            real_free = (void (*)(void*))RTN_Funptr(rtn);
+
+            RTN_ReplaceSignature(rtn, (AFUNPTR)NewFree,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0,  // ptr
+                                 IARG_RETURN_IP,
+                                 IARG_END);
+            break;
         }
     }
 }
 
 /* ===================================================================== */
-
-VOID Fini(INT32 code, VOID* v) { TraceFile.close(); }
-
+/* 退出时的清理动作 */
 /* ===================================================================== */
-/* Print Help Message                                                    */
-/* ===================================================================== */
+VOID Fini(INT32 code, VOID* v)
+{
+    TraceFile << "==== [Pin Replace Tracer] Tracing Successfully Finished ====\n";
+    TraceFile.close();
+}
 
 INT32 Usage()
 {
-    cerr << "This tool produces a trace of calls to malloc / calloc / realloc / free." << endl;
+    cerr << "This tool produces a trace of calls to malloc / calloc / realloc / free using RTN_ReplaceSignature." << endl;
     cerr << endl << KNOB_BASE::StringKnobSummary() << endl;
     return -1;
 }
 
 /* ===================================================================== */
-/* Main                                                                  */
+/* 主函数 */
 /* ===================================================================== */
-
 int main(int argc, char* argv[])
 {
     PIN_InitSymbols();
@@ -166,8 +186,7 @@ int main(int argc, char* argv[])
     }
 
     TraceFile.open(KnobOutputFile.Value().c_str());
-    TraceFile << hex;
-    TraceFile.setf(ios::showbase);
+    TraceFile << hex << std::showbase;
 
     IMG_AddInstrumentFunction(Image, 0);
     PIN_AddFiniFunction(Fini, 0);
@@ -176,7 +195,3 @@ int main(int argc, char* argv[])
 
     return 0;
 }
-
-/* ===================================================================== */
-/* eof */
-/* ===================================================================== */
