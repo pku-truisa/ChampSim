@@ -14,8 +14,6 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
-#include <unistd.h>
-#include <fcntl.h>
 #include <sys/mman.h>
 
 using std::cerr;
@@ -58,8 +56,8 @@ KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "malloctrace.ou
 /* Global State                                                          */
 /* ===================================================================== */
 
-static int trace_fd = -1;
-static volatile unsigned long long write_offset = 0;
+static std::ofstream TraceFile;
+static PIN_LOCK trace_lock;
 
 /* ===================================================================== */
 /* Real function pointers                                                */
@@ -74,7 +72,7 @@ static int   (*real_munmap)(void*, size_t) = nullptr;
 static void* (*real_mremap)(void*, size_t, size_t, int, ...) = nullptr;
 
 /* ===================================================================== */
-/* Helper: write one record atomically                                   */
+/* Helper: write one record (thread-safe)                                */
 /* ===================================================================== */
 static void write_rec(unsigned char t, unsigned long long a1,
                       unsigned long long a2, unsigned long long ret,
@@ -86,10 +84,11 @@ static void write_rec(unsigned char t, unsigned long long a1,
     rec.ret       = ret;
     rec.caller_ip = caller_ip;
     rec.type      = t;
-    memset(rec.reserved, 0, sizeof(rec.reserved));
+    std::memset(rec.reserved, 0, sizeof(rec.reserved));
 
-    unsigned long long off = __sync_fetch_and_add(&write_offset, sizeof(rec));
-    pwrite(trace_fd, &rec, sizeof(rec), off);
+    PIN_GetLock(&trace_lock, PIN_ThreadId());
+    TraceFile.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
+    PIN_ReleaseLock(&trace_lock);
 }
 
 /* ===================================================================== */
@@ -276,7 +275,7 @@ VOID Image(IMG img, VOID* v)
 
 VOID Fini(INT32 code, VOID* v)
 {
-    if (trace_fd >= 0) close(trace_fd);
+    TraceFile.close();
 }
 
 /* ===================================================================== */
@@ -302,13 +301,14 @@ int main(int argc, char* argv[])
         return Usage();
     }
 
-    // Open trace file (binary)
-    const string& fname = KnobOutputFile.Value();
-    trace_fd = open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (trace_fd < 0) {
-        cerr << "Could not open " << fname << endl;
+    PIN_InitLock(&trace_lock);
+
+    TraceFile.open(KnobOutputFile.Value().c_str(), std::ios::binary | std::ios::trunc);
+    if (!TraceFile) {
+        cerr << "Could not open " << KnobOutputFile.Value() << endl;
         return -1;
     }
+    TraceFile << hex << std::showbase;
 
     IMG_AddInstrumentFunction(Image, 0);
     PIN_AddFiniFunction(Fini, 0);
