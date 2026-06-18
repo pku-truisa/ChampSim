@@ -32,7 +32,7 @@
  *  - Thread-local state (TLS) + PIN_LOCK for thread safety
  *  - tracked_addresses set to filter free/munmap (suppress glibc-internal noise)
  *  - Independent mmap depth tracking
-  *  - realloc in-place detection (via source_memory[0] == destination_memory[0])
+ *  - realloc in-place detection (via source_memory[0] == destination_memory[0])
  *  - aligned_alloc and memalign are NOT hooked (thin wrappers that call malloc internally)
  */
 
@@ -628,6 +628,31 @@ static void try_auto_reset_depth(ThreadState* ts)
   }
 }
 
+// --- Stuck-depth auto-reset for mmap ---
+static void try_auto_reset_mmap_depth(ThreadState* ts)
+{
+  if (ts->mmap_depth == 0) {
+    ts->mmap_stuck_counter = 0;
+    return;
+  }
+  ts->mmap_stuck_counter++;
+  if (ts->mmap_stuck_counter >= MAX_STUCK) {
+    // mmap_depth permanently stuck (glibc init loss) — force reset
+    ts->mmap_depth = 0;
+    ts->mmap_overflow = 0;
+    ts->mmap_stuck_counter = 0;
+  }
+}
+
+// =========================================================================
+// Record helpers — forward declarations (defined later)
+// =========================================================================
+static void record_alloc_event(unsigned char coarse, unsigned long long arg1,
+                               unsigned long long arg2, unsigned long long ret,
+                               ADDRINT size_for_tracking, unsigned char coarse_for_tracking,
+                               unsigned long long caller_ip);
+static void record_free_event(unsigned long long ptr, unsigned long long caller_ip);
+
 // =========================================================================
 // Wrapper functions (RTN_ReplaceSignature) — from malloctrace methodology
 //
@@ -774,6 +799,7 @@ static void NewFree(void* ptr, ADDRINT caller_ip)
 static void* NewMmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset, ADDRINT caller_ip)
 {
   ThreadState* ts = get_tls();
+  try_auto_reset_mmap_depth(ts);
 
   // Skip if we're inside a malloc/calloc/realloc — this mmap is an internal glibc detail
   if (ts->alloc_depth > 0) {
@@ -804,6 +830,7 @@ static void* NewMmap(void* addr, size_t length, int prot, int flags, int fd, off
 static void* NewMmap64(void* addr, size_t length, int prot, int flags, int fd, off_t offset, ADDRINT caller_ip)
 {
   ThreadState* ts = get_tls();
+  try_auto_reset_mmap_depth(ts);
 
   // Skip if we're inside a malloc/calloc/realloc
   if (ts->alloc_depth > 0) {
@@ -834,6 +861,7 @@ static void* NewMmap64(void* addr, size_t length, int prot, int flags, int fd, o
 static void* NewMremap(void* old_addr, size_t old_size, size_t new_size, int flags, void* new_addr, ADDRINT caller_ip)
 {
   ThreadState* ts = get_tls();
+  try_auto_reset_mmap_depth(ts);
 
   // Skip if we're inside a malloc/calloc/realloc
   if (ts->alloc_depth > 0) {
@@ -927,10 +955,6 @@ static void record_free_event(unsigned long long ptr, unsigned long long caller_
     write_alloc_record_locked(4, ptr, 0, 0, caller_ip);
   }
 }
-
-// =========================================================================
-// Cleanup: old BEFORE/AFTER callbacks removed (replaced by NewMalloc etc.)
-// =========================================================================
 
 // Forward declaration
 VOID ResetDepthOnMain();
