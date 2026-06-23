@@ -1,10 +1,7 @@
-# Object Tracer — Memory Allocation PIN Tool
+# Intel PIN tracer
 
-The included PIN tool `object_tracer.cpp` records all memory allocation and deallocation events to a binary trace file (`malloc.bin`). It does **not** generate any instruction-level trace — it focuses solely on heap and anonymous mmap activity.
-
-It has been tested with PIN 3.22 through PIN 3.31.
-
-See [test/README.md](test/README.md) for the test suite documentation.
+The included PIN tool `champsim_tracer.cpp` can be used to generate new traces.
+It has been tested using PIN 3.22+.
 
 ## Download and install PIN
 
@@ -18,216 +15,155 @@ Download the source of PIN from Intel's website, then build it in a location of 
 
 ## Building the tracer
 
-The provided makefile uses the standard Pin kit build system. Set `PIN_ROOT` to your Pin or SDE kit's `pinkit` directory.
+The provided makefile will generate `obj-intel64/champsim_tracer.so`.
 
-```bash
-# Build with SDE kit (recommended)
-make PIN_ROOT=$SDE_BUILD_KIT/pinkit
+    cd tracer/pin-object
+    make
+    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -- <your program here>
 
-# Or build with standalone Pin kit
-export PIN_ROOT=/path/to/pin
-make
+## Three Operation Modes
+
+The tracer supports three mutually exclusive modes:
+
+### 1. Compat mode (default, no `-m`)
+
+Produces an instruction trace **without** allocation events. Compatible with the upstream
+ChampSim trace format. Only normal instructions (instr_type=0) and branches (instr_type=1)
+are recorded. Allocation events are completely ignored.
+
+    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -o trace.champsim -t 1000000 -- ./my_program
+
+### 2. Embedded alloc mode (`-m`, no `-a`)
+
+Produces an instruction trace **with** allocation events (instr_type=2) embedded between
+normal instructions. Allocation events are mixed into the same output file as the instruction
+records. This allows the simulator to reconstruct the dynamic memory allocation history.
+
+    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -o trace.champsim -t 1000000 -m -- ./my_program
+
+### 3. Alloc-only mode (`-m -a <file>`)
+
+Produces **only** allocation events (40-byte malloc_instr records compatible with
+`little_object_analyzer.py`). No instruction trace is generated. This mode has no
+threshold filtering — all allocation events are recorded regardless of size.
+
+    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -m -a alloc_trace.bin -- ./my_program
+
+## Options
+
 ```
+-o <filename>
+Specify the output file for the instruction trace (compat and embedded alloc modes only).
+The default is champsim.trace. Not used in alloc-only mode.
 
-This generates `obj-intel64/object_tracer.so`.
+-s <number>
+Specify the number of instructions to skip in the program before tracing begins.
+This is useful for skipping initialization code that you don't want to include in
+your instruction trace. The default value is 0 (start tracing from the beginning).
 
-> **Important for SDE users:** The compiled `.so` **must** be copied into the SDE kit's `intel64/` directory before use, as `sde64` resolves tool names relative to that path:
->
-> ```bash
-> cp obj-intel64/object_tracer.so $SDE_BUILD_KIT/intel64/
-> ```
+-t <number>
+The number of instructions to trace, after -s instructions have been skipped.
+The default value is 0, which means trace all instructions (unlimited).
+If you specify a positive number N, the tracer will stop after tracing N instructions.
 
-## Command-line options
+-k <number>
+Minimum allocation size to record for allocation events embedded in the instruction
+trace (embedded alloc mode only). The default value is 256 bytes.
+Not used in compat or alloc-only modes.
 
-```
--m <filename>
-Specify the output file for the binary malloc trace.
-The default is malloc.bin.
-```
+-c <filename>
+Specify a config file for multi-segment trace. Format: one line per segment,
+each with -s N -t N -o filename.
+Example: echo '-s 100000000 -t 50000000 -o trace_0.champsim' > cfg.txt
 
-## SDE PinPlay Replay
+-m
+Enable allocation event recording. Without -a, operates in embedded alloc mode:
+allocation events are mixed into the instruction trace output.
+With -a, operates in alloc-only mode. See "Three Operation Modes" above.
 
-The tool includes a built-in argument filter that strips PinPlay-injected internal options (`-work-dir`, `-pinplay:work-dir`, `-replay`, etc.), making it compatible with **both** standard `pin -t` and SDE PinPlay replay modes without any code changes.
-
-### Whole Program replay
-
-Replay a whole-program pinball with object tracing:
-
-```bash
-$SDE_BUILD_KIT/sde64 -skl -replay \
-  -t object_tracer.so \
-  -replay:basename whole_program.1/<program>.<pid>_<tid> \
-  -replay:strace -replay:playout 0 -replay:deadlock_timeout 0 \
-  -xyzzy \
-  -- $SDE_BUILD_KIT/intel64/nullapp
-```
-
-`malloc.bin` is written to the current working directory.
-
-### Region Pinball replay
-
-Each region pinball can be replayed independently:
-
-```bash
-for rpb in test-malloc.1_6864.pp/*.address; do
-  rpbname=$(basename "$rpb" .address)
-  dir=$(dirname "$rpb")
-  $SDE_BUILD_KIT/sde64 -skl -replay \
-    -t object_tracer.so \
-    -replay:basename "$dir/$rpbname" \
-    -replay:strace -replay:playout 0 -replay:deadlock_timeout 0 \
-    -xyzzy \
-    -- $SDE_BUILD_KIT/intel64/nullapp
-  mv malloc.bin "$dir/${rpbname}.malloc.bin"
-done
+-a <filename>
+(Requires -m) Alloc-only mode. Output only allocation events (40-byte malloc_instr
+records compatible with little_object_analyzer.py) to the specified file.
+No instruction trace is generated. All allocation events are recorded regardless
+of size (-k is ignored).
 ```
 
 ## Usage Examples
 
-### Standard Pin — trace a live program
+### Compat mode (upstream ChampSim compatible)
 
-```bash
-pin -t obj-intel64/object_tracer.so -- ./my_program
-pin -t obj-intel64/object_tracer.so -m my_malloc.bin -- ./my_program
-```
+    pin -t obj-intel64/champsim_tracer.so -o my_trace.champsim -s 1000000 -t 500000 -- ./my_program
 
-### SDE — trace a live program
+### Embedded alloc mode
 
-```bash
-$SDE_BUILD_KIT/sde64 -skl -t object_tracer.so -m malloc.bin -- ./my_program
-```
+    pin -t obj-intel64/champsim_tracer.so -o trace_with_alloc.champsim -t 500000 -m -- ls
 
-### SDE — replay a whole program pinball
+### Alloc-only mode
 
-```bash
-$SDE_BUILD_KIT/sde64 -skl -replay \
-  -t object_tracer.so \
-  -replay:basename whole_program.1/test-malloc.1_6864 \
-  -replay:strace -replay:playout 0 -replay:deadlock_timeout 0 \
-  -xyzzy \
-  -- $SDE_BUILD_KIT/intel64/nullapp
-```
+    pin -t obj-intel64/champsim_tracer.so -m -a alloc_events.bin -- ./my_program
 
-## Tracked Allocation Functions
+### Multi-segment trace
 
-The tracer hooks the following functions in all loaded shared libraries (7-type scheme):
+    echo '-s 1000000 -t 500000 -o seg0.champsim' > cfg.txt
+    echo '-s 2000000 -t 500000 -o seg1.champsim' >> cfg.txt
+    pin -t obj-intel64/champsim_tracer.so -c cfg.txt -- ./my_program
 
-| Function                 | Type | Description                              |
-|--------------------------|------|------------------------------------------|
-| `malloc`, `_Znwm`, `_Znam` | 1  | Standard memory allocation / C++ new     |
-| `free`, `_ZdlPv`, `_ZdaPv` | 2  | Memory deallocation / C++ delete         |
-| `calloc`                 | 3    | Allocate and zero-initialize array       |
-| `realloc`                | 4    | Reallocation (move or in-place)          |
-| `posix_memalign`         | 5    | POSIX aligned allocation                 |
-| `mmap`                   | 6    | Anonymous memory mapping                 |
-| `munmap`                 | 7    | Unmap memory region                      |
+## Output File Formats
 
-> **Note:** `aligned_alloc` (C11), `memalign`, and `valloc` in glibc are thin wrappers that internally call `malloc` or `mmap`. The tracer captures them correctly through the standard `malloc`/`mmap` hooks as **type=1** or **type=6**, rather than instrumenting them directly (to avoid tail-call deadlocks). Similarly, C++ `operator new`/`operator new[]` and `operator delete`/`operator delete[]` are tracked through `_Znwm`/`_Znam` and `_ZdlPv`/`_ZdaPv` hooks, mapped to type=1 and type=2 respectively.
+### Instruction trace (compat and embedded alloc modes)
 
-All events are recorded to a single binary file. Free/munmap events are only recorded for addresses that were previously tracked from an allocation/mmap call.
+Output is a sequence of 64-byte `input_instr` records:
 
-## Binary File Format
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0..7   | ip    | Instruction pointer (PC) |
+| 8      | instr_type | 0=normal, 1=branch, 2=alloc (embedded only) |
+| 9      | instr_info | branch_taken or alloc type code |
+| 10..11 | destination_registers[2] | Written register numbers |
+| 12..15 | source_registers[4] | Read register numbers |
+| 16..31 | destination_memory[2] | Written memory addresses |
+| 32..63 | source_memory[4] | Read memory addresses |
 
-The output file consists of consecutive 40-byte records with the following C layout:
+### Alloc-only mode
 
-```c
-struct malloc_instr {
-  unsigned long long ip;       // caller's return address  (offset 0)
-  unsigned long long arg1;     // parameter 1               (offset 8)
-  unsigned long long arg2;     // parameter 2               (offset 16)
-  unsigned long long ret;      // return value              (offset 24)
-  unsigned char type;          // allocation event type     (offset 32)
-  unsigned char reserved[7];   // alignment padding         (offset 33)
-};  // total: 40 bytes
-```
+Output is a sequence of 40-byte `malloc_instr` records, compatible with
+`little_object_analyzer.py`:
 
-### Field semantics by event type
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0..7   | arg1  | Size (alloc) / old pointer (realloc) |
+| 8..15  | arg2  | 0 (alloc) / new size (realloc) / alignment (posix_memalign) |
+| 16..23 | ret   | Returned address (allocated/freed pointer) |
+| 24..31 | caller_ip | Caller instruction pointer |
+| 32     | type  | Allocation type code (see table below) |
+| 33..39 | reserved | Zero padding |
 
-All events use the 7-type scheme (1=malloc, 2=free, 3=calloc, 4=realloc, 5=posix_memalign, 6=mmap, 7=munmap). C++ `operator new`/`delete` and allocator-variant symbols (mi_malloc, je_malloc, etc.) are all mapped to their corresponding base type.
+### Allocation type codes (8-type scheme)
 
-| Type | Event               | `arg1`                    | `arg2`                    | `ret`               |
-|------|---------------------|---------------------------|---------------------------|---------------------|
-| 1    | malloc / C++ new    | size                      | 0                         | allocated address   |
-| 2    | free / C++ delete   | pointer to free           | 0                         | 0                   |
-| 3    | calloc              | nmemb × size              | 0                         | allocated address   |
-| 4    | realloc             | old pointer               | new size                  | new or same address |
-| 5    | posix_memalign      | size                      | alignment                 | aligned address     |
-| 6    | mmap                | length                    | 0                         | mapped address      |
-| 7    | munmap              | address to unmap          | length                    | 0                   |
+All allocator-variant symbols (mi_malloc, je_malloc, tc_malloc, C++ new/delete)
+are mapped to their corresponding base type. Type 8 is a special marker
+that indicates the start of the program's `main()` function.
 
-## Analyzing Memory Allocation Traces
+| Code | Type | Meaning |
+|------|------|---------|
+| 1 | malloc / C++ new | malloc, mi/je/tc_malloc, _Znwm, _Znam |
+| 2 | free / C++ delete | free, mi/je/tc_free, _ZdlPv, _ZdaPv |
+| 3 | calloc | calloc, mi/je/tc_calloc |
+| 4 | realloc | realloc, mi/je/tc_realloc |
+| 5 | posix_memalign | POSIX aligned allocation |
+| 6 | mmap | Anonymous memory mapping |
+| 7 | munmap | Unmap memory region |
+| 8 | main_begin | Marker: `main()` function has started |
 
-The `little_object_analyzer.py` tool provides streaming, low-memory-footprint analysis of the binary malloc trace. It supports:
+### Type 8 — main_begin Marker
 
-1. **Function call statistics** — count of each allocation and deallocation type
-2. **Active memory tracking** — peak memory usage over time, both original and power-of-2-aligned
-3. **Multi-threshold peak comparison** — compares aligned peaks at [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072] byte thresholds
-4. **Large object listing** (`*.objects.log`) — all allocated objects ≥32KB, sorted by size descending
+When running in embedded-alloc or alloc-only mode, the tracer automatically
+emits a `type=8` record at the entry of `main()`. This is done via the
+`ResetDepthOnMain()` callback, which is instrumented at `main`/`MAIN__`/`main_`
+symbols found in each loaded image.
 
-### Usage
-
-```bash
-# Single file analysis (supports both .bin and .bin.xz input)
-python3 little_object_analyzer.py -i malloc.bin
-
-# Batch mode: process all *.malloc.bin.xz files in the current directory
-python3 little_object_analyzer.py -i all
-```
-
-### Parameters
-
-- `-i, --input`: Input binary malloc trace file (required). Supports `.xz` compressed files. Use `all` to batch-process every `*.malloc.bin.xz` in the current directory.
-
-### Output Files
-
-| File               | Description                                                              |
-|--------------------|--------------------------------------------------------------------------|
-| `*.result.log`     | Full analysis report including per-threshold peak comparison (console mirror) |
-| `*.objects.log`    | All objects ≥32KB ever allocated, sorted by size descending              |
-
-## Testing
-
-The `test/` directory contains comprehensive test suites. See [test/README.md](test/README.md) for details.
-
-### Quick synthetic test (no PIN required)
-
-```bash
-python3 test/test_analyzer_synthetic.py
-```
-
-### End-to-end tests (PIN required)
-
-```bash
-# Build test programs
-cd test
-g++ -o test_malloc test_malloc.cpp
-g++ -o test_analyzer test_analyzer.cpp
-gfortran -o test_fortran test_fortran.f90
-cd ..
-
-# Run each test
-pin -t obj-intel64/object_tracer.so -m test/malloc.bin -- test/test_malloc
-python3 little_object_analyzer.py -i test/malloc.bin
-```
-
-## Differences from champsim_tracer
-
-`object_tracer` is a stripped-down, standalone version of the `-a` (alloc-only) mode from `champsim_tracer.cpp`:
-
-- **No instruction trace** — no `-o`, `-s`, `-t` options
-- **No size threshold (`-k`)** — all allocation events are recorded without filtering
-- **No header/tail records** — the binary file consists purely of allocation/deallocation events
-- **Self-contained** — the `malloc_instr` struct is defined directly in the source, no dependency on `inc/trace_instruction.h`
-
-## Type 8 — main_begin Marker
-
-The `ResetDepthOnMain()` callback in `ImageLoad` (instrumented at `main`/`MAIN__`/`main_` symbols)
-now emits a `type=8` marker record at the entry of `main()`. This allows the analyzer to:
-
+The marker allows the analyzer to:
 - Skip glibc initialization allocations that occurred before `main()`
 - Reset its internal state so only user-level allocations are counted
 - Achieve a clean alloc/free ledger (active objects ≈ 1 at exit)
 
-For example, with dedup under PARSEC 3.0, this produces:
-- Alloc: 794,192 / Free: 748,207 / Active: 1
-- Peak memory: 444.73 MiB
