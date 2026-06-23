@@ -1,6 +1,6 @@
 # Intel PIN tracer
 
-The included PIN tool `champsim_tracer.cpp` can be used to generate new traces.
+The included PIN tool `champsim_object_tracer.cpp` can be used to generate new traces.
 It has been tested using PIN 3.22+.
 
 ## Download and install PIN
@@ -15,11 +15,11 @@ Download the source of PIN from Intel's website, then build it in a location of 
 
 ## Building the tracer
 
-The provided makefile will generate `obj-intel64/champsim_tracer.so`.
+The provided makefile will generate `obj-intel64/champsim_object_tracer.so`.
 
     cd tracer/pin-object
     make
-    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -- <your program here>
+    $PIN_ROOT/pin -t obj-intel64/champsim_object_tracer.so -- <your program here>
 
 ## Three Operation Modes
 
@@ -31,7 +31,7 @@ Produces an instruction trace **without** allocation events. Compatible with the
 ChampSim trace format. Only normal instructions (instr_type=0) and branches (instr_type=1)
 are recorded. Allocation events are completely ignored.
 
-    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -o trace.champsim -t 1000000 -- ./my_program
+    $PIN_ROOT/pin -t obj-intel64/champsim_object_tracer.so -o trace.champsim -t 1000000 -- ./my_program
 
 ### 2. Embedded alloc mode (`-m`, no `-a`)
 
@@ -39,7 +39,7 @@ Produces an instruction trace **with** allocation events (instr_type=2) embedded
 normal instructions. Allocation events are mixed into the same output file as the instruction
 records. This allows the simulator to reconstruct the dynamic memory allocation history.
 
-    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -o trace.champsim -t 1000000 -m -- ./my_program
+    $PIN_ROOT/pin -t obj-intel64/champsim_object_tracer.so -o trace.champsim -t 1000000 -m -- ./my_program
 
 ### 3. Alloc-only mode (`-m -a <file>`)
 
@@ -47,7 +47,7 @@ Produces **only** allocation events (40-byte malloc_instr records compatible wit
 `little_object_analyzer.py`). No instruction trace is generated. This mode has no
 threshold filtering — all allocation events are recorded regardless of size.
 
-    $PIN_ROOT/pin -t obj-intel64/champsim_tracer.so -m -a alloc_trace.bin -- ./my_program
+    $PIN_ROOT/pin -t obj-intel64/champsim_object_tracer.so -m -a alloc_trace.bin -- ./my_program
 
 ## Options
 
@@ -92,21 +92,21 @@ of size (-k is ignored).
 
 ### Compat mode (upstream ChampSim compatible)
 
-    pin -t obj-intel64/champsim_tracer.so -o my_trace.champsim -s 1000000 -t 500000 -- ./my_program
+    pin -t obj-intel64/champsim_object_tracer.so -o my_trace.champsim -s 1000000 -t 500000 -- ./my_program
 
 ### Embedded alloc mode
 
-    pin -t obj-intel64/champsim_tracer.so -o trace_with_alloc.champsim -t 500000 -m -- ls
+    pin -t obj-intel64/champsim_object_tracer.so -o trace_with_alloc.champsim -t 500000 -m -- ls
 
 ### Alloc-only mode
 
-    pin -t obj-intel64/champsim_tracer.so -m -a alloc_events.bin -- ./my_program
+    pin -t obj-intel64/champsim_object_tracer.so -m -a alloc_events.bin -- ./my_program
 
 ### Multi-segment trace
 
     echo '-s 1000000 -t 500000 -o seg0.champsim' > cfg.txt
     echo '-s 2000000 -t 500000 -o seg1.champsim' >> cfg.txt
-    pin -t obj-intel64/champsim_tracer.so -c cfg.txt -- ./my_program
+    pin -t obj-intel64/champsim_object_tracer.so -c cfg.txt -- ./my_program
 
 ## Output File Formats
 

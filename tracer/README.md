@@ -1,6 +1,6 @@
 This directory contains example tracing utilities that create ChampSim traces. It currently contains:
 
- - A tracer for use with Intel PIN (see `champsim_tracer.cpp` in `pin-object/`)
+ - A tracer for use with Intel PIN (see `champsim_object_tracer.cpp` in `pin-object/`)
  - An LD_PRELOAD memory allocation tracer (see `malloc_memusage-champsim.c` in `nopin-object/`)
  - A conversion program for CVP traces (`cvp_converter/`)
 
@@ -27,13 +27,13 @@ All three tracers now emit a `type=8` (main_begin) marker record at the entry of
 2. Reset analysis state at the marker, ensuring only user-level allocations are counted
 3. Achieve a perfect 1:1 Alloc/Free match (active objects = 1 at program exit)
 
-### PIN champsim_tracer
+### PIN champsim_object_tracer
 
-The PIN instruction+alloc tracer (`pin-object/champsim_tracer.cpp`) writes the type=8 marker in embedded-alloc mode via `pending_instr_malloc` (embedded into the next instruction record) and in alloc-only mode via direct `write_alloc_record_locked(8,...)`.
+The PIN instruction+alloc tracer (`pin-object/champsim_object_tracer.cpp`) writes the type=8 marker in embedded-alloc mode via `pending_instr_malloc` (embedded into the next instruction record) and in alloc-only mode via direct `write_alloc_record_locked(8,...)`.
 
 ### PIN alloc-only tracer
 
-The PIN alloc-only tracer (also `pin-object/champsim_tracer.cpp`, invoked with `-m -a`) calls `write_malloc_instr_locked(8, 0, 0, 0, 0)` in its `ResetDepthOnMain()` callback, which is triggered at `main()` entry via `RTN_FindByName`.
+The PIN alloc-only tracer (also `pin-object/champsim_object_tracer.cpp`, invoked with `-m -a`) calls `write_malloc_instr_locked(8, 0, 0, 0, 0)` in its `ResetDepthOnMain()` callback, which is triggered at `main()` entry via `RTN_FindByName`.
 
 ### LD_PRELOAD wrapper (nopin-object)
 
