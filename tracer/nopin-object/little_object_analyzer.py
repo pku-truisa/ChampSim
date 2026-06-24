@@ -330,12 +330,14 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
         interval_obj_pct.append((extra_objs / total_alloc * 100) if total_alloc > 0 else 0)
         cum_obj_pct.append(cum_obj_pct[-1] if cum_obj_pct else 100.0)
 
-        # Summary header
+        # Summary header with dynamic value alignment
+        sum_labels = ['Total Alloc Objects:', 'Total Allocated Memory:', 'Peak Active Objects:', 'Peak Allocated Memory:']
+        sum_vals = [f"{total_alloc:,}", format_size(total_allocated_memory), f"{peak_active_objects:,}", format_size(original_peak_size)]
+        sum_label_width = max(len(l) for l in sum_labels)
+        sum_val_width = max(len(v) for v in sum_vals)
         print("\n=== Peak Memory Usage Summary ===")
-        print(f"{'Total Alloc Objects:':>24}  {total_alloc:>12,}")
-        print(f"{'Total Allocated Memory:':>24}  {format_size(total_allocated_memory):>12}")
-        print(f"{'Peak Active Objects:':>24}  {peak_active_objects:>12,}")
-        print(f"{'Peak Allocated Memory:':>24}  {format_size(original_peak_size):>12}")
+        for label, val in zip(sum_labels, sum_vals):
+            print(f"{label:>{sum_label_width}}  {val:>{sum_val_width}}")
         print()
 
         # Data rows: (label, values, fmt_string)
@@ -381,7 +383,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
         # ===== Caller IP Statistics =====
         if caller_stats or invalid_caller_count > 0:
             # Build list of (avg_size, caller_ip, count, total_size, avg_lifetime, primary_type)
-            caller_list = []
+            raw_caller_rows = []
 
             # Aggregate invalid caller IPs into one row
             if invalid_caller_count > 0:
@@ -401,7 +403,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                     avg_sz = invalid_tot_sz / invalid_cnt if invalid_cnt > 0 else 0
                     primary_type = max(invalid_types, key=invalid_types.get) if invalid_types else 0
                     type_name = TYPE_MAP.get(primary_type, 'unknown')
-                    caller_list.append((avg_sz, 0, invalid_cnt, invalid_tot_sz, 0.0, type_name))
+                    raw_caller_rows.append((avg_sz, 0, invalid_cnt, invalid_tot_sz, 0.0, type_name))
 
             for ip, info in caller_stats.items():
                 cnt = info["cnt"]
@@ -412,22 +414,53 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                 # Determine primary type (most frequent)
                 primary_type = max(info["types"], key=info["types"].get) if info["types"] else 0
                 type_name = TYPE_MAP.get(primary_type, 'unknown')
-                caller_list.append((avg_sz, ip, cnt, tot_sz, avg_lt, type_name))
+                raw_caller_rows.append((avg_sz, ip, cnt, tot_sz, avg_lt, type_name))
 
             # Sort by avg size descending
-            caller_list.sort(key=lambda x: -x[0])
+            raw_caller_rows.sort(key=lambda x: -x[0])
 
-            header_line = f"{'Caller IP':<20}  {'Type':<14}  {'Alloc Count':>12}  {'Avg Size':>12}  {'Total Size':>14}  {'Avg Lifetime':>12}"
-            print("\n=== Caller IP Statistics (sorted by avg size) ===")
-            print(header_line)
-            print("-" * len(header_line))
-            for avg_sz, ip, cnt, tot_sz, avg_lt, type_name in caller_list:
+            # Format all rows and compute dynamic column widths
+            caller_headers = ['Caller IP', 'Type', 'Alloc Count', 'Avg Size', 'Total Size', 'Avg Lifetime']
+            caller_formatted = []
+            for avg_sz, ip, cnt, tot_sz, avg_lt, type_name in raw_caller_rows:
                 if ip == 0:
                     ip_str = "unknown/invalid"
                 else:
                     ip_str = f"0x{ip:016x}"
-                print(f"{ip_str:<20}  {type_name:<14}  {cnt:>12,}  {avg_sz:>12,.1f}  {tot_sz:>14,}  {avg_lt:>12,.1f}")
-            print(f"\n(Total unique caller IPs: {len(caller_list) - (1 if invalid_caller_count > 0 else 0)})")
+                cnt_str = f"{cnt:,}"
+                avg_sz_str = f"{avg_sz:,.1f}"
+                tot_sz_str = f"{tot_sz:,}"
+                avg_lt_str = f"{avg_lt:,.1f}"
+                caller_formatted.append((ip_str, type_name, cnt_str, avg_sz_str, tot_sz_str, avg_lt_str))
+
+            # Column widths = max(width of header, max width of data)
+            cw = []
+            for ci in range(6):
+                max_w = len(caller_headers[ci])
+                for row in caller_formatted:
+                    max_w = max(max_w, len(row[ci]))
+                # Left-aligned columns (0, 1) need no extra; right-aligned columns need size
+                cw.append(max_w)
+
+            print("\n=== Caller IP Statistics (sorted by avg size) ===")
+            # Build header with dynamic widths
+            hdr = f"{caller_headers[0]:<{cw[0]}}  {caller_headers[1]:<{cw[1]}}"
+            hdr += f"  {caller_headers[2]:>{cw[2]}}"
+            hdr += f"  {caller_headers[3]:>{cw[3]}}"
+            hdr += f"  {caller_headers[4]:>{cw[4]}}"
+            hdr += f"  {caller_headers[5]:>{cw[5]}}"
+            print(hdr)
+            print("-" * len(hdr))
+
+            for row in caller_formatted:
+                line = f"{row[0]:<{cw[0]}}  {row[1]:<{cw[1]}}"
+                line += f"  {row[2]:>{cw[2]}}"
+                line += f"  {row[3]:>{cw[3]}}"
+                line += f"  {row[4]:>{cw[4]}}"
+                line += f"  {row[5]:>{cw[5]}}"
+                print(line)
+
+            print(f"\n(Total unique caller IPs: {len(raw_caller_rows) - (1 if invalid_caller_count > 0 else 0)})")
             if invalid_caller_count > 0:
                 print(f"(Records with invalid caller_ip <= {INVALID_CALLER_IP_MAX}: {invalid_caller_count})")
         else:
