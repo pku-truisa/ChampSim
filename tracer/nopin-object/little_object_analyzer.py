@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-High-performance low-memory streaming Memory Allocation Trace File Analyzer — v12
+High-performance low-memory streaming Memory Allocation Trace File Analyzer — v13
 v6: Added top-64 largest memory objects tracking with lifetime (alloc/free event count).
 v7: Added automatic legacy format detection + type code remapping for old PIN tracer traces.
 v8: Added automatic 32-byte vs 40-byte record detection for compatibility.
@@ -10,6 +10,9 @@ v11: Added defensive caller_ip filtering in display: caller_ip <= 4096 grouped a
 v12: Updated type codes to match champsim_tracer.cpp: 1=malloc,2=calloc,3=realloc,4=free,
      5=mmap,6=mmap64,7=mremap,8=munmap,9=main_begin.
      Format: <QQQQB7s> (arg1, arg2, ret, caller_ip, type, reserved[7])
+v13: Removed top-64 largest objects tracking. Thresholds changed to [16..65536].
+     Removed desc overhead stats. Added total/peak object/memory summary.
+     Table transposed to interval-granularity by columns (range >prev <=current).
 """
 
 import struct
@@ -19,7 +22,6 @@ import glob
 import lzma
 import argparse
 import bisect
-import heapq
 from collections import defaultdict
 
 INVALID_CALLER_IP_MAX = 4096  # caller_ip addresses at or below this are considered invalid
@@ -115,9 +117,8 @@ def read_malloc_binary(filename):
                 offset += RECORD_SIZE
             remainder = frame[offset:]
 
-def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, ge_counts, n, size, pow2, split_idx):
+def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, n, size, pow2, split_idx):
     for i in range(split_idx):
-        ge_counts[i] += 1
         current_sizes[i] += size
         if current_sizes[i] > peak_sizes[i]: peak_sizes[i] = current_sizes[i]
     for i in range(split_idx, n):
@@ -125,60 +126,30 @@ def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, g
         current_sizes[i] += pow2
         if current_sizes[i] > peak_sizes[i]: peak_sizes[i] = current_sizes[i]
 
-def _update_sizes_on_free(current_sizes, ge_counts, n, old_sz, pow2, split_idx):
+def _update_sizes_on_free(current_sizes, n, old_sz, pow2, split_idx):
     for i in range(split_idx):
-        ge_counts[i] -= 1
         current_sizes[i] -= old_sz
     for i in range(split_idx, n):
         current_sizes[i] -= pow2
-
-def _maybe_add_candidate(candidate_heap, candidate_info, size, ptr, alloc_event, func_name, caller_ip):
-    """Try to add object to top-64 candidate set. Returns False if not added."""
-    while candidate_heap and candidate_heap[0][1] not in candidate_info:
-        heapq.heappop(candidate_heap)
-
-    if len(candidate_info) < 64:
-        heapq.heappush(candidate_heap, (size, ptr))
-        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None, "caller_ip": caller_ip}
-        return True
-
-    if candidate_heap and size > candidate_heap[0][0]:
-        min_size, min_ptr = heapq.heappop(candidate_heap)
-        if min_ptr in candidate_info:
-            del candidate_info[min_ptr]
-        heapq.heappush(candidate_heap, (size, ptr))
-        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None, "caller_ip": caller_ip}
-        return True
-    elif candidate_heap and size == candidate_heap[0][0] and ptr < candidate_heap[0][1]:
-        min_size, min_ptr = heapq.heappop(candidate_heap)
-        if min_ptr in candidate_info:
-            del candidate_info[min_ptr]
-        heapq.heappush(candidate_heap, (size, ptr))
-        candidate_info[ptr] = {"size": size, "type": func_name, "alloc_event": alloc_event, "lifetime": None, "caller_ip": caller_ip}
-        return True
-
-    return False
 
 def process_malloc_binary(filename, objects_path=None, from_main=False):
     func_stats = {k: 0 for k in TYPE_MAP.values()}
     active_heap = {}
 
-    thresholds = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+    thresholds = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     n = len(thresholds)
     current_sizes = [0] * n
     peak_sizes = [0] * n
     peak_moment_sizes = [0] * n
     threshold_object_counts = [0] * n
-    current_ge_counts = [0] * n
-    peak_moment_ge_counts = [0] * n
 
     original_current_size = 0
     original_peak_size = 0
+    total_allocated_memory = 0
+    peak_active_objects = 0
     all_large_objects = []
 
     event_counter = 0
-    candidate_heap = []
-    candidate_info = {}
 
     # Per-caller_ip statistics: { caller_ip -> {cnt, tot_sz, tot_lt, types: {type: count}} }
     caller_stats = {}
@@ -204,14 +175,12 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                 peak_sizes = [0] * n
                 peak_moment_sizes = [0] * n
                 threshold_object_counts = [0] * n
-                current_ge_counts = [0] * n
-                peak_moment_ge_counts = [0] * n
                 original_current_size = 0
                 original_peak_size = 0
+                total_allocated_memory = 0
+                peak_active_objects = 0
                 all_large_objects.clear()
                 event_counter = 0
-                candidate_heap.clear()
-                candidate_info.clear()
                 caller_stats.clear()
                 invalid_caller_count = 0
                 in_main = True
@@ -244,32 +213,29 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                     # realloc: remove old pointer before adding new
                     old_sz, old_alloc_ev, _, old_caller_ip = active_heap.pop(arg1)
                     original_current_size -= old_sz
-                    if arg1 in candidate_info:
-                        candidate_info[arg1]["lifetime"] = event_counter - old_alloc_ev
                     # Accumulate lifetime to the original allocator's caller_ip
                     lifetime = event_counter - old_alloc_ev
                     if old_caller_ip > INVALID_CALLER_IP_MAX and old_caller_ip in caller_stats:
                         caller_stats[old_caller_ip]["tot_lt"] += lifetime
                     old_pow2 = next_power_of_2(old_sz)
                     old_idx = bisect.bisect_right(thresholds, old_sz)
-                    _update_sizes_on_free(current_sizes, current_ge_counts, n, old_sz, old_pow2, old_idx)
+                    _update_sizes_on_free(current_sizes, n, old_sz, old_pow2, old_idx)
 
                 active_heap[ret] = (size, event_counter, func_name, caller_ip)
                 original_current_size += size
+                total_allocated_memory += size
                 if size >= 32768:
                     all_large_objects.append((ret, size, func_name))
 
-                _maybe_add_candidate(candidate_heap, candidate_info, size, ret, event_counter, func_name, caller_ip)
-
                 pow2 = next_power_of_2(size)
                 split_idx = bisect.bisect_right(thresholds, size)
-                _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, current_ge_counts,
+                _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts,
                                        n, size, pow2, split_idx)
 
                 if original_current_size > original_peak_size:
                     original_peak_size = original_current_size
+                    peak_active_objects = len(active_heap)
                     peak_moment_sizes = current_sizes.copy()
-                    peak_moment_ge_counts = current_ge_counts.copy()
 
         elif etype in _FREE_TYPES:
             func_stats[func_name] += 1
@@ -281,16 +247,9 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                 lifetime = event_counter - old_alloc_ev
                 if old_caller_ip > INVALID_CALLER_IP_MAX and old_caller_ip in caller_stats:
                     caller_stats[old_caller_ip]["tot_lt"] += lifetime
-                if ptr in candidate_info:
-                    candidate_info[ptr]["lifetime"] = event_counter - old_alloc_ev
                 old_pow2 = next_power_of_2(old_sz)
                 old_idx = bisect.bisect_right(thresholds, old_sz)
-                _update_sizes_on_free(current_sizes, current_ge_counts, n, old_sz, old_pow2, old_idx)
-
-    for ptr in list(candidate_info.keys()):
-        if candidate_info[ptr]["lifetime"] is None:
-            alloc_ev = candidate_info[ptr]["alloc_event"]
-            candidate_info[ptr]["lifetime"] = event_counter - alloc_ev
+                _update_sizes_on_free(current_sizes, n, old_sz, old_pow2, old_idx)
 
     base_name = os.path.splitext(filename)[0]
     if base_name.endswith('.malloc'): base_name = base_name[:-7]
@@ -305,6 +264,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
         for name, codes in _FREE_GROUPS:
             total_dealloc += sum(func_stats.get(TYPE_MAP.get(c, 'unknown'), 0) for c in codes)
 
+        print(f"\nProcessing file: {base_name}")
         print("\n=== Function Call Statistics ===")
         print(f"Total Alloc calls: {total_alloc}")
         print(f"Total Free calls:  {total_dealloc}")
@@ -319,58 +279,104 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
             if count > 0:
                 print(f"{name:<30} {code:>4}  {count:>14,}")
 
-        print("\n=== Peak Memory Usage Summary ===")
-        print(f"Original Peak Memory: {format_size(original_peak_size)}")
-        print("\n Threshold   Aligned Increase               Increase %   Objects (interval)   % of Total Objs   Desc Overhead   Desc Overhead %")
-        print("-" * 137)
-        prev = 0
+        # ===== Transposed Peak Memory Table (interval granularity) =====
+        # Build column labels and interval values
+        range_labels = []
         for i in range(n):
-            t = thresholds[i]
-            increase = peak_moment_sizes[i] - original_peak_size
-            inc_pct = (increase / original_peak_size * 100) if original_peak_size > 0 else 0
-            delta = threshold_object_counts[i] - prev
-            obj_pct = (threshold_object_counts[i] / total_alloc * 100) if total_alloc > 0 else 0
-            desc_overhead = peak_moment_ge_counts[i] * 16
-            desc_pct = (desc_overhead / original_peak_size * 100) if original_peak_size > 0 else 0
-            print(f"{t:>9}  {increase:>27,}  {inc_pct:>9.2f}%  {delta:>16,}  {obj_pct:>15.2f}%  {desc_overhead:>13,}  {desc_pct:>15.2f}%")
-            prev = threshold_object_counts[i]
+            lo = 0 if i == 0 else thresholds[i - 1]
+            hi = thresholds[i]
+            range_labels.append(f"({lo},{hi}]")
+        # Extra column for >65536
+        range_labels.append(f"({thresholds[-1]},+\u221e)")
 
-        # >=128K row (cumulative object count)
-        ge128k_objs = total_alloc - threshold_object_counts[-1]
-        ge128k_pct = (ge128k_objs / total_alloc * 100) if total_alloc > 0 else 0
-        print(f"{'>=128K':>9}  {0:>27,}  {0:>9.2f}%  {ge128k_objs:>16,}  {ge128k_pct:>15.2f}%  {0:>13,}  {0:>15.2f}%")
+        # Pre-compute interval metrics (excluding the extra >max column)
+        interval_inc = []
+        interval_inc_pct = []
+        cum_inc_pct = []
+        interval_objs = []
+        interval_obj_pct = []
+        cum_obj_pct = []
 
-        if candidate_info:
-            # Filter to objects >= 4KB (4096 bytes)
-            sorted_candidates = sorted(
-                [c for c in candidate_info.values() if c["size"] >= 4096],
-                key=lambda x: (-x["size"], x["alloc_event"])
-            )
+        prev_objs = 0
+        for i in range(n):
+            # Interval-object count (delta from cumulative)
+            delta_objs = threshold_object_counts[i] - prev_objs
+            prev_objs = threshold_object_counts[i]
 
-            print("\n=== Top 64 Largest Memory Objects (>=4KB) ===")
-            print(f"{'#':>4}  {'Alloc@':>8}  {'Size':>12}  {'Type':<18}  {'Lifetime':>10}  {'Caller IP':<20}")
-            print("-" * 78)
+            # Aligned increase contributed by this interval at peak moment
+            #   peak_moment_sizes[i] = cumulative aligned total for objects <= threshold[i]
+            #   subtract the baseline: for i==0, subtract original_peak_size;
+            #   for i>0, subtract peak_moment_sizes[i-1] (aligned total of smaller objects at peak moment)
+            base = original_peak_size if i == 0 else peak_moment_sizes[i - 1]
+            inc = peak_moment_sizes[i] - base
 
-            print_count = min(64, len(sorted_candidates))
-            for i in range(print_count):
-                obj = sorted_candidates[i]
-                caller_ip_str = "unknown/invalid" if obj['caller_ip'] <= INVALID_CALLER_IP_MAX else f"0x{obj['caller_ip']:016x}"
-                print(f"{i+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  {caller_ip_str}")
+            # Cumulative inc%: total aligned increase for all objects <= threshold[i]
+            total_aligned_inc = peak_moment_sizes[i] - original_peak_size
+            cum_pct = (total_aligned_inc / original_peak_size * 100) if original_peak_size > 0 else 0
 
-            if len(sorted_candidates) > 64:
-                last_size = sorted_candidates[63]["size"]
-                for j in range(64, len(sorted_candidates)):
-                    if sorted_candidates[j]["size"] == last_size:
-                        obj = sorted_candidates[j]
-                        caller_ip_str = "unknown/invalid" if obj['caller_ip'] <= INVALID_CALLER_IP_MAX else f"0x{obj['caller_ip']:016x}"
-                        print(f"{j+1:>4}  {obj['alloc_event']:>8,}  {obj['size']:>12,}  {obj['type']:<18}  {obj['lifetime']:>10,}  {caller_ip_str}")
-                    else:
-                        break
+            interval_inc.append(inc)
+            interval_inc_pct.append((inc / original_peak_size * 100) if original_peak_size > 0 else 0)
+            cum_inc_pct.append(cum_pct)
+            interval_objs.append(delta_objs)
+            interval_obj_pct.append((delta_objs / total_alloc * 100) if total_alloc > 0 else 0)
+            cum_obj_pct.append((threshold_object_counts[i] / total_alloc * 100) if total_alloc > 0 else 0)
 
-            print(f"\n(Total unique candidate objects in top-64 set: {len(sorted_candidates)})")
-        else:
-            print("\n=== Top 64 Largest Memory Objects (>=4KB) ===")
-            print("(No objects >= 4KB found)")
+        # Extra column (>65536)
+        extra_objs = total_alloc - threshold_object_counts[-1]
+        interval_inc.append(0)
+        interval_inc_pct.append(0.0)
+        cum_inc_pct.append(cum_inc_pct[-1] if cum_inc_pct else 0.0)  # same as last cum value
+        interval_objs.append(extra_objs)
+        interval_obj_pct.append((extra_objs / total_alloc * 100) if total_alloc > 0 else 0)
+        cum_obj_pct.append(cum_obj_pct[-1] if cum_obj_pct else 100.0)
+
+        # Summary header
+        print("\n=== Peak Memory Usage Summary ===")
+        print(f"{'Total Alloc Objects:':>24}  {total_alloc:>12,}")
+        print(f"{'Total Allocated Memory:':>24}  {format_size(total_allocated_memory):>12}")
+        print(f"{'Peak Active Objects:':>24}  {peak_active_objects:>12,}")
+        print(f"{'Peak Allocated Memory:':>24}  {format_size(original_peak_size):>12}")
+        print()
+
+        # Data rows: (label, values, fmt_string)
+        metrics = [
+            ("Aligned Inc",   interval_inc,     "{:,}"),
+            ("Inc%",          interval_inc_pct, "{:.2f}%"),
+            ("Cum Inc%",      cum_inc_pct,      "{:.2f}%"),
+            ("Obj Cnt",       interval_objs,    "{:,}"),
+            ("Obj%",          interval_obj_pct, "{:.2f}%"),
+            ("Cum Obj%",      cum_obj_pct,      "{:.2f}%"),
+        ]
+
+        # Compute dynamic column widths from actual formatted data
+        first_col_width = max(len(label) for label, _, _ in metrics)
+        col_strs = [[] for _ in range(len(range_labels))]
+        for j in range(len(range_labels)):
+            col_strs[j].append(range_labels[j])  # header
+        for label, values, fmt in metrics:
+            for j, v in enumerate(values):
+                s = fmt.format(v)
+                col_strs[j].append(s)
+        col_widths = [max(len(s) for s in col_strs[j]) for j in range(len(range_labels))]
+
+        # Build header: metrics row + range labels as columns
+        header = f"{'Metric':>{first_col_width}}"
+        for j, rl in enumerate(range_labels):
+            header += f"  {rl:>{col_widths[j]}}"
+        print(header)
+
+        # Separator
+        sep = "-" * first_col_width
+        for j in range(len(range_labels)):
+            sep += "  " + "-" * col_widths[j]
+        print(sep)
+
+        for label, values, fmt in metrics:
+            row = f"{label:>{first_col_width}}"
+            for j, v in enumerate(values):
+                s = fmt.format(v)
+                row += "  " + f"{s:>{col_widths[j]}}"
+            print(row)
 
         # ===== Caller IP Statistics =====
         if caller_stats or invalid_caller_count > 0:
@@ -400,9 +406,6 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
             for ip, info in caller_stats.items():
                 cnt = info["cnt"]
                 tot_sz = info["tot_sz"]
-                # Skip callers with only one allocation and total size < 4KB
-                if cnt == 1 and tot_sz < 4096:
-                    continue
                 tot_lt = info["tot_lt"]
                 avg_sz = tot_sz / cnt if cnt > 0 else 0
                 avg_lt = tot_lt / cnt if cnt > 0 else 0
@@ -414,9 +417,10 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
             # Sort by avg size descending
             caller_list.sort(key=lambda x: -x[0])
 
+            header_line = f"{'Caller IP':<20}  {'Type':<14}  {'Alloc Count':>12}  {'Avg Size':>12}  {'Total Size':>14}  {'Avg Lifetime':>12}"
             print("\n=== Caller IP Statistics (sorted by avg size) ===")
-            print(f"{'Caller IP':<20} {'Type':<14}  {'Alloc Count':>12}  {'Avg Size':>12}  {'Total Size':>14}  {'Avg Lifetime':>12}")
-            print("-" * 86)
+            print(header_line)
+            print("-" * len(header_line))
             for avg_sz, ip, cnt, tot_sz, avg_lt, type_name in caller_list:
                 if ip == 0:
                     ip_str = "unknown/invalid"
@@ -448,7 +452,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
         sys.stdout = sys.__stdout__
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v12, 40-byte, caller_ip stats, new type codes)')
+    parser = argparse.ArgumentParser(description='High Performance streaming Analyzer (v13, 40-byte, caller_ip stats, transposed interval peaks)')
     parser.add_argument('input', help='Path to malloc.bin or malloc.bin.xz, or "all"')
     parser.add_argument('-m', '--from-main', action='store_true', help='Only count events after the main_begin marker (type=9)')
     parser.add_argument('-o', '--objects', default=None, help='Output path for large objects (>=32KB) report')
