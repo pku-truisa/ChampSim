@@ -251,6 +251,12 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                 old_idx = bisect.bisect_right(thresholds, old_sz)
                 _update_sizes_on_free(current_sizes, n, old_sz, old_pow2, old_idx)
 
+    # Accumulate lifetime for objects still alive at end of trace
+    for ptr, (old_sz, old_alloc_ev, _, old_caller_ip) in active_heap.items():
+        lifetime = event_counter - old_alloc_ev
+        if old_caller_ip > INVALID_CALLER_IP_MAX and old_caller_ip in caller_stats:
+            caller_stats[old_caller_ip]["tot_lt"] += lifetime
+
     base_name = os.path.splitext(filename)[0]
     if base_name.endswith('.malloc'): base_name = base_name[:-7]
 
