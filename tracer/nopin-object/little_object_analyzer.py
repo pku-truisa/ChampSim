@@ -126,10 +126,11 @@ def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, n
         current_sizes[i] += pow2
         if current_sizes[i] > peak_sizes[i]: peak_sizes[i] = current_sizes[i]
 
-def _update_sizes_on_free(current_sizes, n, old_sz, pow2, split_idx):
+def _update_sizes_on_free(current_sizes, threshold_object_counts, n, old_sz, pow2, split_idx):
     for i in range(split_idx):
         current_sizes[i] -= old_sz
     for i in range(split_idx, n):
+        threshold_object_counts[i] -= 1
         current_sizes[i] -= pow2
 
 def process_malloc_binary(filename, objects_path=None, from_main=False):
@@ -141,6 +142,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
     current_sizes = [0] * n
     peak_sizes = [0] * n
     peak_moment_sizes = [0] * n
+    peak_moment_objs = [0] * n
     threshold_object_counts = [0] * n
 
     original_current_size = 0
@@ -174,6 +176,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                 current_sizes = [0] * n
                 peak_sizes = [0] * n
                 peak_moment_sizes = [0] * n
+                peak_moment_objs = [0] * n
                 threshold_object_counts = [0] * n
                 original_current_size = 0
                 original_peak_size = 0
@@ -219,7 +222,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                         caller_stats[old_caller_ip]["tot_lt"] += lifetime
                     old_pow2 = next_power_of_2(old_sz)
                     old_idx = bisect.bisect_right(thresholds, old_sz)
-                    _update_sizes_on_free(current_sizes, n, old_sz, old_pow2, old_idx)
+                    _update_sizes_on_free(current_sizes, threshold_object_counts, n, old_sz, old_pow2, old_idx)
 
                 active_heap[ret] = (size, event_counter, func_name, caller_ip)
                 original_current_size += size
@@ -236,6 +239,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                     original_peak_size = original_current_size
                     peak_active_objects = len(active_heap)
                     peak_moment_sizes = current_sizes.copy()
+                    peak_moment_objs = threshold_object_counts.copy()
 
         elif etype in _FREE_TYPES:
             func_stats[func_name] += 1
@@ -249,7 +253,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                     caller_stats[old_caller_ip]["tot_lt"] += lifetime
                 old_pow2 = next_power_of_2(old_sz)
                 old_idx = bisect.bisect_right(thresholds, old_sz)
-                _update_sizes_on_free(current_sizes, n, old_sz, old_pow2, old_idx)
+                _update_sizes_on_free(current_sizes, threshold_object_counts, n, old_sz, old_pow2, old_idx)
 
     # Accumulate lifetime for objects still alive at end of trace
     for ptr, (old_sz, old_alloc_ev, _, old_caller_ip) in active_heap.items():
@@ -303,11 +307,12 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
         interval_obj_pct = []
         cum_obj_pct = []
 
+        total_peak_objs = peak_moment_objs[-1]  # total alive objects at peak moment
         prev_objs = 0
         for i in range(n):
-            # Interval-object count (delta from cumulative)
-            delta_objs = threshold_object_counts[i] - prev_objs
-            prev_objs = threshold_object_counts[i]
+            # Interval-object count at peak moment (delta from cumulative peak snapshot)
+            delta_objs = peak_moment_objs[i] - prev_objs
+            prev_objs = peak_moment_objs[i]
 
             # Aligned increase contributed by this interval at peak moment
             #   peak_moment_sizes[i] = cumulative aligned total for objects <= threshold[i]
@@ -324,17 +329,17 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
             interval_inc_pct.append((inc / original_peak_size * 100) if original_peak_size > 0 else 0)
             cum_inc_pct.append(cum_pct)
             interval_objs.append(delta_objs)
-            interval_obj_pct.append((delta_objs / total_alloc * 100) if total_alloc > 0 else 0)
-            cum_obj_pct.append((threshold_object_counts[i] / total_alloc * 100) if total_alloc > 0 else 0)
+            interval_obj_pct.append((delta_objs / total_peak_objs * 100) if total_peak_objs > 0 else 0)
+            cum_obj_pct.append((peak_moment_objs[i] / total_peak_objs * 100) if total_peak_objs > 0 else 0)
 
-        # Extra column (>65536)
-        extra_objs = total_alloc - threshold_object_counts[-1]
+        # Extra column (>65536): no objects above max threshold at peak moment
+        extra_objs = 0
         interval_inc.append(0)
         interval_inc_pct.append(0.0)
         cum_inc_pct.append(cum_inc_pct[-1] if cum_inc_pct else 0.0)  # same as last cum value
-        interval_objs.append(extra_objs)
-        interval_obj_pct.append((extra_objs / total_alloc * 100) if total_alloc > 0 else 0)
-        cum_obj_pct.append(cum_obj_pct[-1] if cum_obj_pct else 100.0)
+        interval_objs.append(0)
+        interval_obj_pct.append(0.0)
+        cum_obj_pct.append(100.0)  # cumulative reaches 100%
 
         # Summary header with dynamic value alignment
         sum_labels = ['Total Alloc Objects:', 'Total Allocated Memory:', 'Peak Active Objects:', 'Peak Allocated Memory:']
