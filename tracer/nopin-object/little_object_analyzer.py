@@ -54,6 +54,16 @@ def format_size(size):
         return "{:.2f} KiB".format(size / 1024)
     return "{} B".format(size)
 
+def simplify_size(n):
+    """Convert a size value to a simplified string with K/M/G suffix if exact multiple."""
+    if n >= 1024 * 1024 * 1024 and n % (1024 * 1024 * 1024) == 0:
+        return f"{n // (1024 * 1024 * 1024)}G"
+    if n >= 1024 * 1024 and n % (1024 * 1024) == 0:
+        return f"{n // (1024 * 1024)}M"
+    if n >= 1024 and n % 1024 == 0:
+        return f"{n // 1024}K"
+    return str(n)
+
 # ===== 9-type code scheme (aligned with champsim_tracer.cpp) =====
 TYPE_MAP = {
     1: 'malloc',
@@ -117,21 +127,23 @@ def read_malloc_binary(filename):
                 offset += RECORD_SIZE
             remainder = frame[offset:]
 
-def _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts, n, size, pow2, split_idx):
+def _update_sizes_on_alloc(current_sizes, current_actual_sizes, peak_sizes, threshold_object_counts, n, size, pow2, split_idx):
     for i in range(split_idx):
         current_sizes[i] += size
         if current_sizes[i] > peak_sizes[i]: peak_sizes[i] = current_sizes[i]
     for i in range(split_idx, n):
         threshold_object_counts[i] += 1
         current_sizes[i] += pow2
+        current_actual_sizes[i] += size
         if current_sizes[i] > peak_sizes[i]: peak_sizes[i] = current_sizes[i]
 
-def _update_sizes_on_free(current_sizes, threshold_object_counts, n, old_sz, pow2, split_idx):
+def _update_sizes_on_free(current_sizes, current_actual_sizes, threshold_object_counts, n, old_sz, pow2, split_idx):
     for i in range(split_idx):
         current_sizes[i] -= old_sz
     for i in range(split_idx, n):
         threshold_object_counts[i] -= 1
         current_sizes[i] -= pow2
+        current_actual_sizes[i] -= old_sz
 
 def process_malloc_binary(filename, objects_path=None, from_main=False):
     func_stats = {k: 0 for k in TYPE_MAP.values()}
@@ -140,8 +152,10 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
     thresholds = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     n = len(thresholds)
     current_sizes = [0] * n
+    current_actual_sizes = [0] * n
     peak_sizes = [0] * n
     peak_moment_sizes = [0] * n
+    peak_moment_actual_sizes = [0] * n
     peak_moment_objs = [0] * n
     threshold_object_counts = [0] * n
 
@@ -150,6 +164,8 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
     total_allocated_memory = 0
     peak_active_objects = 0
     all_large_objects = []
+    pow2_obj_counts = {}
+    pow2_total_sizes = {}
 
     event_counter = 0
 
@@ -176,13 +192,17 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                 current_sizes = [0] * n
                 peak_sizes = [0] * n
                 peak_moment_sizes = [0] * n
+                peak_moment_actual_sizes = [0] * n
                 peak_moment_objs = [0] * n
                 threshold_object_counts = [0] * n
+                current_actual_sizes = [0] * n
                 original_current_size = 0
                 original_peak_size = 0
                 total_allocated_memory = 0
                 peak_active_objects = 0
                 all_large_objects.clear()
+                pow2_obj_counts.clear()
+                pow2_total_sizes.clear()
                 event_counter = 0
                 caller_stats.clear()
                 invalid_caller_count = 0
@@ -222,7 +242,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                         caller_stats[old_caller_ip]["tot_lt"] += lifetime
                     old_pow2 = next_power_of_2(old_sz)
                     old_idx = bisect.bisect_right(thresholds, old_sz)
-                    _update_sizes_on_free(current_sizes, threshold_object_counts, n, old_sz, old_pow2, old_idx)
+                    _update_sizes_on_free(current_sizes, current_actual_sizes, threshold_object_counts, n, old_sz, old_pow2, old_idx)
 
                 active_heap[ret] = (size, event_counter, func_name, caller_ip)
                 original_current_size += size
@@ -231,14 +251,17 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                     all_large_objects.append((ret, size, func_name))
 
                 pow2 = next_power_of_2(size)
+                pow2_obj_counts[pow2] = pow2_obj_counts.get(pow2, 0) + 1
+                pow2_total_sizes[pow2] = pow2_total_sizes.get(pow2, 0) + size
                 split_idx = bisect.bisect_right(thresholds, size)
-                _update_sizes_on_alloc(current_sizes, peak_sizes, threshold_object_counts,
+                _update_sizes_on_alloc(current_sizes, current_actual_sizes, peak_sizes, threshold_object_counts,
                                        n, size, pow2, split_idx)
 
                 if original_current_size > original_peak_size:
                     original_peak_size = original_current_size
                     peak_active_objects = len(active_heap)
                     peak_moment_sizes = current_sizes.copy()
+                    peak_moment_actual_sizes = current_actual_sizes.copy()
                     peak_moment_objs = threshold_object_counts.copy()
 
         elif etype in _FREE_TYPES:
@@ -253,7 +276,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                     caller_stats[old_caller_ip]["tot_lt"] += lifetime
                 old_pow2 = next_power_of_2(old_sz)
                 old_idx = bisect.bisect_right(thresholds, old_sz)
-                _update_sizes_on_free(current_sizes, threshold_object_counts, n, old_sz, old_pow2, old_idx)
+                _update_sizes_on_free(current_sizes, current_actual_sizes, threshold_object_counts, n, old_sz, old_pow2, old_idx)
 
     # Accumulate lifetime for objects still alive at end of trace
     for ptr, (old_sz, old_alloc_ev, _, old_caller_ip) in active_heap.items():
@@ -295,9 +318,9 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
         for i in range(n):
             lo = 0 if i == 0 else thresholds[i - 1]
             hi = thresholds[i]
-            range_labels.append(f"({lo},{hi}]")
+            range_labels.append(f"({simplify_size(lo)},{simplify_size(hi)}]")
         # Extra column for >65536
-        range_labels.append(f"({thresholds[-1]},+\u221e)")
+        range_labels.append(f"({simplify_size(thresholds[-1])},+\u221e)")
 
         # Pre-compute interval metrics (excluding the extra >max column)
         interval_inc = []
@@ -307,7 +330,7 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
         interval_obj_pct = []
         cum_obj_pct = []
 
-        total_peak_objs = peak_moment_objs[-1]  # total alive objects at peak moment
+        total_peak_objs = peak_active_objects  # total alive objects at peak moment (including >65536)
         prev_objs = 0
         for i in range(n):
             # Interval-object count at peak moment (delta from cumulative peak snapshot)
@@ -332,13 +355,13 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
             interval_obj_pct.append((delta_objs / total_peak_objs * 100) if total_peak_objs > 0 else 0)
             cum_obj_pct.append((peak_moment_objs[i] / total_peak_objs * 100) if total_peak_objs > 0 else 0)
 
-        # Extra column (>65536): no objects above max threshold at peak moment
-        extra_objs = 0
+        # Extra column (>65536): objects above max threshold at peak moment
+        extra_objs = max(0, peak_active_objects - peak_moment_objs[-1])
         interval_inc.append(0)
         interval_inc_pct.append(0.0)
-        cum_inc_pct.append(cum_inc_pct[-1] if cum_inc_pct else 0.0)  # same as last cum value
-        interval_objs.append(0)
-        interval_obj_pct.append(0.0)
+        cum_inc_pct.append(0.0)
+        interval_objs.append(extra_objs)
+        interval_obj_pct.append((extra_objs / total_peak_objs * 100) if total_peak_objs > 0 else 0)
         cum_obj_pct.append(100.0)  # cumulative reaches 100%
 
         # Summary header with dynamic value alignment
@@ -351,14 +374,34 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
             print(f"{label:>{sum_label_width}}  {val:>{sum_val_width}}")
         print()
 
+        # Pre-compute actual size metrics
+        interval_actual_sizes = []
+        actual_size_pct = []
+        cum_actual_size_pct = []
+        prev_actual = 0
+        for i in range(n):
+            delta_sz = peak_moment_actual_sizes[i] - prev_actual
+            prev_actual = peak_moment_actual_sizes[i]
+            interval_actual_sizes.append(delta_sz)
+            actual_size_pct.append((delta_sz / original_peak_size * 100) if original_peak_size > 0 else 0)
+            cum_actual_size_pct.append((peak_moment_actual_sizes[i] / original_peak_size * 100) if original_peak_size > 0 else 0)
+        # Extra column (>65536)
+        extra_actual = max(0, original_peak_size - peak_moment_actual_sizes[-1])
+        interval_actual_sizes.append(extra_actual)
+        actual_size_pct.append((extra_actual / original_peak_size * 100) if original_peak_size > 0 else 0)
+        cum_actual_size_pct.append(100.0)
+
         # Data rows: (label, values, fmt_string)
         metrics = [
-            ("Aligned Inc",   interval_inc,     "{:,}"),
-            ("Inc%",          interval_inc_pct, "{:.2f}%"),
-            ("Cum Inc%",      cum_inc_pct,      "{:.2f}%"),
-            ("Obj Cnt",       interval_objs,    "{:,}"),
-            ("Obj%",          interval_obj_pct, "{:.2f}%"),
-            ("Cum Obj%",      cum_obj_pct,      "{:.2f}%"),
+            ("Aligned Inc",   interval_inc,           "{:,}"),
+            ("Inc%",          interval_inc_pct,       "{:.2f}%"),
+            ("Cum Inc%",      cum_inc_pct,            "{:.2f}%"),
+            ("Total Size",    interval_actual_sizes,  "{:,}"),
+            ("Size%",         actual_size_pct,        "{:.2f}%"),
+            ("Cum Size%",     cum_actual_size_pct,    "{:.2f}%"),
+            ("Obj Cnt",       interval_objs,          "{:,}"),
+            ("Obj%",          interval_obj_pct,       "{:.2f}%"),
+            ("Cum Obj%",      cum_obj_pct,            "{:.2f}%"),
         ]
 
         # Compute dynamic column widths from actual formatted data
@@ -491,6 +534,63 @@ def process_malloc_binary(filename, objects_path=None, from_main=False):
                 with open(objects_path, "w") as obj_out:
                     obj_out.write("No objects >= 32KB found.\n")
                 print(f"No objects >= 32KB found (empty report written to: {objects_path})")
+
+        # ===== All Objects Size Distribution (by power-of-2 intervals) =====
+        if pow2_obj_counts:
+            pow2_keys = sorted(pow2_obj_counts.keys())
+            pow2_headers = ['Range', 'Objects', 'Obj%', 'Total Size', 'Size%', 'Cum Obj%', 'Cum Size%']
+            pow2_rows = []
+            cum_objs = 0
+            cum_sz = 0
+            for k in pow2_keys:
+                lo = k // 2
+                hi = k
+                cnt = pow2_obj_counts[k]
+                sz = pow2_total_sizes[k]
+                cum_objs += cnt
+                cum_sz += sz
+                obj_pct = cnt / total_alloc * 100
+                sz_pct = sz / total_allocated_memory * 100
+                cum_obj_pct_val = cum_objs / total_alloc * 100
+                cum_sz_pct_val = cum_sz / total_allocated_memory * 100
+                range_str = f"({simplify_size(lo)},{simplify_size(hi)}]"
+                pow2_rows.append((range_str, cnt, obj_pct, sz, sz_pct, cum_obj_pct_val, cum_sz_pct_val))
+
+            # Build formatted strings
+            pow2_headers_w = len(pow2_headers)
+            col_data = [[] for _ in range(pow2_headers_w)]
+            for ci, h in enumerate(pow2_headers):
+                col_data[ci].append(h)
+            for row in pow2_rows:
+                col_data[0].append(row[0])
+                col_data[1].append(f"{row[1]:,}")
+                col_data[2].append(f"{row[2]:.2f}%")
+                col_data[3].append(format_size(row[3]))
+                col_data[4].append(f"{row[4]:.2f}%")
+                col_data[5].append(f"{row[5]:.2f}%")
+                col_data[6].append(f"{row[6]:.2f}%")
+            col_widths_p2 = [max(len(s) for s in col_data[ci]) for ci in range(pow2_headers_w)]
+
+            # Output table (same layout as previous tables: first col left, rest right)
+            print("\n=== All Objects Size Distribution (by power-of-2 intervals) ===")
+            hdr = f"{pow2_headers[0]:<{col_widths_p2[0]}}"
+            for ci in range(1, pow2_headers_w):
+                hdr += f"  {pow2_headers[ci]:>{col_widths_p2[ci]}}"
+            print(hdr)
+            sep = "-" * col_widths_p2[0]
+            for ci in range(1, pow2_headers_w):
+                sep += "  " + "-" * col_widths_p2[ci]
+            print(sep)
+            for ri, row in enumerate(pow2_rows):
+                idx = ri + 1  # skip header at index 0
+                line = f"{row[0]:<{col_widths_p2[0]}}"
+                line += f"  {col_data[1][idx]:>{col_widths_p2[1]}}"
+                line += f"  {col_data[2][idx]:>{col_widths_p2[2]}}"
+                line += f"  {col_data[3][idx]:>{col_widths_p2[3]}}"
+                line += f"  {col_data[4][idx]:>{col_widths_p2[4]}}"
+                line += f"  {col_data[5][idx]:>{col_widths_p2[5]}}"
+                line += f"  {col_data[6][idx]:>{col_widths_p2[6]}}"
+                print(line)
 
         print(f"Analysis successfully done. Output logs saved to base: {base_name}")
         sys.stdout = sys.__stdout__
