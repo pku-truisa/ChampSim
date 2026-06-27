@@ -1481,7 +1481,7 @@ output_table_caller (FILE *fp)
   int i, ncallers = 0;
   for (i = 0; i < CALLER_HASH_SIZE; i++)
     if (caller_tbl[i].ip != 0) ncallers++;
-  fprintf (fp, "\n=== Top Caller IP Statistics (top 50 by average size) ===\n");
+  fprintf (fp, "\n=== Caller IP Statistics (sorted by average size) ===\n");
   if (ncallers == 0) { fprintf (fp, "  (no caller IP data collected)\n"); return; }
   int n = 0;
   int *sorted = (int *) (*mallocp) (ncallers * sizeof (int));
@@ -1507,7 +1507,7 @@ output_table_caller (FILE *fp)
            "Caller IP", "Type", "Alloc Count", "Avg Size", "Total Size", "Avg Lifetime(cyc)");
   for (i = 0; i < 95; i++) fputc ('-', fp);
   fputc ('\n', fp);
-  int limit = n < 50 ? n : 50;
+  int limit = n;
   for (int ri = 0; ri < limit; ri++)
     {
       int idx = sorted[ri];
