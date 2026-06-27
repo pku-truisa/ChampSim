@@ -36,8 +36,8 @@ Profile memory usage of PROGRAM.
    -m,--mmap              Also trace mmap & friends
    -c,--champsim-trace=FILE  Also output ChampSim malloc trace format
    -s,--summary-file=FILE  Output three statistic tables to FILE (plain text)
-      --summary-only       Suppress colorful stderr histogram; tables only
-                           (-s FILE = --summary-file; -s alone = --summary-only)
+                               (screen output always shown; -s requires FILE)
+                           
 
    -?,--help              Print this help and exit
       --usage             Give a short usage message
@@ -63,7 +63,6 @@ progname=
 tracemmap=
 mtrace=
 summary_file=
-summary_only=
 
 while test $# -gt 0; do
   case "$1" in
@@ -83,17 +82,10 @@ while test $# -gt 0; do
   -c | --champsim-trace) shift; mtrace="$1" ;;
   --champsim-trace=*) mtrace=${1##*=} ;;
   -m | --mmap) tracemmap=yes ;;
-   -s) shift
-      if test $# -gt 0 && ! expr "$1" : '^-' >/dev/null 2>&1; then
-        summary_file="$1"
-      else
-        summary_only=yes
-        continue
-      fi
-      ;;
+   -s) shift; summary_file="$1" ;;
   --summary-file) shift; summary_file="$1" ;;
   --summary-file=*) summary_file=${1##*=} ;;
-  --summary-only) summary_only=yes ;;
+  
   -t | --time-based) memusagestat_args="$memusagestat_args -t" ;;
   -T | --total) memusagestat_args="$memusagestat_args -T" ;;
   --title) shift; memusagestat_args="$memusagestat_args -s $1" ;;
@@ -140,10 +132,6 @@ fi
 if test -n "$summary_file"; then
   add_env="$add_env MEMUSAGE_SUMMARY_FILE=$summary_file"
 fi
-if test -n "$summary_only"; then
-  add_env="$add_env MEMUSAGE_SUMMARY_ONLY=1"
-fi
-
 eval "$add_env" '"$@"'
 result=$?
 

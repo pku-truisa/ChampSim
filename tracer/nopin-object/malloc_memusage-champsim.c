@@ -140,7 +140,6 @@ extern const char *__progname;
 static int mtrace_fd = -1;
 
 /* === New statistics tracking for three output tables === */
-static bool summary_only = false;
 static FILE *summary_fp = NULL;
 static FILE *mtrace_fp = NULL;            /* xz popen alternative to mtrace_fd */
 
@@ -154,12 +153,16 @@ static _Atomic unsigned long long pow2_sizes[POW2_BUCKETS];
 static const size_t threshold_vals[NUM_THRESHOLDS] = {
   16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
 };
-static _Atomic long long cur_objs[NUM_THRESHOLDS];
-static _Atomic long long cur_actual[NUM_THRESHOLDS];
-static _Atomic long long cur_aligned[NUM_THRESHOLDS];
+/* Cumulative interval tracking (matching Python's bisect_right semantics)
+   cum_aligned[i] = actual_{<=threshold[i]} + pow2_{>threshold[i]}
+   cum_actual[i]  = actual_{<=threshold[i]}
+   cum_objs[i]    = count_{<=threshold[i]}  */
+static _Atomic unsigned long long cum_aligned[NUM_THRESHOLDS];
+static _Atomic unsigned long long cum_actual[NUM_THRESHOLDS];
+static _Atomic long long cum_objs[NUM_THRESHOLDS];
+static unsigned long long peak_aligned[NUM_THRESHOLDS];
+static unsigned long long peak_actual[NUM_THRESHOLDS];
 static long long peak_objs[NUM_THRESHOLDS];
-static long long peak_actual[NUM_THRESHOLDS];
-static long long peak_aligned[NUM_THRESHOLDS];
 static _Atomic unsigned long long peak_heap_val;
 static _Atomic unsigned long long peak_objs_val;
 static _Atomic unsigned long long alive_objs;   /* current number of live objects */
@@ -167,11 +170,13 @@ static _Atomic unsigned long long alive_objs;   /* current number of live object
 /* Caller IP hash table */
 #define CALLER_HASH_SIZE 32768
 struct caller_entry {
-  unsigned long long ip;
+  _Atomic unsigned long long ip;
   _Atomic unsigned long long count;
   _Atomic unsigned long long tot_sz;
-  _Atomic unsigned long long tot_lt;     /* total lifetime in cycles */
-  _Atomic unsigned char type;
+  _Atomic unsigned long long tot_lt;     /* total lifetime in cycles (freed objects) */
+  _Atomic unsigned long long alloc_cycles_sum; /* sum of alloc_cycles for unfreed objects */
+  _Atomic unsigned long long unfreed_cnt;      /* number of objects not yet freed */
+  _Atomic unsigned int types[9];         /* frequency per type (indices 1-8) */
 };
 static struct caller_entry caller_tbl[CALLER_HASH_SIZE];
 static _Atomic unsigned long long caller_entries;
@@ -244,7 +249,7 @@ update_data (struct header *result, size_t len, size_t old_len)
 				 memory_order_relaxed) + len - old_len;
   peak_atomic_max (&peak_heap, heap);
   /* Check and snapshot peak-interval stats.  */
-  stats_check_peak ();
+  /* stats_check_peak moved after stats_alloc/free */
 
   /* Compute current stack usage and compare it with the maximum
      value.  The base stack pointer might not be set if this is not
@@ -338,13 +343,25 @@ pow2_bucket (size_t sz)
   return 64 - __builtin_clzll ((unsigned long long)(sz - 1));
 }
 
+/* bisect_right(thresholds, sz): returns count of thresholds <= sz */
 static inline int
-interval_idx (size_t sz)
+bisect_right (size_t sz)
 {
-  for (int i = 0; i < NUM_THRESHOLDS; i++)
-    if (sz <= threshold_vals[i])
+  int i;
+  for (i = 0; i < NUM_THRESHOLDS; i++)
+    if (threshold_vals[i] > sz)
       return i;
-  return NUM_THRESHOLDS - 1;
+  return NUM_THRESHOLDS;
+}
+
+static inline unsigned long long
+next_power_of_2 (unsigned long long n)
+{
+  if (n == 0 || n == 1) return 1;
+  if ((n & (n - 1)) == 0) return n;
+  unsigned long long p = 1;
+  while (p < n) p <<= 1;
+  return p;
 }
 
 static inline unsigned long long
@@ -353,7 +370,7 @@ caller_hash (unsigned long long ip)
   return (ip ^ (ip >> 16) ^ (ip >> 32)) % CALLER_HASH_SIZE;
 }
 
-/* Record an allocation in pow2 + interval stats. */
+/* Record an allocation in cumulative interval + pow2 stats. */
 static inline void
 stats_alloc (size_t sz)
 {
@@ -363,26 +380,45 @@ stats_alloc (size_t sz)
       atomic_fetch_add_explicit (&pow2_objs[p2], 1, memory_order_relaxed);
       atomic_fetch_add_explicit (&pow2_sizes[p2], sz, memory_order_relaxed);
     }
-  int iv = interval_idx (sz);
-  atomic_fetch_add_explicit (&cur_objs[iv], 1, memory_order_relaxed);
-  atomic_fetch_add_explicit (&cur_actual[iv], sz, memory_order_relaxed);
-  atomic_fetch_add_explicit (&cur_aligned[iv], sz, memory_order_relaxed);
+  /* Cumulative interval tracking (Python semantics) */
+  int split = bisect_right (sz);  /* count of thresholds <= sz */
+  unsigned long long pow2 = next_power_of_2 (sz);
+  int i;
+  for (i = 0; i < split; i++)
+    atomic_fetch_add_explicit (&cum_aligned[i], sz, memory_order_relaxed);
+  for (i = split; i < NUM_THRESHOLDS; i++)
+    {
+      atomic_fetch_add_explicit (&cum_aligned[i], pow2, memory_order_relaxed);
+      atomic_fetch_add_explicit (&cum_actual[i], sz, memory_order_relaxed);
+      atomic_fetch_add_explicit (&cum_objs[i], 1, memory_order_relaxed);
+    }
   atomic_fetch_add_explicit (&alive_objs, 1, memory_order_relaxed);
 }
 
-/* Record a free in interval stats. */
+/* Record a free in cumulative interval stats. */
 static inline void
 stats_free (size_t sz)
 {
-  int iv = interval_idx (sz);
-  atomic_fetch_sub_explicit (&cur_objs[iv], 1, memory_order_relaxed);
-  atomic_fetch_sub_explicit (&cur_actual[iv], sz, memory_order_relaxed);
-  atomic_fetch_sub_explicit (&cur_aligned[iv], sz, memory_order_relaxed);
+  int split = bisect_right (sz);
+  unsigned long long pow2 = next_power_of_2 (sz);
+  int i;
+  for (i = 0; i < split; i++)
+    atomic_fetch_sub_explicit (&cum_aligned[i], sz, memory_order_relaxed);
+  for (i = split; i < NUM_THRESHOLDS; i++)
+    {
+      atomic_fetch_sub_explicit (&cum_aligned[i], pow2, memory_order_relaxed);
+      atomic_fetch_sub_explicit (&cum_actual[i], sz, memory_order_relaxed);
+      atomic_fetch_sub_explicit (&cum_objs[i], 1, memory_order_relaxed);
+    }
   atomic_fetch_sub_explicit (&alive_objs, 1, memory_order_relaxed);
 }
 
 /* Insert or update caller IP hash table entry.  cycles_delta is 0 on alloc,
    (cycles_now - alloc_cycles) on free. */
+/* Insert or update caller IP hash table entry.
+   For ALLOC events: sz is the allocated size, cycles_delta=0.
+   For FREE events: sz is the freed size, cycles_delta = (cycles_now - alloc_cycles).
+   Only the original allocator's IP gets the lifetime update. */
 static inline void
 stats_caller (unsigned long long ip, size_t sz,
               unsigned char type, unsigned long long cycles_delta)
@@ -404,8 +440,24 @@ stats_caller (unsigned long long ip, size_t sz,
                                   memory_order_relaxed);
           atomic_store_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
                                   memory_order_relaxed);
-          atomic_store_explicit (&caller_tbl[idx].type, type,
+          atomic_store_explicit (&caller_tbl[idx].alloc_cycles_sum, 0,
                                   memory_order_relaxed);
+          atomic_store_explicit (&caller_tbl[idx].unfreed_cnt, 0,
+                                  memory_order_relaxed);
+          /* Clear and increment type frequency */
+          for (int t = 0; t < 9; t++)
+            atomic_store_explicit (&caller_tbl[idx].types[t], 0,
+                                    memory_order_relaxed);
+          if (type < 9)
+            atomic_fetch_add_explicit (&caller_tbl[idx].types[type], 1,
+                                        memory_order_relaxed);
+          if (type <= TYPE_REALLOC) /* alloc types */
+            {
+              atomic_store_explicit (&caller_tbl[idx].unfreed_cnt, 1,
+                                      memory_order_relaxed);
+              atomic_store_explicit (&caller_tbl[idx].alloc_cycles_sum,
+                                      get_cycles (), memory_order_relaxed);
+            }
           atomic_fetch_add_explicit (&caller_entries, 1,
                                       memory_order_relaxed);
           return;
@@ -418,12 +470,53 @@ stats_caller (unsigned long long ip, size_t sz,
                                       memory_order_relaxed);
           atomic_fetch_add_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
                                       memory_order_relaxed);
-          atomic_store_explicit (&caller_tbl[idx].type, type,
-                                  memory_order_relaxed);
+          if (type < 9)
+            atomic_fetch_add_explicit (&caller_tbl[idx].types[type], 1,
+                                        memory_order_relaxed);
+          if (type <= TYPE_REALLOC) /* alloc types */
+            {
+              atomic_fetch_add_explicit (&caller_tbl[idx].unfreed_cnt, 1,
+                                          memory_order_relaxed);
+              atomic_fetch_add_explicit (&caller_tbl[idx].alloc_cycles_sum,
+                                          get_cycles (), memory_order_relaxed);
+            }
           return;
         }
     }
   /* Table full – silently drop */
+}
+
+/* Update lifetime only for an existing caller entry (matching Python: free events
+   accumulate lifetime to the ORIGINAL allocator, not the free caller).
+   Does NOT create a new entry if the IP is not found. */
+static inline void
+stats_caller_lifetime (unsigned long long ip, unsigned long long cycles_delta,
+                       unsigned long long alloc_cycles)
+{
+  if (ip == 0 || ip <= 4096)
+    return;
+  unsigned long long h = caller_hash (ip);
+  for (unsigned int i = 0; i < CALLER_HASH_SIZE; i++)
+    {
+      unsigned int idx = (h + i) % CALLER_HASH_SIZE;
+      if (caller_tbl[idx].ip == ip)
+        {
+          if (cycles_delta != 0)
+            atomic_fetch_add_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
+                                        memory_order_relaxed);
+          /* Decrement unfreed tracking */
+          if (alloc_cycles != 0)
+            {
+              atomic_fetch_add_explicit (&caller_tbl[idx].unfreed_cnt, -1ULL,
+                                          memory_order_relaxed);
+              atomic_fetch_add_explicit (&caller_tbl[idx].alloc_cycles_sum,
+                                          -alloc_cycles, memory_order_relaxed);
+            }
+          return;
+        }
+      if (caller_tbl[idx].ip == 0)
+        return;  /* empty slot -> entry not found */
+    }
 }
 
 /* Check whether current heap exceeds peak, and snapshot if so. */
@@ -445,11 +538,11 @@ stats_check_peak (void)
           atomic_store_explicit (&peak_objs_val, objs, memory_order_relaxed);
           for (int i = 0; i < NUM_THRESHOLDS; i++)
             {
-              peak_objs[i] = atomic_load_explicit (&cur_objs[i],
+              peak_objs[i] = atomic_load_explicit (&cum_objs[i],
                                                     memory_order_relaxed);
-              peak_actual[i] = atomic_load_explicit (&cur_actual[i],
+              peak_actual[i] = atomic_load_explicit (&cum_actual[i],
                                                       memory_order_relaxed);
-              peak_aligned[i] = atomic_load_explicit (&cur_aligned[i],
+              peak_aligned[i] = atomic_load_explicit (&cum_aligned[i],
                                                        memory_order_relaxed);
             }
         }
@@ -465,7 +558,9 @@ get_cycles (void)
   HP_TIMING_NOW (now);
   return (unsigned long long) now;
 #else
-  return 0;
+  unsigned int lo, hi;
+  __asm__ volatile ("rdtsc" : "=a" (lo), "=d" (hi));
+  return ((unsigned long long)hi << 32) | lo;
 #endif
 }
 
@@ -619,11 +714,7 @@ me (void)
       if (summary_file != NULL && summary_file[0] != '\0')
         {
           summary_fp = fopen (summary_file, "w");
-          if (summary_fp != NULL)
-            summary_only = true;
         }
-      if (getenv ("MEMUSAGE_SUMMARY_ONLY") != NULL)
-        summary_only = true;
     }
 }
 
@@ -707,6 +798,7 @@ malloc (size_t len)
 
   /* Update new statistics tables.  */
   stats_alloc (len);
+  stats_check_peak ();
   stats_caller (mtrace_caller_ip, len, TYPE_MALLOC, 0);
 
   /* Return the pointer to the user buffer.  */
@@ -734,7 +826,20 @@ realloc (void *old, size_t len)
 
   /* If this is not the correct program just use the normal function.  */
   if (not_me)
-    return (*reallocp)(old, len);
+    {
+      if (old != NULL)
+        {
+          struct header *real = ((struct header *) old) - 1;
+          if (real->magic == MAGIC)
+            {
+              struct header *newh = (*reallocp)(real, len + sizeof (struct header));
+              if (newh == NULL) return NULL;
+              newh->length = len;
+              return (void *) (newh + 1);
+            }
+        }
+      return (*reallocp)(old, len);
+    }
 
   if (old == NULL)
     {
@@ -785,8 +890,10 @@ realloc (void *old, size_t len)
 
       /* Update new statistics tables.  */
       stats_free (old_len);
-      stats_caller (mtrace_caller_ip, old_len, TYPE_FREE,
-                    get_cycles () - real->alloc_cycles);
+  stats_check_peak ();
+      /* Update lifetime for the original allocator (not the free caller) */
+      stats_caller_lifetime (real->caller_ip, get_cycles () - real->alloc_cycles,
+                               real->alloc_cycles);
 
       /* Do the real work.  */
       (*freep) (real);
@@ -801,6 +908,11 @@ realloc (void *old, size_t len)
     atomic_fetch_add_explicit (&large, 1, memory_order_relaxed);
   /* Total number of calls of any of the functions.  */
   atomic_fetch_add_explicit (&calls_total, 1, memory_order_relaxed);
+
+
+  /* Save old header info before reallocp may free the old block.  */
+  unsigned long long old_caller_ip = (real != NULL) ? real->caller_ip : 0;
+  unsigned long long old_alloc_cycles = (real != NULL) ? real->alloc_cycles : 0;
 
   /* Do the real work.  */
   result = (struct header *) (*reallocp)(real, len + sizeof (struct header));
@@ -833,10 +945,12 @@ realloc (void *old, size_t len)
   if (old_len > 0)
     {
       stats_free (old_len);
-      stats_caller (real->caller_ip, old_len, TYPE_FREE,
-                    get_cycles () - real->alloc_cycles);
+  stats_check_peak ();
+      stats_caller_lifetime (old_caller_ip, get_cycles () - old_alloc_cycles,
+                               old_alloc_cycles);
     }
   stats_alloc (len);
+  stats_check_peak ();
   stats_caller (mtrace_caller_ip, len, TYPE_REALLOC, 0);
 
   /* Return the pointer to the user buffer.  */
@@ -901,6 +1015,7 @@ calloc (size_t n, size_t len)
 
   /* Update new statistics tables.  */
   stats_alloc (size);
+  stats_check_peak ();
   stats_caller (mtrace_caller_ip, size, TYPE_CALLOC, 0);
 
   /* Do what `calloc' would have done and return the buffer to the caller.  */
@@ -927,7 +1042,14 @@ free (void *ptr)
   /* If this is not the correct program just use the normal function.  */
   if (not_me)
     {
-      (*freep) (ptr);
+      if (ptr != NULL)
+        {
+          struct header *real = ((struct header *) ptr) - 1;
+          if (real->magic == MAGIC)
+            (*freep) (real);
+          else
+            (*freep) (ptr);
+        }
       return;
     }
 
@@ -965,8 +1087,9 @@ free (void *ptr)
 
   /* Update new statistics tables.  */
   stats_free (real->length);
-  stats_caller (mtrace_caller_ip, real->length, TYPE_FREE,
-                get_cycles () - real->alloc_cycles);
+  stats_check_peak ();
+  stats_caller_lifetime (real->caller_ip, get_cycles () - real->alloc_cycles,
+                           real->alloc_cycles);
 
   /* Do the real work.  */
   (*freep) (real);
@@ -1030,6 +1153,7 @@ mmap (void *start, size_t len, int prot, int flags, int fd, off_t offset)
 
           /* Update new statistics tables (mmap alloc).  */
           stats_alloc (len);
+  stats_check_peak ();
           stats_caller (mtrace_caller_ip, len, TYPE_MMAP, 0);
         }
     }
@@ -1093,6 +1217,7 @@ mmap64 (void *start, size_t len, int prot, int flags, int fd, off64_t offset)
 
           /* Update new statistics tables (mmap64 alloc).  */
           stats_alloc (len);
+  stats_check_peak ();
           stats_caller (mtrace_caller_ip, len, TYPE_MMAP64, 0);
         }
     }
@@ -1173,7 +1298,9 @@ mremap (void *start, size_t old_len, size_t len, int flags, ...)
 
           /* Update new statistics tables (mremap: free old + alloc new).  */
           stats_free (old_len);
+  stats_check_peak ();
           stats_alloc (len);
+  stats_check_peak ();
           stats_caller (mtrace_caller_ip, len, TYPE_MREMAP, 0);
         }
     }
@@ -1224,6 +1351,7 @@ munmap (void *start, size_t len)
 
           /* Update new statistics tables (munmap free).  */
           stats_free (len);
+  stats_check_peak ();
           stats_caller (mtrace_caller_ip, len, TYPE_MUNMAP, 0);
         }
       else
@@ -1238,96 +1366,181 @@ munmap (void *start, size_t len)
 /* ===== Output functions for the three new statistics tables ===== */
 
 static const char *
-fmt_sz (unsigned long long v, char *buf, size_t bufsz)
+fmt_range_val (unsigned long long v, char *buf, size_t bufsz)
 {
-  if (v >= (1024ULL * 1024 * 1024))
-    snprintf (buf, bufsz, "%.2fG", (double)v / (1024.0 * 1024 * 1024));
-  else if (v >= (1024ULL * 1024))
-    snprintf (buf, bufsz, "%.2fM", (double)v / (1024.0 * 1024));
-  else if (v >= 1024)
-    snprintf (buf, bufsz, "%.2fK", (double)v / 1024.0);
+  if (v >= (1024ULL * 1024 * 1024) && (v % (1024ULL * 1024 * 1024)) == 0)
+    snprintf (buf, bufsz, "%lluG", v / (1024ULL * 1024 * 1024));
+  else if (v >= (1024ULL * 1024) && (v % (1024ULL * 1024)) == 0)
+    snprintf (buf, bufsz, "%lluM", v / (1024ULL * 1024));
+  else if (v >= 1024 && (v % 1024) == 0)
+    snprintf (buf, bufsz, "%lluK", v / 1024);
   else
     snprintf (buf, bufsz, "%llu", v);
   return buf;
 }
 
-/* Table 1: Peak Memory Usage by Size Interval */
+static const char *
+fmt_sz (unsigned long long v, char *buf, size_t bufsz)
+{
+  if (v >= (1024ULL * 1024 * 1024))
+    snprintf (buf, bufsz, "%.2f G", (double)v / (1024.0 * 1024 * 1024));
+  else if (v >= (1024ULL * 1024))
+    snprintf (buf, bufsz, "%.2f M", (double)v / (1024.0 * 1024));
+  else if (v >= 1024)
+    snprintf (buf, bufsz, "%.2f K", (double)v / 1024.0);
+  else
+    snprintf (buf, bufsz, "%llu", v);
+  return buf;
+}
+
+/* Table 1: Peak Memory Usage by Size Interval (matches Python cumulative logic) */
 static void
 output_table_peak (FILE *fp)
 {
   int i;
-  unsigned long long total_inc = 0, total_sz = 0, total_obj = 0;
-  for (i = 0; i < NUM_THRESHOLDS; i++)
-    { total_inc += peak_aligned[i]; total_sz += peak_actual[i]; total_obj += peak_objs[i]; }
-
   fprintf (fp, "\n=== Peak Memory Usage by Size Interval ===\n");
+
+  /* Column headers: row names on left, interval columns */
   fprintf (fp, "%-14s %15s %7s %7s %15s %7s %7s %10s %7s %7s\n",
-           "Range", "Aligned Inc", "Inc%", "Cum%",
-           "Total Size", "Size%", "Cum%", "Obj Cnt", "Obj%", "Cum%");
+           "Range", "Aligned Inc", "Inc%%", "Cum%%",
+           "Total Size", "Size%%", "Cum%%", "Obj Cnt", "Obj%%", "Cum%%");
   for (i = 0; i < 110; i++) fputc ('-', fp);
   fputc ('\n', fp);
-  unsigned long long cum_inc = 0, cum_sz = 0, cum_obj = 0;
+
+  unsigned long long peak_heap_v = atomic_load_explicit (&peak_heap_val, memory_order_relaxed);
+  unsigned long long peak_objs_v = atomic_load_explicit (&peak_objs_val, memory_order_relaxed);
+  unsigned long long prev_aligned = 0, prev_actual = 0;
+  long long prev_objs = 0;
+
   for (i = 0; i < NUM_THRESHOLDS; i++)
     {
       char rb[64], ib[32], sb[32];
-      unsigned long long inc = peak_aligned[i], sz = peak_actual[i], obj = peak_objs[i];
-      cum_inc += inc; cum_sz += sz; cum_obj += obj;
-      unsigned long long prev = (i == 0) ? 0 : (unsigned long long)threshold_vals[i - 1];
-      snprintf (rb, sizeof (rb), "(%llu,%llu]", prev, (unsigned long long)threshold_vals[i]);
-      fprintf (fp, "%-14s %15s %6.2f%% %6.2f%% %15s %6.2f%% %6.2f%% %10llu %6.2f%% %6.2f%%\n",
-               rb, fmt_sz (inc, ib, sizeof (ib)),
-               total_inc ? 100.0 * inc / total_inc : 0.0,
-               total_inc ? 100.0 * cum_inc / total_inc : 0.0,
-               fmt_sz (sz, sb, sizeof (sb)),
-               total_sz ? 100.0 * sz / total_sz : 0.0,
-               total_sz ? 100.0 * cum_sz / total_sz : 0.0,
-               (unsigned long long)obj,
-               total_obj ? 100.0 * obj / total_obj : 0.0,
-               total_obj ? 100.0 * cum_obj / total_obj : 0.0);
+      unsigned long long alc = peak_aligned[i];
+      unsigned long long act = peak_actual[i];
+      long long obj = peak_objs[i];
+
+      /* Python: inc = peak_sizes[i] - (original_peak_size if i==0 else peak_sizes[i-1]) */
+      unsigned long long base = (i == 0) ? peak_heap_v : prev_aligned;
+      long long inc = (long long)(alc - base);
+
+      /* Python: delta_sz = peak_actual_sizes[i] - (0 if i==0 else peak_actual_sizes[i-1]) */
+      unsigned long long delta_sz = act - prev_actual;
+
+      /* Python: delta_objs = peak_objs[i] - (0 if i==0 else peak_objs[i-1]) */
+      long long delta_objs = obj - prev_objs;
+
+      /* Python: total_aligned_inc = peak_sizes[i] - original_peak_size */
+      long long total_inc = (long long)(alc - peak_heap_v);
+
+      prev_aligned = alc;
+      prev_actual = act;
+      prev_objs = obj;
+
+      char rlo[32], rhi[32];
+      unsigned long long prev_t = (i == 0) ? 0 : (unsigned long long)threshold_vals[i - 1];
+      snprintf (rb, sizeof (rb), "(%s,%s]",
+                fmt_range_val (prev_t, rlo, sizeof (rlo)),
+                fmt_range_val ((unsigned long long)threshold_vals[i], rhi, sizeof (rhi)));
+
+      fprintf (fp, "%-14s %15s %6.2f%% %6.2f%% %15s %6.2f%% %6.2f%% %10lld %6.2f%% %6.2f%%\n",
+               rb,
+               fmt_sz (inc > 0 ? (unsigned long long)inc : 0, ib, sizeof (ib)),
+               peak_heap_v ? 100.0 * inc / peak_heap_v : 0.0,
+               peak_heap_v ? 100.0 * total_inc / peak_heap_v : 0.0,
+               fmt_sz (delta_sz, sb, sizeof (sb)),
+               peak_heap_v ? 100.0 * delta_sz / peak_heap_v : 0.0,
+               peak_heap_v ? 100.0 * act / peak_heap_v : 0.0,
+               (long long)delta_objs,
+               peak_objs_v ? 100.0 * delta_objs / peak_objs_v : 0.0,
+               peak_objs_v ? 100.0 * obj / peak_objs_v : 0.0);
     }
+
+  /* Extra >65536 column (Python: objects above max threshold) */
+  {
+    char rb[64], ib[32], sb[32];
+    unsigned long long extra_sz = (peak_heap_v > prev_actual) ? peak_heap_v - prev_actual : 0;
+    long long extra_objs = (long long)((peak_objs_v > (unsigned long long)prev_objs) ? peak_objs_v - (unsigned long long)prev_objs : 0);
+    char rhi[32];
+    snprintf (rb, sizeof (rb), "(%s,+)", fmt_range_val ((unsigned long long)threshold_vals[NUM_THRESHOLDS - 1], rhi, sizeof (rhi)));
+    fprintf (fp, "%-14s %15s %6.2f%% %6.2f%% %15s %6.2f%% %6.2f%% %10lld %6.2f%% %6.2f%%\n",
+             rb, fmt_sz (0, ib, sizeof (ib)), 0.0,
+             peak_heap_v ? 100.0 * 0 / peak_heap_v : 0.0,
+             fmt_sz (extra_sz, sb, sizeof (sb)),
+             peak_heap_v ? 100.0 * extra_sz / peak_heap_v : 0.0,
+             100.0,
+             (long long)extra_objs,
+             peak_objs_v ? 100.0 * extra_objs / peak_objs_v : 0.0,
+             100.0);
+  }
 }
 
-/* Table 2: Top Caller IP Statistics */
+/* Table 2: Top Caller IP Statistics (matches Python: type from frequency, sort by avg_size) */
 static void
 output_table_caller (FILE *fp)
 {
   int i, ncallers = 0;
   for (i = 0; i < CALLER_HASH_SIZE; i++)
     if (caller_tbl[i].ip != 0) ncallers++;
-  fprintf (fp, "\n=== Top Caller IP Statistics (top 50 by total size) ===\n");
+  fprintf (fp, "\n=== Top Caller IP Statistics (top 50 by average size) ===\n");
   if (ncallers == 0) { fprintf (fp, "  (no caller IP data collected)\n"); return; }
   int n = 0;
-  int *sorted = (int *)__builtin_alloca (ncallers * sizeof (int));
+  int *sorted = (int *) (*mallocp) (ncallers * sizeof (int));
+  if (sorted == NULL)
+    { fprintf (fp, "  (malloc failed for sorting)\n"); return; }
   for (i = 0; i < CALLER_HASH_SIZE; i++)
     if (caller_tbl[i].ip != 0) sorted[n++] = i;
+  /* Sort by avg_size descending (matching Python) */
   for (int a = 0; a < n - 1; a++)
     for (int b = 0; b < n - 1 - a; b++)
-      if (caller_tbl[sorted[b]].tot_sz < caller_tbl[sorted[b + 1]].tot_sz)
-        { int t = sorted[b]; sorted[b] = sorted[b + 1]; sorted[b + 1] = t; }
-  fprintf (fp, "  %-18s %10s %15s %10s %18s %s\n",
-           "Caller IP", "Count", "Total Size", "Avg Size", "Avg Lifetime(cyc)", "Type");
-  for (i = 0; i < 100; i++) fputc ('-', fp);
+      {
+        unsigned long long cnt_a = atomic_load_explicit (&caller_tbl[sorted[b]].count, memory_order_relaxed);
+        unsigned long long cnt_b = atomic_load_explicit (&caller_tbl[sorted[b + 1]].count, memory_order_relaxed);
+        unsigned long long sz_a = atomic_load_explicit (&caller_tbl[sorted[b]].tot_sz, memory_order_relaxed);
+        unsigned long long sz_b = atomic_load_explicit (&caller_tbl[sorted[b + 1]].tot_sz, memory_order_relaxed);
+        unsigned long long avg_a = cnt_a ? sz_a / cnt_a : 0;
+        unsigned long long avg_b = cnt_b ? sz_b / cnt_b : 0;
+        if (avg_a < avg_b)
+          { int t = sorted[b]; sorted[b] = sorted[b + 1]; sorted[b + 1] = t; }
+      }
+  /* Python output: Caller IP, Type, Alloc Count, Avg Size, Total Size, Avg Lifetime */
+  fprintf (fp, "  %18s %8s %12s %10s %15s %18s\n",
+           "Caller IP", "Type", "Alloc Count", "Avg Size", "Total Size", "Avg Lifetime(cyc)");
+  for (i = 0; i < 95; i++) fputc ('-', fp);
   fputc ('\n', fp);
   int limit = n < 50 ? n : 50;
   for (int ri = 0; ri < limit; ri++)
     {
       int idx = sorted[ri];
-      unsigned long long ip = caller_tbl[idx].ip, cnt = caller_tbl[idx].count;
-      unsigned long long tot_sz = caller_tbl[idx].tot_sz, tot_lt = caller_tbl[idx].tot_lt;
-      unsigned char tc = caller_tbl[idx].type;
-      const char *ts = "?";
-      switch (tc) { case 1: ts="malloc"; break; case 2: ts="calloc"; break;
-        case 3: ts="realloc"; break; case 4: ts="free"; break;
-        case 5: ts="mmap"; break; case 6: ts="mmap64"; break;
-        case 7: ts="mremap"; break; case 8: ts="munmap"; break; }
+      unsigned long long ip = caller_tbl[idx].ip;
+      unsigned long long cnt = atomic_load_explicit (&caller_tbl[idx].count, memory_order_relaxed);
+      unsigned long long tot_sz = atomic_load_explicit (&caller_tbl[idx].tot_sz, memory_order_relaxed);
+      unsigned long long tot_lt = atomic_load_explicit (&caller_tbl[idx].tot_lt, memory_order_relaxed);
+      /* Determine primary type (most frequent) */
+      unsigned int max_type = 0, max_cnt = 0;
+      for (int ti = 1; ti < 9; ti++)
+        {
+          unsigned int c = atomic_load_explicit (&caller_tbl[idx].types[ti], memory_order_relaxed);
+          if (c > max_cnt) { max_cnt = c; max_type = ti; }
+        }
+      const char *typestr = "?";
+      switch (max_type) {
+        case 1: typestr = "malloc"; break; case 2: typestr = "calloc"; break;
+        case 3: typestr = "realloc"; break; case 4: typestr = "free"; break;
+        case 5: typestr = "mmap"; break; case 6: typestr = "mmap64"; break;
+        case 7: typestr = "mremap"; break; case 8: typestr = "munmap"; break;
+      }
       char sb[32];
-      fprintf (fp, "  0x%016llx %10llu %15s %10llu %18llu %s\n",
-               ip, cnt, fmt_sz (tot_sz, sb, sizeof (sb)),
-               cnt ? tot_sz / cnt : 0ULL, cnt ? tot_lt / cnt : 0ULL, ts);
+      fprintf (fp, "  0x%016llx %8s %12llu %10llu %15s %18llu\n",
+               ip, typestr, cnt,
+               cnt ? tot_sz / cnt : 0ULL,
+               fmt_sz (tot_sz, sb, sizeof (sb)),
+               cnt ? tot_lt / cnt : 0ULL);
+
     }
+  (*freep) (sorted);
 }
 
-/* Table 3: All Objects Size Distribution (by power-of-2 intervals) */
+/* Table 3: All Objects Size Distribution (by power-of-2 intervals) *//* Table 3: All Objects Size Distribution (by power-of-2 intervals) */
 static void
 output_table_pow2 (FILE *fp)
 {
@@ -1350,10 +1563,12 @@ output_table_pow2 (FILE *fp)
     {
       unsigned long long objs = pow2_objs[i], sz = pow2_sizes[i];
       cum_o += objs; cum_s += sz;
-      char rb[64], sb[32];
+      char rb[64], sb[32], rlo[32], rhi[32];
       unsigned long long lo = (i == 0) ? 0 : (1ULL << (i - 1));
       unsigned long long hi = (1ULL << i);
-      snprintf (rb, sizeof (rb), "(%llu,%llu]", lo, hi);
+      snprintf (rb, sizeof (rb), "(%s,%s]",
+                fmt_range_val (lo, rlo, sizeof (rlo)),
+                fmt_range_val (hi, rhi, sizeof (rhi)));
       fprintf (fp, "  %-14s %12llu %7.2f%% %15s %7.2f%% %8.2f%% %8.2f%%\n",
                rb, objs, total_objs ? 100.0 * objs / total_objs : 0.0,
                fmt_sz (sz, sb, sizeof (sb)),
@@ -1488,9 +1703,39 @@ dest (void)
              failed[idx_munmap] ? "\e[01;41m" : "",
              (unsigned long int) failed[idx_munmap]);
 
-  if (summary_only && summary_fp != NULL)
+  /* Peak Memory Usage Summary (matches Python output) */
+  {
+    unsigned long long peak_objs_v = atomic_load_explicit (&peak_objs_val, memory_order_relaxed);
+    unsigned long long peak_heap_v = atomic_load_explicit (&peak_heap_val, memory_order_relaxed);
+    char sz_buf[32];
+    fprintf (stderr, "\n\e[01;32m=== Peak Memory Usage Summary ===\e[0;0m\n");
+    fprintf (stderr, "   Total Alloc Objects: %'14llu\n", (unsigned long long int) calls_total);
+    fprintf (stderr, "Total Allocated Memory: %15s\n", fmt_sz (grand_total, sz_buf, sizeof (sz_buf)));
+    fprintf (stderr, "   Peak Active Objects: %'14llu\n", peak_objs_v);
+    fprintf (stderr, " Peak Allocated Memory: %15s\n", fmt_sz (peak_heap_v, sz_buf, sizeof (sz_buf)));
+  }
+
+  /* Final sweep: add lifetime for unfreed objects (treat program end as free time) */
+  {
+    unsigned long long end_cycles = get_cycles ();
+    for (int i = 0; i < CALLER_HASH_SIZE; i++)
+      {
+        unsigned long long unfreed = atomic_load_explicit (&caller_tbl[i].unfreed_cnt, memory_order_relaxed);
+        if (unfreed > 0)
+          {
+            unsigned long long sum_ac = atomic_load_explicit (&caller_tbl[i].alloc_cycles_sum, memory_order_relaxed);
+            unsigned long long extra = end_cycles * unfreed - sum_ac;
+            atomic_fetch_add_explicit (&caller_tbl[i].tot_lt, extra, memory_order_relaxed);
+            /* Clear tracking to avoid double-counting */
+            atomic_store_explicit (&caller_tbl[i].unfreed_cnt, 0, memory_order_relaxed);
+            atomic_store_explicit (&caller_tbl[i].alloc_cycles_sum, 0, memory_order_relaxed);
+          }
+      }
+  }
+
+  if (summary_fp != NULL)
     {
-      /* Write raw summary (no color codes) to summary_fp */
+      /* Three tables to summary_fp (file) */
       fprintf (summary_fp, "\nMemory usage summary: heap total: %llu, heap peak: %lu, stack peak: %lu\n",
                (unsigned long long int) grand_total, (unsigned long int) peak_heap,
                (unsigned long int) peak_stack);
@@ -1520,8 +1765,14 @@ dest (void)
       output_table_pow2 (summary_fp);
 
       /* Close summary file */
-      fclose (summary_fp);
+      fflush(summary_fp); fsync(fileno(summary_fp));
+      fclose(summary_fp);
       summary_fp = NULL;
+
+       /* Also output three tables to stderr (screen) */
+       output_table_peak (stderr);
+       output_table_caller (stderr);
+       output_table_pow2 (stderr);
     }
   else
     {
@@ -1570,15 +1821,11 @@ dest (void)
           fputs ("\e[0;0m\n", stderr);
         }
 
-      /* Output three new tables to stderr */
-      output_table_peak (stderr);
-      output_table_caller (stderr);
-      output_table_pow2 (stderr);
     }
 
   /* Any following malloc/free etc. calls should generate statistics again,
      because otherwise freeing something that has been malloced before
      this destructor (including struct header in front of it) wouldn't
      be properly freed.  */
-  not_me = false;
+  not_me = true;
 }
