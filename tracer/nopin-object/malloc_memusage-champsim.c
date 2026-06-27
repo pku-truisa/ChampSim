@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -97,6 +98,8 @@ struct header
 {
   size_t length;
   size_t magic;
+  unsigned long long caller_ip;      /* caller IP at allocation time (for lifetime) */
+  unsigned long long alloc_cycles;   /* HP_TIMING_NOW cycles at allocation time */
 };
 
 #define MAGIC 0xfeedbeaf
@@ -135,6 +138,43 @@ extern const char *__progname;
 
 /* ChampSim malloc trace support */
 static int mtrace_fd = -1;
+
+/* === New statistics tracking for three output tables === */
+static bool summary_only = false;
+static FILE *summary_fp = NULL;
+static FILE *mtrace_fp = NULL;            /* xz popen alternative to mtrace_fd */
+
+/* Power-of-2 distribution: 48 buckets (2^0 .. 2^47) */
+#define POW2_BUCKETS 48
+static _Atomic unsigned long long pow2_objs[POW2_BUCKETS];
+static _Atomic unsigned long long pow2_sizes[POW2_BUCKETS];
+
+/* 13 size threshold intervals [16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536] */
+#define NUM_THRESHOLDS 13
+static const size_t threshold_vals[NUM_THRESHOLDS] = {
+  16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
+};
+static _Atomic long long cur_objs[NUM_THRESHOLDS];
+static _Atomic long long cur_actual[NUM_THRESHOLDS];
+static _Atomic long long cur_aligned[NUM_THRESHOLDS];
+static long long peak_objs[NUM_THRESHOLDS];
+static long long peak_actual[NUM_THRESHOLDS];
+static long long peak_aligned[NUM_THRESHOLDS];
+static _Atomic unsigned long long peak_heap_val;
+static _Atomic unsigned long long peak_objs_val;
+static _Atomic unsigned long long alive_objs;   /* current number of live objects */
+
+/* Caller IP hash table */
+#define CALLER_HASH_SIZE 32768
+struct caller_entry {
+  unsigned long long ip;
+  _Atomic unsigned long long count;
+  _Atomic unsigned long long tot_sz;
+  _Atomic unsigned long long tot_lt;     /* total lifetime in cycles */
+  _Atomic unsigned char type;
+};
+static struct caller_entry caller_tbl[CALLER_HASH_SIZE];
+static _Atomic unsigned long long caller_entries;
 
 struct entry
 {
@@ -179,6 +219,10 @@ peak_atomic_max (_Atomic size_t *peak, size_t val)
   while (! atomic_compare_exchange_weak (peak, &v, val));
 }
 
+/* Forward declarations for helper functions used in update_data.  */
+static inline void stats_check_peak (void);
+static inline unsigned long long get_cycles (void);
+
 /* Update the global data after a successful function call.  */
 static void
 update_data (struct header *result, size_t len, size_t old_len)
@@ -189,6 +233,9 @@ update_data (struct header *result, size_t len, size_t old_len)
          magic number.  */
       result->length = len;
       result->magic = MAGIC;
+      /* Store caller IP and cycle count for lifetime tracking.  */
+      result->caller_ip = mtrace_caller_ip;
+      result->alloc_cycles = get_cycles ();
     }
 
   /* Compute current heap usage and compare it with the maximum value.  */
@@ -196,6 +243,8 @@ update_data (struct header *result, size_t len, size_t old_len)
     = atomic_fetch_add_explicit (&current_heap, len - old_len,
 				 memory_order_relaxed) + len - old_len;
   peak_atomic_max (&peak_heap, heap);
+  /* Check and snapshot peak-interval stats.  */
+  stats_check_peak ();
 
   /* Compute current stack usage and compare it with the maximum
      value.  The base stack pointer might not be set if this is not
@@ -255,7 +304,7 @@ update_data (struct header *result, size_t len, size_t old_len)
     }
 
   /* ChampSim malloc trace: write pending record if mtrace is active.  */
-  if (mtrace_fd != -1 && mtrace_type != 0)
+  if (mtrace_type != 0)
     {
       struct malloc_instr rec;
       rec.type = mtrace_type;
@@ -264,11 +313,161 @@ update_data (struct header *result, size_t len, size_t old_len)
       rec.ret = mtrace_ret;
       rec.caller_ip = mtrace_caller_ip;
       memset (rec.reserved, 0, sizeof (rec.reserved));
-      (void)write (mtrace_fd, &rec, sizeof (rec));
+      if (mtrace_fp != NULL)
+        {
+          (void)fwrite (&rec, sizeof (rec), 1, mtrace_fp);
+          fflush (mtrace_fp);
+        }
+      else if (mtrace_fd != -1)
+        {
+          (void)write (mtrace_fd, &rec, sizeof (rec));
+        }
       mtrace_type = 0;  /* clear pending flag */
     }
 }
 
+
+/* ===== Helper functions for new statistics tables ===== */
+
+static inline int
+pow2_bucket (size_t sz)
+{
+  if (sz == 0) return 0;
+  if (sz == 1) return 1;
+  /* ceil(log2(sz)) = (64 - __builtin_clzll(sz - 1)) */
+  return 64 - __builtin_clzll ((unsigned long long)(sz - 1));
+}
+
+static inline int
+interval_idx (size_t sz)
+{
+  for (int i = 0; i < NUM_THRESHOLDS; i++)
+    if (sz <= threshold_vals[i])
+      return i;
+  return NUM_THRESHOLDS - 1;
+}
+
+static inline unsigned long long
+caller_hash (unsigned long long ip)
+{
+  return (ip ^ (ip >> 16) ^ (ip >> 32)) % CALLER_HASH_SIZE;
+}
+
+/* Record an allocation in pow2 + interval stats. */
+static inline void
+stats_alloc (size_t sz)
+{
+  int p2 = pow2_bucket (sz);
+  if (p2 < POW2_BUCKETS)
+    {
+      atomic_fetch_add_explicit (&pow2_objs[p2], 1, memory_order_relaxed);
+      atomic_fetch_add_explicit (&pow2_sizes[p2], sz, memory_order_relaxed);
+    }
+  int iv = interval_idx (sz);
+  atomic_fetch_add_explicit (&cur_objs[iv], 1, memory_order_relaxed);
+  atomic_fetch_add_explicit (&cur_actual[iv], sz, memory_order_relaxed);
+  atomic_fetch_add_explicit (&cur_aligned[iv], sz, memory_order_relaxed);
+  atomic_fetch_add_explicit (&alive_objs, 1, memory_order_relaxed);
+}
+
+/* Record a free in interval stats. */
+static inline void
+stats_free (size_t sz)
+{
+  int iv = interval_idx (sz);
+  atomic_fetch_sub_explicit (&cur_objs[iv], 1, memory_order_relaxed);
+  atomic_fetch_sub_explicit (&cur_actual[iv], sz, memory_order_relaxed);
+  atomic_fetch_sub_explicit (&cur_aligned[iv], sz, memory_order_relaxed);
+  atomic_fetch_sub_explicit (&alive_objs, 1, memory_order_relaxed);
+}
+
+/* Insert or update caller IP hash table entry.  cycles_delta is 0 on alloc,
+   (cycles_now - alloc_cycles) on free. */
+static inline void
+stats_caller (unsigned long long ip, size_t sz,
+              unsigned char type, unsigned long long cycles_delta)
+{
+  if (ip == 0 || ip <= 4096)
+    return;
+  unsigned long long h = caller_hash (ip);
+  for (unsigned int i = 0; i < CALLER_HASH_SIZE; i++)
+    {
+      unsigned int idx = (h + i) % CALLER_HASH_SIZE;
+      unsigned long long expected = 0;
+      if (atomic_compare_exchange_weak (&caller_tbl[idx].ip,
+                                         &expected, ip))
+        {
+          /* New entry inserted by this thread.  */
+          atomic_store_explicit (&caller_tbl[idx].count, 1,
+                                  memory_order_relaxed);
+          atomic_store_explicit (&caller_tbl[idx].tot_sz, sz,
+                                  memory_order_relaxed);
+          atomic_store_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
+                                  memory_order_relaxed);
+          atomic_store_explicit (&caller_tbl[idx].type, type,
+                                  memory_order_relaxed);
+          atomic_fetch_add_explicit (&caller_entries, 1,
+                                      memory_order_relaxed);
+          return;
+        }
+      if (caller_tbl[idx].ip == ip)
+        {
+          atomic_fetch_add_explicit (&caller_tbl[idx].count, 1,
+                                      memory_order_relaxed);
+          atomic_fetch_add_explicit (&caller_tbl[idx].tot_sz, sz,
+                                      memory_order_relaxed);
+          atomic_fetch_add_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
+                                      memory_order_relaxed);
+          atomic_store_explicit (&caller_tbl[idx].type, type,
+                                  memory_order_relaxed);
+          return;
+        }
+    }
+  /* Table full – silently drop */
+}
+
+/* Check whether current heap exceeds peak, and snapshot if so. */
+static inline void
+stats_check_peak (void)
+{
+  unsigned long long heap_val = atomic_load_explicit (&current_heap,
+                                                       memory_order_relaxed);
+  unsigned long long peak_val = atomic_load_explicit (&peak_heap_val,
+                                                       memory_order_relaxed);
+  if (heap_val > peak_val)
+    {
+      unsigned long long old = peak_val;
+      if (atomic_compare_exchange_weak (&peak_heap_val, &old, heap_val))
+        {
+          /* We won the race – take a snapshot.  */
+          unsigned long long objs = atomic_load_explicit (&alive_objs,
+                                                           memory_order_relaxed);
+          atomic_store_explicit (&peak_objs_val, objs, memory_order_relaxed);
+          for (int i = 0; i < NUM_THRESHOLDS; i++)
+            {
+              peak_objs[i] = atomic_load_explicit (&cur_objs[i],
+                                                    memory_order_relaxed);
+              peak_actual[i] = atomic_load_explicit (&cur_actual[i],
+                                                      memory_order_relaxed);
+              peak_aligned[i] = atomic_load_explicit (&cur_aligned[i],
+                                                       memory_order_relaxed);
+            }
+        }
+    }
+}
+
+/* Get CPU cycle count via HP_TIMING_NOW, or fallback to 0. */
+static inline unsigned long long
+get_cycles (void)
+{
+#if HP_TIMING_INLINE
+  hp_timing_t now;
+  HP_TIMING_NOW (now);
+  return (unsigned long long) now;
+#else
+  return 0;
+#endif
+}
 
 /* Interrupt handler.  */
 static void
@@ -392,13 +591,39 @@ me (void)
     }
 
   /* Open ChampSim malloc trace file if requested.  */
-  if (!not_me && mtrace_fd == -1)
+  if (!not_me && mtrace_fd == -1 && mtrace_fp == NULL)
     {
       const char *mtrace_file = getenv ("MEMUSAGE_MTRACE_FILE");
       if (mtrace_file != NULL && mtrace_file[0] != '\0')
         {
-          mtrace_fd = creat64 (mtrace_file, 0666);
+          size_t mflen = strlen (mtrace_file);
+          if (mflen > 3 && strcmp (mtrace_file + mflen - 3, ".xz") == 0)
+            {
+              /* For .xz files, pipe through xz compressor */
+              char cmd[4096];
+              snprintf (cmd, sizeof (cmd), "xz -c > %s", mtrace_file);
+              mtrace_fp = popen (cmd, "w");
+              mtrace_fd = -1; /* mark open via mtrace_fp */
+            }
+          else
+            {
+              mtrace_fd = creat64 (mtrace_file, 0666);
+            }
         }
+    }
+
+  /* Read summary-only / summary-file environment variables.  */
+  if (!not_me && summary_fp == NULL)
+    {
+      const char *summary_file = getenv ("MEMUSAGE_SUMMARY_FILE");
+      if (summary_file != NULL && summary_file[0] != '\0')
+        {
+          summary_fp = fopen (summary_file, "w");
+          if (summary_fp != NULL)
+            summary_only = true;
+        }
+      if (getenv ("MEMUSAGE_SUMMARY_ONLY") != NULL)
+        summary_only = true;
     }
 }
 
@@ -413,13 +638,16 @@ init (void)
     me ();
 
   /* Write main_begin marker (type=9) if mtrace is active.  */
-  if (mtrace_fd != -1)
+  if (mtrace_fd != -1 || mtrace_fp != NULL)
     {
       struct malloc_instr rec;
       rec.type = TYPE_MAIN_BEG;
       rec.arg1 = 0; rec.arg2 = 0; rec.ret = 0; rec.caller_ip = 0;
       memset (rec.reserved, 0, sizeof (rec.reserved));
-      (void)write (mtrace_fd, &rec, sizeof (rec));
+      if (mtrace_fp != NULL)
+        { (void)fwrite (&rec, sizeof (rec), 1, mtrace_fp); fflush (mtrace_fp); }
+      else
+        { (void)write (mtrace_fd, &rec, sizeof (rec)); }
     }
 }
 
@@ -476,6 +704,10 @@ malloc (size_t len)
 
   /* Update the allocation data and write out the records if necessary.  */
   update_data (result, len, 0);
+
+  /* Update new statistics tables.  */
+  stats_alloc (len);
+  stats_caller (mtrace_caller_ip, len, TYPE_MALLOC, 0);
 
   /* Return the pointer to the user buffer.  */
   return (void *) (result + 1);
@@ -551,6 +783,11 @@ realloc (void *old, size_t len)
       /* Update the allocation data and write out the records if necessary.  */
       update_data (NULL, 0, old_len);
 
+      /* Update new statistics tables.  */
+      stats_free (old_len);
+      stats_caller (mtrace_caller_ip, old_len, TYPE_FREE,
+                    get_cycles () - real->alloc_cycles);
+
       /* Do the real work.  */
       (*freep) (real);
 
@@ -590,6 +827,17 @@ realloc (void *old, size_t len)
 
   /* Update the allocation data and write out the records if necessary.  */
   update_data (result, len, old_len);
+
+  /* Update new statistics tables.
+     realloc semantics: free(old) + alloc(new).  */
+  if (old_len > 0)
+    {
+      stats_free (old_len);
+      stats_caller (real->caller_ip, old_len, TYPE_FREE,
+                    get_cycles () - real->alloc_cycles);
+    }
+  stats_alloc (len);
+  stats_caller (mtrace_caller_ip, len, TYPE_REALLOC, 0);
 
   /* Return the pointer to the user buffer.  */
   return (void *) (result + 1);
@@ -651,6 +899,10 @@ calloc (size_t n, size_t len)
   /* Update the allocation data and write out the records if necessary.  */
   update_data (result, size, 0);
 
+  /* Update new statistics tables.  */
+  stats_alloc (size);
+  stats_caller (mtrace_caller_ip, size, TYPE_CALLOC, 0);
+
   /* Do what `calloc' would have done and return the buffer to the caller.  */
   return memset (result + 1, '\0', size);
 }
@@ -711,6 +963,11 @@ free (void *ptr)
   /* Update the allocation data and write out the records if necessary.  */
   update_data (NULL, 0, real->length);
 
+  /* Update new statistics tables.  */
+  stats_free (real->length);
+  stats_caller (mtrace_caller_ip, real->length, TYPE_FREE,
+                get_cycles () - real->alloc_cycles);
+
   /* Do the real work.  */
   (*freep) (real);
 }
@@ -770,6 +1027,10 @@ mmap (void *start, size_t len, int prot, int flags, int fd, off_t offset)
           /* Update the allocation data and write out the records if
              necessary.  */
           update_data (NULL, len, 0);
+
+          /* Update new statistics tables (mmap alloc).  */
+          stats_alloc (len);
+          stats_caller (mtrace_caller_ip, len, TYPE_MMAP, 0);
         }
     }
 
@@ -829,6 +1090,10 @@ mmap64 (void *start, size_t len, int prot, int flags, int fd, off64_t offset)
           mtrace_caller_ip = (unsigned long long)__builtin_return_address (0);
 
           update_data (NULL, len, 0);
+
+          /* Update new statistics tables (mmap64 alloc).  */
+          stats_alloc (len);
+          stats_caller (mtrace_caller_ip, len, TYPE_MMAP64, 0);
         }
     }
 
@@ -905,6 +1170,11 @@ mremap (void *start, size_t old_len, size_t len, int flags, ...)
 
           /* Update the allocation data.  */
           update_data (NULL, len, old_len);
+
+          /* Update new statistics tables (mremap: free old + alloc new).  */
+          stats_free (old_len);
+          stats_alloc (len);
+          stats_caller (mtrace_caller_ip, len, TYPE_MREMAP, 0);
         }
     }
 
@@ -951,6 +1221,10 @@ munmap (void *start, size_t len)
 
           /* Update the allocation data.  */
           update_data (NULL, 0, len);
+
+          /* Update new statistics tables (munmap free).  */
+          stats_free (len);
+          stats_caller (mtrace_caller_ip, len, TYPE_MUNMAP, 0);
         }
       else
         atomic_fetch_add_explicit (&failed[idx_munmap], 1,
@@ -958,6 +1232,135 @@ munmap (void *start, size_t len)
     }
 
   return result;
+}
+
+
+/* ===== Output functions for the three new statistics tables ===== */
+
+static const char *
+fmt_sz (unsigned long long v, char *buf, size_t bufsz)
+{
+  if (v >= (1024ULL * 1024 * 1024))
+    snprintf (buf, bufsz, "%.2fG", (double)v / (1024.0 * 1024 * 1024));
+  else if (v >= (1024ULL * 1024))
+    snprintf (buf, bufsz, "%.2fM", (double)v / (1024.0 * 1024));
+  else if (v >= 1024)
+    snprintf (buf, bufsz, "%.2fK", (double)v / 1024.0);
+  else
+    snprintf (buf, bufsz, "%llu", v);
+  return buf;
+}
+
+/* Table 1: Peak Memory Usage by Size Interval */
+static void
+output_table_peak (FILE *fp)
+{
+  int i;
+  unsigned long long total_inc = 0, total_sz = 0, total_obj = 0;
+  for (i = 0; i < NUM_THRESHOLDS; i++)
+    { total_inc += peak_aligned[i]; total_sz += peak_actual[i]; total_obj += peak_objs[i]; }
+
+  fprintf (fp, "\n=== Peak Memory Usage by Size Interval ===\n");
+  fprintf (fp, "%-14s %15s %7s %7s %15s %7s %7s %10s %7s %7s\n",
+           "Range", "Aligned Inc", "Inc%", "Cum%",
+           "Total Size", "Size%", "Cum%", "Obj Cnt", "Obj%", "Cum%");
+  for (i = 0; i < 110; i++) fputc ('-', fp);
+  fputc ('\n', fp);
+  unsigned long long cum_inc = 0, cum_sz = 0, cum_obj = 0;
+  for (i = 0; i < NUM_THRESHOLDS; i++)
+    {
+      char rb[64], ib[32], sb[32];
+      unsigned long long inc = peak_aligned[i], sz = peak_actual[i], obj = peak_objs[i];
+      cum_inc += inc; cum_sz += sz; cum_obj += obj;
+      unsigned long long prev = (i == 0) ? 0 : (unsigned long long)threshold_vals[i - 1];
+      snprintf (rb, sizeof (rb), "(%llu,%llu]", prev, (unsigned long long)threshold_vals[i]);
+      fprintf (fp, "%-14s %15s %6.2f%% %6.2f%% %15s %6.2f%% %6.2f%% %10llu %6.2f%% %6.2f%%\n",
+               rb, fmt_sz (inc, ib, sizeof (ib)),
+               total_inc ? 100.0 * inc / total_inc : 0.0,
+               total_inc ? 100.0 * cum_inc / total_inc : 0.0,
+               fmt_sz (sz, sb, sizeof (sb)),
+               total_sz ? 100.0 * sz / total_sz : 0.0,
+               total_sz ? 100.0 * cum_sz / total_sz : 0.0,
+               (unsigned long long)obj,
+               total_obj ? 100.0 * obj / total_obj : 0.0,
+               total_obj ? 100.0 * cum_obj / total_obj : 0.0);
+    }
+}
+
+/* Table 2: Top Caller IP Statistics */
+static void
+output_table_caller (FILE *fp)
+{
+  int i, ncallers = 0;
+  for (i = 0; i < CALLER_HASH_SIZE; i++)
+    if (caller_tbl[i].ip != 0) ncallers++;
+  fprintf (fp, "\n=== Top Caller IP Statistics (top 50 by total size) ===\n");
+  if (ncallers == 0) { fprintf (fp, "  (no caller IP data collected)\n"); return; }
+  int n = 0;
+  int *sorted = (int *)__builtin_alloca (ncallers * sizeof (int));
+  for (i = 0; i < CALLER_HASH_SIZE; i++)
+    if (caller_tbl[i].ip != 0) sorted[n++] = i;
+  for (int a = 0; a < n - 1; a++)
+    for (int b = 0; b < n - 1 - a; b++)
+      if (caller_tbl[sorted[b]].tot_sz < caller_tbl[sorted[b + 1]].tot_sz)
+        { int t = sorted[b]; sorted[b] = sorted[b + 1]; sorted[b + 1] = t; }
+  fprintf (fp, "  %-18s %10s %15s %10s %18s %s\n",
+           "Caller IP", "Count", "Total Size", "Avg Size", "Avg Lifetime(cyc)", "Type");
+  for (i = 0; i < 100; i++) fputc ('-', fp);
+  fputc ('\n', fp);
+  int limit = n < 50 ? n : 50;
+  for (int ri = 0; ri < limit; ri++)
+    {
+      int idx = sorted[ri];
+      unsigned long long ip = caller_tbl[idx].ip, cnt = caller_tbl[idx].count;
+      unsigned long long tot_sz = caller_tbl[idx].tot_sz, tot_lt = caller_tbl[idx].tot_lt;
+      unsigned char tc = caller_tbl[idx].type;
+      const char *ts = "?";
+      switch (tc) { case 1: ts="malloc"; break; case 2: ts="calloc"; break;
+        case 3: ts="realloc"; break; case 4: ts="free"; break;
+        case 5: ts="mmap"; break; case 6: ts="mmap64"; break;
+        case 7: ts="mremap"; break; case 8: ts="munmap"; break; }
+      char sb[32];
+      fprintf (fp, "  0x%016llx %10llu %15s %10llu %18llu %s\n",
+               ip, cnt, fmt_sz (tot_sz, sb, sizeof (sb)),
+               cnt ? tot_sz / cnt : 0ULL, cnt ? tot_lt / cnt : 0ULL, ts);
+    }
+}
+
+/* Table 3: All Objects Size Distribution (by power-of-2 intervals) */
+static void
+output_table_pow2 (FILE *fp)
+{
+  int i;
+  unsigned long long total_objs = 0, total_sz = 0;
+  int first = -1, last = -1;
+  for (i = 0; i < POW2_BUCKETS; i++)
+    {
+      total_objs += pow2_objs[i]; total_sz += pow2_sizes[i];
+      if (pow2_objs[i] != 0) { if (first == -1) first = i; last = i; }
+    }
+  fprintf (fp, "\n=== All Objects Size Distribution (by power-of-2 intervals) ===\n");
+  if (total_objs == 0) { fprintf (fp, "  (no allocation data collected)\n"); return; }
+  fprintf (fp, "  %-14s %12s %8s %15s %8s %9s %9s\n",
+           "Range", "Objects", "Obj%", "Total Size", "Size%", "Cum Obj%", "Cum Size%");
+  for (i = 0; i < 80; i++) fputc ('-', fp);
+  fputc ('\n', fp);
+  unsigned long long cum_o = 0, cum_s = 0;
+  for (i = first; i <= last; i++)
+    {
+      unsigned long long objs = pow2_objs[i], sz = pow2_sizes[i];
+      cum_o += objs; cum_s += sz;
+      char rb[64], sb[32];
+      unsigned long long lo = (i == 0) ? 0 : (1ULL << (i - 1));
+      unsigned long long hi = (1ULL << i);
+      snprintf (rb, sizeof (rb), "(%llu,%llu]", lo, hi);
+      fprintf (fp, "  %-14s %12llu %7.2f%% %15s %7.2f%% %8.2f%% %8.2f%%\n",
+               rb, objs, total_objs ? 100.0 * objs / total_objs : 0.0,
+               fmt_sz (sz, sb, sizeof (sb)),
+               total_sz ? 100.0 * sz / total_sz : 0.0,
+               total_objs ? 100.0 * cum_o / total_objs : 0.0,
+               total_sz ? 100.0 * cum_s / total_sz : 0.0);
+    }
 }
 
 
@@ -972,12 +1375,19 @@ dest (void)
   /* If we haven't done anything here just return.  */
   if (not_me)
     {
-      /* Close mtrace fd if open */
+      /* Close mtrace fd/fp if open */
+      if (mtrace_fp != NULL) { pclose (mtrace_fp); mtrace_fp = NULL; }
       if (mtrace_fd != -1) { close (mtrace_fd); mtrace_fd = -1; }
       return;
     }
 
-  /* Close mtrace fd first */
+  /* Close mtrace fp (popen) first if open */
+  if (mtrace_fp != NULL)
+    {
+      pclose (mtrace_fp);
+      mtrace_fp = NULL;
+    }
+  /* Close mtrace fd if open */
   if (mtrace_fd != -1)
     {
       close (mtrace_fd);
@@ -1078,47 +1488,92 @@ dest (void)
              failed[idx_munmap] ? "\e[01;41m" : "",
              (unsigned long int) failed[idx_munmap]);
 
-  /* Write out a histogram of the sizes of the allocations.  */
-  fprintf (stderr, "\e[01;32mHistogram for block sizes:\e[0;0m\n");
-
-  /* Determine the maximum of all calls for each size range.  */
-  maxcalls = large;
-  for (cnt = 0; cnt < 65536; cnt += 16)
-    if (histogram[cnt / 16] > maxcalls)
-      maxcalls = histogram[cnt / 16];
-
-  for (cnt = 0; cnt < 65536; cnt += 16)
-    /* Only write out the nonzero entries.  */
-    if (histogram[cnt / 16] != 0)
-      {
-        percent = (histogram[cnt / 16] * 100) / calls_total;
-        fprintf (stderr, "%5d-%-5d%12lu ", cnt, cnt + 15,
-                 (unsigned long int) histogram[cnt / 16]);
-        if (percent == 0)
-          fputs (" <1% \e[41;37m", stderr);
-        else
-          fprintf (stderr, "%3d%% \e[41;37m", percent);
-
-        /* Draw a bar with a length corresponding to the current
-           percentage.  */
-        percent = (histogram[cnt / 16] * 50) / maxcalls;
-        while (percent-- > 0)
-          fputc ('=', stderr);
-        fputs ("\e[0;0m\n", stderr);
-      }
-
-  if (large != 0)
+  if (summary_only && summary_fp != NULL)
     {
-      percent = (large * 100) / calls_total;
-      fprintf (stderr, "   large   %12lu ", (unsigned long int) large);
-      if (percent == 0)
-        fputs (" <1% \e[41;37m", stderr);
-      else
-        fprintf (stderr, "%3d%% \e[41;37m", percent);
-      percent = (large * 50) / maxcalls;
-      while (percent-- > 0)
-        fputc ('=', stderr);
-      fputs ("\e[0;0m\n", stderr);
+      /* Write raw summary (no color codes) to summary_fp */
+      fprintf (summary_fp, "\nMemory usage summary: heap total: %llu, heap peak: %lu, stack peak: %lu\n",
+               (unsigned long long int) grand_total, (unsigned long int) peak_heap,
+               (unsigned long int) peak_stack);
+      fprintf (summary_fp, "         total calls   total memory   failed calls\n");
+      fprintf (summary_fp, " malloc| %10lu   %12llu   %12lu\n",
+               (unsigned long int) calls[idx_malloc],
+               (unsigned long long int) total[idx_malloc],
+               (unsigned long int) failed[idx_malloc]);
+      fprintf (summary_fp, "realloc| %10lu   %12llu   %12lu  (nomove:%ld, dec:%ld, free:%ld)\n",
+               (unsigned long int) calls[idx_realloc],
+               (unsigned long long int) total[idx_realloc],
+               (unsigned long int) failed[idx_realloc],
+               (unsigned long int) inplace,
+               (unsigned long int) decreasing,
+               (unsigned long int) realloc_free);
+      fprintf (summary_fp, " calloc| %10lu   %12llu   %12lu\n",
+               (unsigned long int) calls[idx_calloc],
+               (unsigned long long int) total[idx_calloc],
+               (unsigned long int) failed[idx_calloc]);
+      fprintf (summary_fp, "   free| %10lu   %12llu\n",
+               (unsigned long int) calls[idx_free],
+               (unsigned long long int) total[idx_free]);
+
+      /* Output three new tables to summary_fp */
+      output_table_peak (summary_fp);
+      output_table_caller (summary_fp);
+      output_table_pow2 (summary_fp);
+
+      /* Close summary file */
+      fclose (summary_fp);
+      summary_fp = NULL;
+    }
+  else
+    {
+      /* === Original histograms (skipped in summary_only mode) === */
+
+      /* Write out a histogram of the sizes of the allocations.  */
+      fprintf (stderr, "\e[01;32mHistogram for block sizes:\e[0;0m\n");
+
+      /* Determine the maximum of all calls for each size range.  */
+      maxcalls = large;
+      for (cnt = 0; cnt < 65536; cnt += 16)
+        if (histogram[cnt / 16] > maxcalls)
+          maxcalls = histogram[cnt / 16];
+
+      for (cnt = 0; cnt < 65536; cnt += 16)
+        /* Only write out the nonzero entries.  */
+        if (histogram[cnt / 16] != 0)
+          {
+            percent = (histogram[cnt / 16] * 100) / calls_total;
+            fprintf (stderr, "%5d-%-5d%12lu ", cnt, cnt + 15,
+                     (unsigned long int) histogram[cnt / 16]);
+            if (percent == 0)
+              fputs (" <1% \e[41;37m", stderr);
+            else
+              fprintf (stderr, "%3d%% \e[41;37m", percent);
+
+            /* Draw a bar with a length corresponding to the current
+               percentage.  */
+            percent = (histogram[cnt / 16] * 50) / maxcalls;
+            while (percent-- > 0)
+              fputc ('=', stderr);
+            fputs ("\e[0;0m\n", stderr);
+          }
+
+      if (large != 0)
+        {
+          percent = (large * 100) / calls_total;
+          fprintf (stderr, "   large   %12lu ", (unsigned long int) large);
+          if (percent == 0)
+            fputs (" <1% \e[41;37m", stderr);
+          else
+            fprintf (stderr, "%3d%% \e[41;37m", percent);
+          percent = (large * 50) / maxcalls;
+          while (percent-- > 0)
+            fputc ('=', stderr);
+          fputs ("\e[0;0m\n", stderr);
+        }
+
+      /* Output three new tables to stderr */
+      output_table_peak (stderr);
+      output_table_caller (stderr);
+      output_table_pow2 (stderr);
     }
 
   /* Any following malloc/free etc. calls should generate statistics again,

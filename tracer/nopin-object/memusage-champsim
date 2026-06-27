@@ -4,7 +4,10 @@
 # Copyright (C) 1999-2026 Free Software Foundation, Inc.
 # Part of the GNU C Library.
 #
-# Modified to support -c,--champsim-trace=FILE for 40-byte malloc_instr output.
+# Modified to support:
+#   -c,--champsim-trace=FILE   40-byte malloc_instr output (accepts .xz suffix)
+#   --summary-file=FILE        Output three statistic tables to FILE (summary-only mode)
+#   --summary-only             Suppress colorful stderr output, tables go to summary-file
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 memusageso="$SCRIPT_DIR/libmemusage-champsim.so"
@@ -32,6 +35,8 @@ Profile memory usage of PROGRAM.
       --no-timer          Don't collect additional information through timer
    -m,--mmap              Also trace mmap & friends
    -c,--champsim-trace=FILE  Also output ChampSim malloc trace format
+      --summary-file=FILE  Output three statistic tables to FILE (plain text)
+      --summary-only       Suppress colorful stderr histogram; tables only
 
    -?,--help              Print this help and exit
       --usage             Give a short usage message
@@ -56,6 +61,8 @@ png=
 progname=
 tracemmap=
 mtrace=
+summary_file=
+summary_only=
 
 while test $# -gt 0; do
   case "$1" in
@@ -75,6 +82,9 @@ while test $# -gt 0; do
   -c | --champsim-trace) shift; mtrace="$1" ;;
   --champsim-trace=*) mtrace=${1##*=} ;;
   -m | --mmap) tracemmap=yes ;;
+  --summary-file) shift; summary_file="$1" ;;
+  --summary-file=*) summary_file=${1##*=} ;;
+  --summary-only) summary_only=yes ;;
   -t | --time-based) memusagestat_args="$memusagestat_args -t" ;;
   -T | --total) memusagestat_args="$memusagestat_args -T" ;;
   --title) shift; memusagestat_args="$memusagestat_args -s $1" ;;
@@ -117,6 +127,12 @@ if test -n "$mtrace"; then
 fi
 if test -n "$tracemmap"; then
   add_env="$add_env MEMUSAGE_TRACE_MMAP=yes"
+fi
+if test -n "$summary_file"; then
+  add_env="$add_env MEMUSAGE_SUMMARY_FILE=$summary_file"
+fi
+if test -n "$summary_only"; then
+  add_env="$add_env MEMUSAGE_SUMMARY_ONLY=1"
 fi
 
 eval "$add_env" '"$@"'
