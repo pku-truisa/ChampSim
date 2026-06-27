@@ -66,6 +66,11 @@ Or using the shell wrapper:
 
     ./memusage-champsim --summary-file=summary.log --summary-only ./my_program
 
+Short form (`-s` alone = `--summary-only`, `-s FILE` = `--summary-file=FILE`):
+
+    ./memusage-champsim --summary-only ./my_program            # summary-only (use long form)
+    ./memusage-champsim -s summary.log ./my_program            # save to file
+
 The three tables are:
 
 1. **Peak Memory Usage by Size Interval** — At peak heap moment, shows for each

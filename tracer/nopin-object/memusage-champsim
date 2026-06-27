@@ -35,8 +35,9 @@ Profile memory usage of PROGRAM.
       --no-timer          Don't collect additional information through timer
    -m,--mmap              Also trace mmap & friends
    -c,--champsim-trace=FILE  Also output ChampSim malloc trace format
-      --summary-file=FILE  Output three statistic tables to FILE (plain text)
+   -s,--summary-file=FILE  Output three statistic tables to FILE (plain text)
       --summary-only       Suppress colorful stderr histogram; tables only
+                           (-s FILE = --summary-file; -s alone = --summary-only)
 
    -?,--help              Print this help and exit
       --usage             Give a short usage message
@@ -82,6 +83,14 @@ while test $# -gt 0; do
   -c | --champsim-trace) shift; mtrace="$1" ;;
   --champsim-trace=*) mtrace=${1##*=} ;;
   -m | --mmap) tracemmap=yes ;;
+   -s) shift
+      if test $# -gt 0 && ! expr "$1" : '^-' >/dev/null 2>&1; then
+        summary_file="$1"
+      else
+        summary_only=yes
+        continue
+      fi
+      ;;
   --summary-file) shift; summary_file="$1" ;;
   --summary-file=*) summary_file=${1##*=} ;;
   --summary-only) summary_only=yes ;;
