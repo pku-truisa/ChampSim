@@ -174,6 +174,13 @@ static _Atomic unsigned long long peak_heap_val;
 static _Atomic unsigned long long peak_objs_val;
 static _Atomic unsigned long long alive_objs;   /* current number of live objects */
 
+/* Peak alive objects tracking (moment when alive_objs peaks) */
+static _Atomic unsigned long long peak_objs_cnt_val;   /* peak of alive_objs */
+static _Atomic unsigned long long peak_objs_cnt_heap;  /* current_heap at that moment */
+static unsigned long long peak_objs_cnt_aligned[NUM_THRESHOLDS];
+static unsigned long long peak_objs_cnt_actual[NUM_THRESHOLDS];
+static long long peak_objs_cnt_objs[NUM_THRESHOLDS];
+
 /* Caller IP hash table */
 #define CALLER_HASH_SIZE 32768
 struct caller_entry {
@@ -233,6 +240,7 @@ peak_atomic_max (_Atomic size_t *peak, size_t val)
 
 /* Forward declarations for helper functions used in update_data.  */
 static inline void stats_check_peak (void);
+static inline void stats_check_peak_objs (void);
 static inline unsigned long long get_cycles (void);
 
 /* Update the global data after a successful function call.  */
@@ -632,6 +640,46 @@ stats_check_peak (void)
     }
 }
 
+/* Check whether current alive_objs count exceeds peak, and snapshot if so.  */
+static inline void
+stats_check_peak_objs (void)
+{
+  unsigned long long objs_val = atomic_load_explicit (&alive_objs,
+                                                       memory_order_relaxed);
+  unsigned long long peak_val = atomic_load_explicit (&peak_objs_cnt_val,
+                                                       memory_order_relaxed);
+  if (objs_val > peak_val)
+    {
+      unsigned long long old = peak_val;
+      if (atomic_compare_exchange_weak (&peak_objs_cnt_val, &old, objs_val))
+        {
+          /* Quick dirty-check on cumulative counters before snapshotting.  */
+          for (int i = 0; i < NUM_THRESHOLDS; i++)
+            {
+              unsigned long long ca = atomic_load_explicit (&cum_aligned[i],
+                                                             memory_order_relaxed);
+              if (ca > 1125899906842624ULL)  /* any interval > 1 PB → dirty */
+                return;   /* abandon this snapshot, wait for a healthy cycle */
+            }
+
+          /* We won the race – take a snapshot.  */
+          unsigned long long heap_val = atomic_load_explicit (&current_heap,
+                                                               memory_order_relaxed);
+          atomic_store_explicit (&peak_objs_cnt_heap, heap_val,
+                                  memory_order_relaxed);
+          for (int i = 0; i < NUM_THRESHOLDS; i++)
+            {
+              peak_objs_cnt_objs[i] = atomic_load_explicit (&cum_objs[i],
+                                                             memory_order_relaxed);
+              peak_objs_cnt_actual[i] = atomic_load_explicit (&cum_actual[i],
+                                                               memory_order_relaxed);
+              peak_objs_cnt_aligned[i] = atomic_load_explicit (&cum_aligned[i],
+                                                                memory_order_relaxed);
+            }
+        }
+    }
+}
+
 /* Get CPU cycle count via HP_TIMING_NOW, or fallback to 0. */
 static inline unsigned long long
 get_cycles (void)
@@ -886,6 +934,7 @@ malloc (size_t len)
   /* Update new statistics tables.  */
   stats_alloc (len);
   stats_check_peak ();
+  stats_check_peak_objs ();
   stats_caller (mtrace_caller_ip, len, TYPE_MALLOC, 0);
 
   /* Return the pointer to the user buffer.  */
@@ -985,6 +1034,7 @@ realloc (void *old, size_t len)
       /* Update new statistics tables.  */
       stats_free (old_len);
   stats_check_peak ();
+  stats_check_peak_objs ();
       /* Update lifetime for the original allocator (not the free caller) */
       stats_caller_lifetime (real->caller_ip, get_cycles () - real->alloc_cycles,
                                real->alloc_cycles);
@@ -1040,11 +1090,13 @@ realloc (void *old, size_t len)
     {
       stats_free (old_len);
   stats_check_peak ();
+  stats_check_peak_objs ();
       stats_caller_lifetime (old_caller_ip, get_cycles () - old_alloc_cycles,
                                old_alloc_cycles);
     }
   stats_alloc (len);
   stats_check_peak ();
+  stats_check_peak_objs ();
   stats_caller (mtrace_caller_ip, len, TYPE_REALLOC, 0);
 
   /* Return the pointer to the user buffer.  */
@@ -1110,6 +1162,7 @@ calloc (size_t n, size_t len)
   /* Update new statistics tables.  */
   stats_alloc (size);
   stats_check_peak ();
+  stats_check_peak_objs ();
   stats_caller (mtrace_caller_ip, size, TYPE_CALLOC, 0);
 
   /* Do what `calloc' would have done and return the buffer to the caller.  */
@@ -1149,10 +1202,7 @@ free (void *ptr)
 
   /* `free (NULL)' has no effect.  */
   if (ptr == NULL)
-    {
-      atomic_fetch_add_explicit (&calls[idx_free], 1, memory_order_relaxed);
-      return;
-    }
+    return;
 
   /* Determine the pointer to the header.  */
   real = ((struct header *) ptr) - 1;
@@ -1182,6 +1232,7 @@ free (void *ptr)
   /* Update new statistics tables.  */
   stats_free (real->length);
   stats_check_peak ();
+  stats_check_peak_objs ();
   stats_caller_lifetime (real->caller_ip, get_cycles () - real->alloc_cycles,
                            real->alloc_cycles);
 
@@ -1248,6 +1299,7 @@ posix_memalign (void **memptr, size_t alignment, size_t size)
   /* Update new statistics tables.  */
   stats_alloc (size);
   stats_check_peak ();
+  stats_check_peak_objs ();
   stats_caller (mtrace_caller_ip, size, TYPE_POSIX_MEMALIGN, 0);
 
   return 0;
@@ -1312,6 +1364,7 @@ aligned_alloc (size_t alignment, size_t size)
   /* Update new statistics tables.  */
   stats_alloc (size);
   stats_check_peak ();
+  stats_check_peak_objs ();
   stats_caller (mtrace_caller_ip, size, TYPE_ALIGNED_ALLOC, 0);
 
   return result;
@@ -1376,6 +1429,7 @@ mmap (void *start, size_t len, int prot, int flags, int fd, off_t offset)
           /* Update new statistics tables (mmap alloc).  */
           stats_alloc (len);
   stats_check_peak ();
+  stats_check_peak_objs ();
           stats_caller (mtrace_caller_ip, len, TYPE_MMAP, 0);
         }
     }
@@ -1440,6 +1494,7 @@ mmap64 (void *start, size_t len, int prot, int flags, int fd, off64_t offset)
           /* Update new statistics tables (mmap64 alloc).  */
           stats_alloc (len);
   stats_check_peak ();
+  stats_check_peak_objs ();
           stats_caller (mtrace_caller_ip, len, TYPE_MMAP64, 0);
         }
     }
@@ -1521,8 +1576,10 @@ mremap (void *start, size_t old_len, size_t len, int flags, ...)
           /* Update new statistics tables (mremap: free old + alloc new).  */
           stats_free (old_len);
   stats_check_peak ();
+  stats_check_peak_objs ();
           stats_alloc (len);
   stats_check_peak ();
+  stats_check_peak_objs ();
           stats_caller (mtrace_caller_ip, len, TYPE_MREMAP, 0);
         }
     }
@@ -1574,6 +1631,7 @@ munmap (void *start, size_t len)
           /* Update new statistics tables (munmap free).  */
           stats_free (len);
   stats_check_peak ();
+  stats_check_peak_objs ();
           stats_caller (mtrace_caller_ip, len, TYPE_MUNMAP, 0);
         }
       else
@@ -1638,6 +1696,87 @@ output_table_peak (FILE *fp)
       unsigned long long alc = peak_aligned[i];
       unsigned long long act = peak_actual[i];
       long long obj = peak_objs[i];
+
+      /* Python: inc = peak_sizes[i] - (original_peak_size if i==0 else peak_sizes[i-1]) */
+      unsigned long long base = (i == 0) ? peak_heap_v : prev_aligned;
+      long long inc = (long long)(alc - base);
+
+      /* Python: delta_sz = peak_actual_sizes[i] - (0 if i==0 else peak_actual_sizes[i-1]) */
+      unsigned long long delta_sz = act - prev_actual;
+
+      /* Python: delta_objs = peak_objs[i] - (0 if i==0 else peak_objs[i-1]) */
+      long long delta_objs = obj - prev_objs;
+
+      /* Python: total_aligned_inc = peak_sizes[i] - original_peak_size */
+      long long total_inc = (long long)(alc - peak_heap_v);
+
+      prev_aligned = alc;
+      prev_actual = act;
+      prev_objs = obj;
+
+      char rlo[32], rhi[32];
+      unsigned long long prev_t = (i == 0) ? 0 : (unsigned long long)threshold_vals[i - 1];
+      snprintf (rb, sizeof (rb), "(%s,%s]",
+                fmt_range_val (prev_t, rlo, sizeof (rlo)),
+                fmt_range_val ((unsigned long long)threshold_vals[i], rhi, sizeof (rhi)));
+
+      fprintf (fp, "%-14s %15s %6.2f%% %6.2f%% %15s %6.2f%% %6.2f%% %10lld %6.2f%% %6.2f%%\n",
+               rb,
+               fmt_sz (inc > 0 ? (unsigned long long)inc : 0, ib, sizeof (ib)),
+               peak_heap_v ? 100.0 * inc / peak_heap_v : 0.0,
+               peak_heap_v ? 100.0 * total_inc / peak_heap_v : 0.0,
+               fmt_sz (delta_sz, sb, sizeof (sb)),
+               peak_heap_v ? 100.0 * delta_sz / peak_heap_v : 0.0,
+               peak_heap_v ? 100.0 * act / peak_heap_v : 0.0,
+               (long long)delta_objs,
+               peak_objs_v ? 100.0 * delta_objs / peak_objs_v : 0.0,
+               peak_objs_v ? 100.0 * obj / peak_objs_v : 0.0);
+    }
+
+  /* Extra >65536 column (Python: objects above max threshold) */
+  {
+    char rb[64], ib[32], sb[32];
+    unsigned long long extra_sz = (peak_heap_v > prev_actual) ? peak_heap_v - prev_actual : 0;
+    long long extra_objs = (long long)((peak_objs_v > (unsigned long long)prev_objs) ? peak_objs_v - (unsigned long long)prev_objs : 0);
+    char rhi[32];
+    snprintf (rb, sizeof (rb), "(%s,+)", fmt_range_val ((unsigned long long)threshold_vals[NUM_THRESHOLDS - 1], rhi, sizeof (rhi)));
+    fprintf (fp, "%-14s %15s %6.2f%% %6.2f%% %15s %6.2f%% %6.2f%% %10lld %6.2f%% %6.2f%%\n",
+             rb, fmt_sz (0, ib, sizeof (ib)), 0.0,
+             peak_heap_v ? 100.0 * 0 / peak_heap_v : 0.0,
+             fmt_sz (extra_sz, sb, sizeof (sb)),
+             peak_heap_v ? 100.0 * extra_sz / peak_heap_v : 0.0,
+             100.0,
+             (long long)extra_objs,
+             peak_objs_v ? 100.0 * extra_objs / peak_objs_v : 0.0,
+             100.0);
+  }
+}
+
+/* Table 1b: Peak Alive Objects Memory Usage by Size Interval (matched format, different snapshot moment) */
+static void
+output_table_peak_objs (FILE *fp)
+{
+  int i;
+  fprintf (fp, "\n=== Peak Alive Objects Memory Usage by Size Interval ===\n");
+
+  /* Column headers: row names on left, interval columns */
+  fprintf (fp, "%-14s %15s %7s %7s %15s %7s %7s %10s %7s %7s\n",
+           "Range", "Aligned Inc", "Inc%%", "Cum%%",
+           "Total Size", "Size%%", "Cum%%", "Obj Cnt", "Obj%%", "Cum%%");
+  for (i = 0; i < 110; i++) fputc ('-', fp);
+  fputc ('\n', fp);
+
+  unsigned long long peak_heap_v = atomic_load_explicit (&peak_objs_cnt_heap, memory_order_relaxed);
+  unsigned long long peak_objs_v = atomic_load_explicit (&peak_objs_cnt_val, memory_order_relaxed);
+  unsigned long long prev_aligned = 0, prev_actual = 0;
+  long long prev_objs = 0;
+
+  for (i = 0; i < NUM_THRESHOLDS; i++)
+    {
+      char rb[64], ib[32], sb[32];
+      unsigned long long alc = peak_objs_cnt_aligned[i];
+      unsigned long long act = peak_objs_cnt_actual[i];
+      long long obj = peak_objs_cnt_objs[i];
 
       /* Python: inc = peak_sizes[i] - (original_peak_size if i==0 else peak_sizes[i-1]) */
       unsigned long long base = (i == 0) ? peak_heap_v : prev_aligned;
@@ -1945,23 +2084,6 @@ dest (void)
              failed[idx_munmap] ? "\e[01;41m" : "",
              (unsigned long int) failed[idx_munmap]);
 
-  /* Peak Memory Usage Summary (matches Python output) */
-  {
-    unsigned long long peak_objs_v = atomic_load_explicit (&peak_objs_val, memory_order_relaxed);
-    unsigned long long peak_heap_v = atomic_load_explicit (&peak_heap_val, memory_order_relaxed);
-    char sz_buf1[32], sz_buf2[32];
-    char val_buf[4][32];
-    snprintf (val_buf[0], sizeof (val_buf[0]), "%14llu", (unsigned long long int) calls_total);
-    snprintf (val_buf[1], sizeof (val_buf[1]), "%14s", fmt_sz (grand_total, sz_buf1, sizeof (sz_buf1)));
-    snprintf (val_buf[2], sizeof (val_buf[2]), "%14llu", peak_objs_v);
-    snprintf (val_buf[3], sizeof (val_buf[3]), "%14s", fmt_sz (peak_heap_v, sz_buf2, sizeof (sz_buf2)));
-    fprintf (stderr, "\n\e[01;32m=== Peak Memory Usage Summary ===\e[0;0m\n");
-    fprintf (stderr, "%-22s %s\n", "   Total Alloc Objects:", val_buf[0]);
-    fprintf (stderr, "%-22s %s\n", "Total Allocated Memory:", val_buf[1]);
-    fprintf (stderr, "%-22s %s\n", "   Peak Active Objects:", val_buf[2]);
-    fprintf (stderr, "%-22s %s\n", " Peak Allocated Memory:", val_buf[3]);
-  }
-
   /* Final sweep: add lifetime for unfreed objects (treat program end as free time) */
   {
     unsigned long long end_cycles = get_cycles ();
@@ -2014,8 +2136,29 @@ dest (void)
                (unsigned long long int) total[idx_aligned_alloc],
                (unsigned long int) failed[idx_aligned_alloc]);
 
-      /* Output three new tables to summary_fp */
+      /* Output tables to summary_fp */
       output_table_peak (summary_fp);
+      {
+        unsigned long long peak_mem = atomic_load_explicit (&peak_heap_val, memory_order_relaxed);
+        unsigned long long peak_obj = atomic_load_explicit (&peak_objs_val, memory_order_relaxed);
+        char sz_buf[32];
+        fprintf (summary_fp, "   %-33s %14s\n", "Peak Allocated Memory:", fmt_sz (peak_mem, sz_buf, sizeof (sz_buf)));
+        fprintf (summary_fp, "   %-33s %14llu\n", "Peak Allocated Memory Objects:", peak_obj);
+      }
+      output_table_peak_objs (summary_fp);
+      {
+        unsigned long long peak_obj_cnt = atomic_load_explicit (&peak_objs_cnt_val, memory_order_relaxed);
+        unsigned long long peak_obj_mem = atomic_load_explicit (&peak_objs_cnt_heap, memory_order_relaxed);
+        char sz_buf[32];
+        fprintf (summary_fp, "   %-33s %14llu\n", "Peak Active Objects:", peak_obj_cnt);
+        fprintf (summary_fp, "   %-33s %14s\n", "Peak Active Objects Memory:", fmt_sz (peak_obj_mem, sz_buf, sizeof (sz_buf)));
+      }
+      {
+        char sz_buf1[32];
+        fprintf (summary_fp, "\n=== Total Objects Summary ===\n");
+        fprintf (summary_fp, "   %-33s %14llu\n", "Total Alloc Objects:", (unsigned long long int) calls_total);
+        fprintf (summary_fp, "   %-33s %14s\n", "Total Allocated Memory:", fmt_sz (grand_total, sz_buf1, sizeof (sz_buf1)));
+      }
       output_table_caller (summary_fp);
       output_table_pow2 (summary_fp);
 
@@ -2024,8 +2167,29 @@ dest (void)
       fclose(summary_fp);
       summary_fp = NULL;
 
-       /* Also output three tables to stderr (screen) */
+       /* Also output tables to stderr (screen) */
        output_table_peak (stderr);
+       {
+         unsigned long long peak_mem = atomic_load_explicit (&peak_heap_val, memory_order_relaxed);
+         unsigned long long peak_obj = atomic_load_explicit (&peak_objs_val, memory_order_relaxed);
+         char sz_buf[32];
+         fprintf (stderr, "   %-33s %14s\n", "Peak Allocated Memory:", fmt_sz (peak_mem, sz_buf, sizeof (sz_buf)));
+         fprintf (stderr, "   %-33s %14llu\n", "Peak Allocated Memory Objects:", peak_obj);
+       }
+       output_table_peak_objs (stderr);
+       {
+         unsigned long long peak_obj_cnt = atomic_load_explicit (&peak_objs_cnt_val, memory_order_relaxed);
+         unsigned long long peak_obj_mem = atomic_load_explicit (&peak_objs_cnt_heap, memory_order_relaxed);
+         char sz_buf[32];
+         fprintf (stderr, "   %-33s %14llu\n", "Peak Active Objects:", peak_obj_cnt);
+         fprintf (stderr, "   %-33s %14s\n", "Peak Active Objects Memory:", fmt_sz (peak_obj_mem, sz_buf, sizeof (sz_buf)));
+       }
+       {
+         char sz_buf1[32];
+         fprintf (stderr, "\n=== Total Objects Summary ===\n");
+         fprintf (stderr, "   %-33s %14llu\n", "Total Alloc Objects:", (unsigned long long int) calls_total);
+         fprintf (stderr, "   %-33s %14s\n", "Total Allocated Memory:", fmt_sz (grand_total, sz_buf1, sizeof (sz_buf1)));
+       }
        output_table_caller (stderr);
        output_table_pow2 (stderr);
     }
