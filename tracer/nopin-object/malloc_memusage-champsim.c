@@ -946,13 +946,13 @@ realloc (void *old, size_t len)
       atomic_fetch_add_explicit (&grand_total, len - old_len,
 				 memory_order_relaxed);
     }
-  else if (len < old_len)
-    {
-      /* Shrinking realloc: decrement totals.  */
-      atomic_fetch_sub_explicit (&total[idx_realloc], old_len - len,
-				 memory_order_relaxed);
-      /* grand_total only ever accumulates, it is not decremented.  */
-    }
+  /* Note: Shrinking realloc (len < old_len) does NOT decrement
+     total[idx_realloc] or grand_total.  These are cumulative
+     "bytes additionally consumed via realloc" counters, always
+     non-negative per the original glibc memusage semantics.
+     The freed bytes from shrinking are reflected in current_heap
+     via update_data() and in total[idx_free] for the realloc(ptr,0)
+     case only.  */
 
   if (len == 0 && old != NULL)
     {
