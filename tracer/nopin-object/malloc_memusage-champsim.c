@@ -523,7 +523,7 @@ stats_caller (unsigned long long ip, size_t sz,
                                       memory_order_relaxed);
           return;
         }
-      if (caller_tbl[idx].ip == ip)
+      if (atomic_load_explicit (&caller_tbl[idx].ip, memory_order_acquire) == ip)
         {
           atomic_fetch_add_explicit (&caller_tbl[idx].count, 1,
                                       memory_order_relaxed);
@@ -560,7 +560,7 @@ stats_caller_lifetime (unsigned long long ip, unsigned long long cycles_delta,
   for (unsigned int i = 0; i < CALLER_HASH_SIZE; i++)
     {
       unsigned int idx = (h + i) % CALLER_HASH_SIZE;
-      if (caller_tbl[idx].ip == ip)
+      if (atomic_load_explicit (&caller_tbl[idx].ip, memory_order_acquire) == ip)
         {
           if (cycles_delta != 0)
             atomic_fetch_add_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
@@ -568,15 +568,13 @@ stats_caller_lifetime (unsigned long long ip, unsigned long long cycles_delta,
           /* Decrement unfreed tracking */
           if (alloc_cycles != 0)
             {
-              atomic_fetch_add_explicit (&caller_tbl[idx].unfreed_cnt, -1ULL,
+              atomic_fetch_sub_explicit (&caller_tbl[idx].unfreed_cnt, 1,
                                           memory_order_relaxed);
-              atomic_fetch_add_explicit (&caller_tbl[idx].alloc_cycles_sum,
-                                          -alloc_cycles, memory_order_relaxed);
+              atomic_fetch_sub_explicit (&caller_tbl[idx].alloc_cycles_sum,
+                                          alloc_cycles, memory_order_relaxed);
             }
           return;
         }
-      if (caller_tbl[idx].ip == 0)
-        return;  /* empty slot -> entry not found */
     }
 }
 
