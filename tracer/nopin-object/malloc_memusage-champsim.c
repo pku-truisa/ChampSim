@@ -243,11 +243,36 @@ update_data (struct header *result, size_t len, size_t old_len)
       result->alloc_cycles = get_cycles ();
     }
 
-  /* Compute current heap usage and compare it with the maximum value.  */
-  size_t heap
-    = atomic_fetch_add_explicit (&current_heap, len - old_len,
-				 memory_order_relaxed) + len - old_len;
-  peak_atomic_max (&peak_heap, heap);
+  /* Compute current heap usage and compare it with the maximum value.
+     Use a CAS loop to clamp current_heap at 0, preventing unsigned
+     underflow when a free matches a pre-library or non-tracked alloc.  */
+  size_t heap;
+  if (len >= old_len) {
+    /* alloc / expand / no-change: always safe.  */
+    heap = atomic_fetch_add_explicit (&current_heap, len - old_len,
+                                      memory_order_relaxed) + len - old_len;
+  } else {
+    /* shrink / free: guard against underflow.  */
+    size_t dec = old_len - len;
+    size_t old_val;
+    do {
+      old_val = atomic_load_explicit (&current_heap, memory_order_relaxed);
+      if (old_val < dec) {
+        /* Clamp result to 0.  */
+        size_t expected = old_val;
+        if (atomic_compare_exchange_weak (&current_heap, &expected, 0)) {
+          heap = 0;
+          break;
+        }
+        /* CAS failed, another thread changed current_heap — retry.  */
+        continue;
+      }
+      heap = old_val - dec;
+    } while (!atomic_compare_exchange_weak (&current_heap, &old_val, heap));
+  }
+  /* Only record peaks that pass a basic sanity filter.  */
+  if (heap <= 1125899906842624ULL)  /* 1 PB sanity cap */
+    peak_atomic_max (&peak_heap, heap);
   /* Check and snapshot peak-interval stats.  */
   /* stats_check_peak moved after stats_alloc/free */
 
@@ -395,7 +420,9 @@ stats_alloc (size_t sz)
   atomic_fetch_add_explicit (&alive_objs, 1, memory_order_relaxed);
 }
 
-/* Record a free in cumulative interval stats. */
+/* Record a free in cumulative interval stats.
+   Underflow-protected: uses CAS loops to prevent unsigned wrap-around
+   that would produce 2^64-size garbage values in concurrent scenarios.  */
 static inline void
 stats_free (size_t sz)
 {
@@ -403,14 +430,48 @@ stats_free (size_t sz)
   unsigned long long pow2 = next_power_of_2 (sz);
   int i;
   for (i = 0; i < split; i++)
-    atomic_fetch_sub_explicit (&cum_aligned[i], sz, memory_order_relaxed);
+    {
+      unsigned long long val;
+      do {
+        val = atomic_load_explicit (&cum_aligned[i], memory_order_relaxed);
+        if (val < sz) { val = sz; break; }  /* clamp so result >= 0 */
+      } while (!atomic_compare_exchange_weak (&cum_aligned[i], &val, val - sz));
+    }
   for (i = split; i < NUM_THRESHOLDS; i++)
     {
-      atomic_fetch_sub_explicit (&cum_aligned[i], pow2, memory_order_relaxed);
-      atomic_fetch_sub_explicit (&cum_actual[i], sz, memory_order_relaxed);
-      atomic_fetch_sub_explicit (&cum_objs[i], 1, memory_order_relaxed);
+      /* cum_aligned[i] -= pow2, floor at 0 */
+      {
+        unsigned long long val;
+        do {
+          val = atomic_load_explicit (&cum_aligned[i], memory_order_relaxed);
+          if (val < pow2) { val = pow2; break; }
+        } while (!atomic_compare_exchange_weak (&cum_aligned[i], &val, val - pow2));
+      }
+      /* cum_actual[i] -= sz, floor at 0 */
+      {
+        unsigned long long val;
+        do {
+          val = atomic_load_explicit (&cum_actual[i], memory_order_relaxed);
+          if (val < sz) { val = sz; break; }
+        } while (!atomic_compare_exchange_weak (&cum_actual[i], &val, val - sz));
+      }
+      /* cum_objs[i] -= 1, floor at 0  (cum_objs is signed long long) */
+      {
+        long long val;
+        do {
+          val = atomic_load_explicit (&cum_objs[i], memory_order_relaxed);
+          if (val <= 0) { val = 1; break; }
+        } while (!atomic_compare_exchange_weak (&cum_objs[i], &val, val - 1));
+      }
     }
-  atomic_fetch_sub_explicit (&alive_objs, 1, memory_order_relaxed);
+  /* alive_objs -= 1, floor at 0 */
+  {
+    unsigned long long val;
+    do {
+      val = atomic_load_explicit (&alive_objs, memory_order_relaxed);
+      if (val <= 0) { val = 1; break; }
+    } while (!atomic_compare_exchange_weak (&alive_objs, &val, val - 1));
+  }
 }
 
 /* Insert or update caller IP hash table entry.  cycles_delta is 0 on alloc,
@@ -519,12 +580,20 @@ stats_caller_lifetime (unsigned long long ip, unsigned long long cycles_delta,
     }
 }
 
-/* Check whether current heap exceeds peak, and snapshot if so. */
+/* Check whether current heap exceeds peak, and snapshot if so.
+   Sanity filters prevent capturing transient dirty-state values caused
+   by multi-threaded race between update_data (delta) and stats_alloc/free
+   (full add/sub) — which can produce 2^64-sized underflow artifacts.  */
 static inline void
 stats_check_peak (void)
 {
   unsigned long long heap_val = atomic_load_explicit (&current_heap,
                                                        memory_order_relaxed);
+  /* Reject absurdly large heap values (>= 1 PB) caused by
+     race-condition underflow before stats_alloc/free catches up.  */
+  if (heap_val > 1125899906842624ULL)  /* 1 PB */
+    return;
+
   unsigned long long peak_val = atomic_load_explicit (&peak_heap_val,
                                                        memory_order_relaxed);
   if (heap_val > peak_val)
@@ -532,6 +601,15 @@ stats_check_peak (void)
       unsigned long long old = peak_val;
       if (atomic_compare_exchange_weak (&peak_heap_val, &old, heap_val))
         {
+          /* Quick dirty-check on cumulative counters before snapshotting.  */
+          for (int i = 0; i < NUM_THRESHOLDS; i++)
+            {
+              unsigned long long ca = atomic_load_explicit (&cum_aligned[i],
+                                                             memory_order_relaxed);
+              if (ca > 1125899906842624ULL)  /* any interval > 1 PB → dirty */
+                return;   /* abandon this snapshot, wait for a healthy cycle */
+            }
+
           /* We won the race – take a snapshot.  */
           unsigned long long objs = atomic_load_explicit (&alive_objs,
                                                            memory_order_relaxed);
@@ -867,6 +945,13 @@ realloc (void *old, size_t len)
       /* Keep track of total memory requirement.  */
       atomic_fetch_add_explicit (&grand_total, len - old_len,
 				 memory_order_relaxed);
+    }
+  else if (len < old_len)
+    {
+      /* Shrinking realloc: decrement totals.  */
+      atomic_fetch_sub_explicit (&total[idx_realloc], old_len - len,
+				 memory_order_relaxed);
+      /* grand_total only ever accumulates, it is not decremented.  */
     }
 
   if (len == 0 && old != NULL)
