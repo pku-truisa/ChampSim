@@ -48,6 +48,8 @@ enum {
   TYPE_MREMAP   = 7,
   TYPE_MUNMAP   = 8,
   TYPE_MAIN_BEG = 9,
+  TYPE_POSIX_MEMALIGN = 10,
+  TYPE_ALIGNED_ALLOC  = 11,
 };
 
 /* ChampSim malloc trace record (40 bytes) */
@@ -79,6 +81,9 @@ static void *(*mmap64p) (void *, size_t, int, int, int, off64_t);
 static int (*munmapp) (void *, size_t);
 static void *(*mremapp) (void *, size_t, size_t, int, void *);
 
+static int (*posix_memalignp) (void **, size_t, size_t);
+static void *(*aligned_allocp) (size_t, size_t);
+
 enum
 {
   idx_malloc = 0,
@@ -90,6 +95,8 @@ enum
   idx_mmap_a,
   idx_mremap,
   idx_munmap,
+  idx_posix_memalign,
+  idx_aligned_alloc,
   idx_last
 };
 
@@ -176,7 +183,7 @@ struct caller_entry {
   _Atomic unsigned long long tot_lt;     /* total lifetime in cycles (freed objects) */
   _Atomic unsigned long long alloc_cycles_sum; /* sum of alloc_cycles for unfreed objects */
   _Atomic unsigned long long unfreed_cnt;      /* number of objects not yet freed */
-  _Atomic unsigned int types[9];         /* frequency per type (indices 1-8) */
+  _Atomic unsigned int types[12];        /* frequency per type (indices 1-11) */
 };
 static struct caller_entry caller_tbl[CALLER_HASH_SIZE];
 static _Atomic unsigned long long caller_entries;
@@ -506,10 +513,10 @@ stats_caller (unsigned long long ip, size_t sz,
           atomic_store_explicit (&caller_tbl[idx].unfreed_cnt, 0,
                                   memory_order_relaxed);
           /* Clear and increment type frequency */
-          for (int t = 0; t < 9; t++)
+          for (int t = 0; t < 12; t++)
             atomic_store_explicit (&caller_tbl[idx].types[t], 0,
                                     memory_order_relaxed);
-          if (type < 9)
+          if (type < 12)
             atomic_fetch_add_explicit (&caller_tbl[idx].types[type], 1,
                                         memory_order_relaxed);
           if (type <= TYPE_REALLOC) /* alloc types */
@@ -531,7 +538,7 @@ stats_caller (unsigned long long ip, size_t sz,
                                       memory_order_relaxed);
           atomic_fetch_add_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
                                       memory_order_relaxed);
-          if (type < 9)
+          if (type < 12)
             atomic_fetch_add_explicit (&caller_tbl[idx].types[type], 1,
                                         memory_order_relaxed);
           if (type <= TYPE_REALLOC) /* alloc types */
@@ -685,6 +692,10 @@ me (void)
   mremapp = (void *(*)(void *, size_t, size_t, int, void *))dlsym (RTLD_NEXT,
                                                                    "mremap");
   munmapp = (int (*)(void *, size_t))dlsym (RTLD_NEXT, "munmap");
+
+  posix_memalignp = (int (*)(void **, size_t, size_t))dlsym (RTLD_NEXT, "posix_memalign");
+  aligned_allocp = (void *(*)(size_t, size_t))dlsym (RTLD_NEXT, "aligned_alloc");
+
   initialized = 1;
 
   if (env != NULL)
@@ -1179,6 +1190,134 @@ free (void *ptr)
 }
 
 
+/* `posix_memalign' replacement.  We keep track of the memory usage if
+   this is the correct program.  No header can be prepended due to
+   alignment constraints, so tracking is similar to mmap (size-only).  */
+int
+posix_memalign (void **memptr, size_t alignment, size_t size)
+{
+  int result;
+
+  /* Determine real implementation if not already happened.  */
+  if (__glibc_unlikely (initialized <= 0))
+    {
+      if (initialized == -1)
+        return ENOMEM;
+
+      me ();
+    }
+
+  /* If this is not the correct program just use the normal function.  */
+  if (not_me)
+    return (*posix_memalignp)(memptr, alignment, size);
+
+  /* Keep track of number of calls.  */
+  atomic_fetch_add_explicit (&calls[idx_posix_memalign], 1, memory_order_relaxed);
+  /* Keep track of total memory consumption for `posix_memalign'.  */
+  atomic_fetch_add_explicit (&total[idx_posix_memalign], size, memory_order_relaxed);
+  /* Keep track of total memory requirement.  */
+  atomic_fetch_add_explicit (&grand_total, size, memory_order_relaxed);
+  /* Remember the size of the request.  */
+  if (size < 65536)
+    atomic_fetch_add_explicit (&histogram[size / 16], 1, memory_order_relaxed);
+  else
+    atomic_fetch_add_explicit (&large, 1, memory_order_relaxed);
+  /* Total number of calls of any of the functions.  */
+  atomic_fetch_add_explicit (&calls_total, 1, memory_order_relaxed);
+
+  /* Do the real work.  */
+  result = (*posix_memalignp)(memptr, alignment, size);
+
+  if (result != 0)
+    {
+      atomic_fetch_add_explicit (&failed[idx_posix_memalign], 1,
+                                  memory_order_relaxed);
+      return result;
+    }
+
+  /* Set pending mtrace info for update_data().  */
+  mtrace_type = TYPE_POSIX_MEMALIGN;
+  mtrace_arg1 = size;
+  mtrace_arg2 = alignment;
+  mtrace_ret = (unsigned long long)*memptr;
+  mtrace_caller_ip = (unsigned long long)__builtin_return_address (0);
+
+  /* Update the allocation data (no header, tracked like mmap).  */
+  update_data (NULL, size, 0);
+
+  /* Update new statistics tables.  */
+  stats_alloc (size);
+  stats_check_peak ();
+  stats_caller (mtrace_caller_ip, size, TYPE_POSIX_MEMALIGN, 0);
+
+  return 0;
+}
+
+
+/* `aligned_alloc' replacement.  We keep track of the memory usage if
+   this is the correct program.  No header can be prepended due to
+   alignment constraints, so tracking is similar to mmap (size-only).  */
+void *
+aligned_alloc (size_t alignment, size_t size)
+{
+  void *result = NULL;
+
+  /* Determine real implementation if not already happened.  */
+  if (__glibc_unlikely (initialized <= 0))
+    {
+      if (initialized == -1)
+        return NULL;
+
+      me ();
+    }
+
+  /* If this is not the correct program just use the normal function.  */
+  if (not_me)
+    return (*aligned_allocp)(alignment, size);
+
+  /* Keep track of number of calls.  */
+  atomic_fetch_add_explicit (&calls[idx_aligned_alloc], 1, memory_order_relaxed);
+  /* Keep track of total memory consumption for `aligned_alloc'.  */
+  atomic_fetch_add_explicit (&total[idx_aligned_alloc], size, memory_order_relaxed);
+  /* Keep track of total memory requirement.  */
+  atomic_fetch_add_explicit (&grand_total, size, memory_order_relaxed);
+  /* Remember the size of the request.  */
+  if (size < 65536)
+    atomic_fetch_add_explicit (&histogram[size / 16], 1, memory_order_relaxed);
+  else
+    atomic_fetch_add_explicit (&large, 1, memory_order_relaxed);
+  /* Total number of calls of any of the functions.  */
+  atomic_fetch_add_explicit (&calls_total, 1, memory_order_relaxed);
+
+  /* Do the real work.  */
+  result = (*aligned_allocp)(alignment, size);
+
+  if (result == NULL)
+    {
+      atomic_fetch_add_explicit (&failed[idx_aligned_alloc], 1,
+                                  memory_order_relaxed);
+      return NULL;
+    }
+
+  /* Set pending mtrace info for update_data().  */
+  mtrace_type = TYPE_ALIGNED_ALLOC;
+  mtrace_arg1 = size;
+  mtrace_arg2 = alignment;
+  mtrace_ret = (unsigned long long)result;
+  mtrace_caller_ip = (unsigned long long)__builtin_return_address (0);
+
+  /* Update the allocation data (no header, tracked like mmap).  */
+  update_data (NULL, size, 0);
+
+  /* Update new statistics tables.  */
+  stats_alloc (size);
+  stats_check_peak ();
+  stats_caller (mtrace_caller_ip, size, TYPE_ALIGNED_ALLOC, 0);
+
+  return result;
+}
+
+
 /* `mmap' replacement.  We do not have to keep track of the size since
    `munmap' will get it as a parameter.  */
 void *
@@ -1466,13 +1605,11 @@ static const char *
 fmt_sz (unsigned long long v, char *buf, size_t bufsz)
 {
   if (v >= (1024ULL * 1024 * 1024))
-    snprintf (buf, bufsz, "%.2f G", (double)v / (1024.0 * 1024 * 1024));
+    snprintf (buf, bufsz, "%.3f G", (double)v / (1024.0 * 1024 * 1024));
   else if (v >= (1024ULL * 1024))
-    snprintf (buf, bufsz, "%.2f M", (double)v / (1024.0 * 1024));
-  else if (v >= 1024)
-    snprintf (buf, bufsz, "%.2f K", (double)v / 1024.0);
+    snprintf (buf, bufsz, "%.3f M", (double)v / (1024.0 * 1024));
   else
-    snprintf (buf, bufsz, "%llu", v);
+    snprintf (buf, bufsz, "%.3f K", (double)v / 1024.0);
   return buf;
 }
 
@@ -1600,7 +1737,7 @@ output_table_caller (FILE *fp)
       unsigned long long tot_lt = atomic_load_explicit (&caller_tbl[idx].tot_lt, memory_order_relaxed);
       /* Determine primary type (most frequent) */
       unsigned int max_type = 0, max_cnt = 0;
-      for (int ti = 1; ti < 9; ti++)
+      for (int ti = 1; ti < 12; ti++)
         {
           unsigned int c = atomic_load_explicit (&caller_tbl[idx].types[ti], memory_order_relaxed);
           if (c > max_cnt) { max_cnt = c; max_type = ti; }
@@ -1611,6 +1748,7 @@ output_table_caller (FILE *fp)
         case 3: typestr = "realloc"; break; case 4: typestr = "free"; break;
         case 5: typestr = "mmap"; break; case 6: typestr = "mmap64"; break;
         case 7: typestr = "mremap"; break; case 8: typestr = "munmap"; break;
+        case 10: typestr = "posix_memalign"; break; case 11: typestr = "aligned_alloc"; break;
       }
       char sb[32];
       fprintf (fp, "  0x%016llx %8s %12llu %10llu %15s %18llu\n",
@@ -1732,16 +1870,20 @@ dest (void)
   fprintf (stderr, "\n\
 \e[01;32mMemory usage summary:\e[0;0m heap total: %llu, heap peak: %lu, stack peak: %lu\n\
 \e[04;34m         total calls   total memory   failed calls\e[0m\n\
-\e[00;34m malloc|\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
-\e[00;34mrealloc|\e[0m %10lu   %12llu   %s%12lu\e[00;00m  (nomove:%ld, dec:%ld, free:%ld)\n\
-\e[00;34m calloc|\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
-\e[00;34m   free|\e[0m %10lu   %12llu\n",
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m  (nomove:%ld, dec:%ld, free:%ld)\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n",
            (unsigned long long int) grand_total, (unsigned long int) peak_heap,
            (unsigned long int) peak_stack,
+           "malloc|",
            (unsigned long int) calls[idx_malloc],
            (unsigned long long int) total[idx_malloc],
            failed[idx_malloc] ? "\e[01;41m" : "",
            (unsigned long int) failed[idx_malloc],
+           "realloc|",
            (unsigned long int) calls[idx_realloc],
            (unsigned long long int) total[idx_realloc],
            failed[idx_realloc] ? "\e[01;41m" : "",
@@ -1749,38 +1891,55 @@ dest (void)
            (unsigned long int) inplace,
            (unsigned long int) decreasing,
            (unsigned long int) realloc_free,
+           "calloc|",
            (unsigned long int) calls[idx_calloc],
            (unsigned long long int) total[idx_calloc],
            failed[idx_calloc] ? "\e[01;41m" : "",
            (unsigned long int) failed[idx_calloc],
+           "free|",
            (unsigned long int) calls[idx_free],
-           (unsigned long long int) total[idx_free]);
+           (unsigned long long int) total[idx_free],
+           "posix_memalign|",
+           (unsigned long int) calls[idx_posix_memalign],
+           (unsigned long long int) total[idx_posix_memalign],
+           failed[idx_posix_memalign] ? "\e[01;41m" : "",
+           (unsigned long int) failed[idx_posix_memalign],
+           "aligned_alloc|",
+           (unsigned long int) calls[idx_aligned_alloc],
+           (unsigned long long int) total[idx_aligned_alloc],
+           failed[idx_aligned_alloc] ? "\e[01;41m" : "",
+           (unsigned long int) failed[idx_aligned_alloc]);
 
   if (trace_mmap)
     fprintf (stderr, "\
-\e[00;34mmmap(r)|\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
-\e[00;34mmmap(w)|\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
-\e[00;34mmmap(a)|\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
-\e[00;34m mremap|\e[0m %10lu   %12llu   %s%12lu\e[00;00m  (nomove: %ld, dec:%ld)\n\
-\e[00;34m munmap|\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n",
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m  (nomove: %ld, dec:%ld)\n\
+\e[00;34m%-16s\e[0m %10lu   %12llu   %s%12lu\e[00;00m\n",
+             "mmap(r)|",
              (unsigned long int) calls[idx_mmap_r],
              (unsigned long long int) total[idx_mmap_r],
              failed[idx_mmap_r] ? "\e[01;41m" : "",
              (unsigned long int) failed[idx_mmap_r],
+             "mmap(w)|",
              (unsigned long int) calls[idx_mmap_w],
              (unsigned long long int) total[idx_mmap_w],
              failed[idx_mmap_w] ? "\e[01;41m" : "",
              (unsigned long int) failed[idx_mmap_w],
+             "mmap(a)|",
              (unsigned long int) calls[idx_mmap_a],
              (unsigned long long int) total[idx_mmap_a],
              failed[idx_mmap_a] ? "\e[01;41m" : "",
              (unsigned long int) failed[idx_mmap_a],
+             "mremap|",
              (unsigned long int) calls[idx_mremap],
              (unsigned long long int) total[idx_mremap],
              failed[idx_mremap] ? "\e[01;41m" : "",
              (unsigned long int) failed[idx_mremap],
              (unsigned long int) inplace_mremap,
              (unsigned long int) decreasing_mremap,
+             "munmap|",
              (unsigned long int) calls[idx_munmap],
              (unsigned long long int) total[idx_munmap],
              failed[idx_munmap] ? "\e[01;41m" : "",
@@ -1790,12 +1949,17 @@ dest (void)
   {
     unsigned long long peak_objs_v = atomic_load_explicit (&peak_objs_val, memory_order_relaxed);
     unsigned long long peak_heap_v = atomic_load_explicit (&peak_heap_val, memory_order_relaxed);
-    char sz_buf[32];
+    char sz_buf1[32], sz_buf2[32];
+    char val_buf[4][32];
+    snprintf (val_buf[0], sizeof (val_buf[0]), "%14llu", (unsigned long long int) calls_total);
+    snprintf (val_buf[1], sizeof (val_buf[1]), "%14s", fmt_sz (grand_total, sz_buf1, sizeof (sz_buf1)));
+    snprintf (val_buf[2], sizeof (val_buf[2]), "%14llu", peak_objs_v);
+    snprintf (val_buf[3], sizeof (val_buf[3]), "%14s", fmt_sz (peak_heap_v, sz_buf2, sizeof (sz_buf2)));
     fprintf (stderr, "\n\e[01;32m=== Peak Memory Usage Summary ===\e[0;0m\n");
-    fprintf (stderr, "   Total Alloc Objects: %'14llu\n", (unsigned long long int) calls_total);
-    fprintf (stderr, "Total Allocated Memory: %15s\n", fmt_sz (grand_total, sz_buf, sizeof (sz_buf)));
-    fprintf (stderr, "   Peak Active Objects: %'14llu\n", peak_objs_v);
-    fprintf (stderr, " Peak Allocated Memory: %15s\n", fmt_sz (peak_heap_v, sz_buf, sizeof (sz_buf)));
+    fprintf (stderr, "%-22s %s\n", "   Total Alloc Objects:", val_buf[0]);
+    fprintf (stderr, "%-22s %s\n", "Total Allocated Memory:", val_buf[1]);
+    fprintf (stderr, "%-22s %s\n", "   Peak Active Objects:", val_buf[2]);
+    fprintf (stderr, "%-22s %s\n", " Peak Allocated Memory:", val_buf[3]);
   }
 
   /* Final sweep: add lifetime for unfreed objects (treat program end as free time) */
@@ -1823,24 +1987,32 @@ dest (void)
                (unsigned long long int) grand_total, (unsigned long int) peak_heap,
                (unsigned long int) peak_stack);
       fprintf (summary_fp, "         total calls   total memory   failed calls\n");
-      fprintf (summary_fp, " malloc| %10lu   %12llu   %12lu\n",
+      fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "malloc|",
                (unsigned long int) calls[idx_malloc],
                (unsigned long long int) total[idx_malloc],
                (unsigned long int) failed[idx_malloc]);
-      fprintf (summary_fp, "realloc| %10lu   %12llu   %12lu  (nomove:%ld, dec:%ld, free:%ld)\n",
+      fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu  (nomove:%ld, dec:%ld, free:%ld)\n", "realloc|",
                (unsigned long int) calls[idx_realloc],
                (unsigned long long int) total[idx_realloc],
                (unsigned long int) failed[idx_realloc],
                (unsigned long int) inplace,
                (unsigned long int) decreasing,
                (unsigned long int) realloc_free);
-      fprintf (summary_fp, " calloc| %10lu   %12llu   %12lu\n",
+      fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "calloc|",
                (unsigned long int) calls[idx_calloc],
                (unsigned long long int) total[idx_calloc],
                (unsigned long int) failed[idx_calloc]);
-      fprintf (summary_fp, "   free| %10lu   %12llu\n",
+      fprintf (summary_fp, "%-16s %10lu   %12llu\n", "free|",
                (unsigned long int) calls[idx_free],
                (unsigned long long int) total[idx_free]);
+      fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "posix_memalign|",
+               (unsigned long int) calls[idx_posix_memalign],
+               (unsigned long long int) total[idx_posix_memalign],
+               (unsigned long int) failed[idx_posix_memalign]);
+      fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "aligned_alloc|",
+               (unsigned long int) calls[idx_aligned_alloc],
+               (unsigned long long int) total[idx_aligned_alloc],
+               (unsigned long int) failed[idx_aligned_alloc]);
 
       /* Output three new tables to summary_fp */
       output_table_peak (summary_fp);
