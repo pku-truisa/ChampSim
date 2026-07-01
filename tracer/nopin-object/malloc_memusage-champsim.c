@@ -191,9 +191,49 @@ struct caller_entry {
   _Atomic unsigned long long alloc_cycles_sum; /* sum of alloc_cycles for unfreed objects */
   _Atomic unsigned long long unfreed_cnt;      /* number of objects not yet freed */
   _Atomic unsigned int types[12];        /* frequency per type (indices 1-11) */
+  _Atomic size_t max_sz;                /* largest single allocation from this IP */
 };
 static struct caller_entry caller_tbl[CALLER_HASH_SIZE];
 static _Atomic unsigned long long caller_entries;
+
+/* Top-64 largest allocations tracking */
+#define TOP_N 64
+static _Atomic size_t top_n_sizes[TOP_N];
+static _Atomic unsigned long long top_n_ips[TOP_N];
+static _Atomic int top_n_count;
+static volatile int top_n_lock;
+static inline void top_n_lock_acquire(void) {
+    while (__sync_lock_test_and_set(&top_n_lock, 1));
+}
+static inline void top_n_lock_release(void) {
+    __sync_lock_release(&top_n_lock);
+}
+
+/* Insert an allocation into the top-64 list if it qualifies.
+   Maintains descending order by size. Uses a spinlock since
+   the operation is very short (O(n), n <= 64). */
+static inline void top_n_try_insert(size_t sz, unsigned long long ip) {
+    top_n_lock_acquire();
+    int n = top_n_count;
+    int pos = n;
+    /* Find insertion position (descending order) */
+    while (pos > 0 && sz > (size_t)top_n_sizes[pos - 1])
+        pos--;
+    if (pos < TOP_N) {
+        /* Shift elements to make room */
+        int shift_start = (n < TOP_N) ? n : (TOP_N - 1);
+        int shift_end = pos;
+        for (int i = shift_start; i > shift_end; i--) {
+            top_n_sizes[i] = top_n_sizes[i - 1];
+            top_n_ips[i] = top_n_ips[i - 1];
+        }
+        top_n_sizes[pos] = sz;
+        top_n_ips[pos] = ip;
+        if (n < TOP_N)
+            top_n_count = n + 1;
+    }
+    top_n_lock_release();
+}
 
 struct entry
 {
@@ -433,6 +473,8 @@ stats_alloc (size_t sz)
       atomic_fetch_add_explicit (&cum_objs[i], 1, memory_order_relaxed);
     }
   atomic_fetch_add_explicit (&alive_objs, 1, memory_order_relaxed);
+  /* Track this allocation in top-64 largest objects */
+  top_n_try_insert (sz, mtrace_caller_ip);
 }
 
 /* Record a free in cumulative interval stats.
@@ -520,6 +562,8 @@ stats_caller (unsigned long long ip, size_t sz,
                                   memory_order_relaxed);
           atomic_store_explicit (&caller_tbl[idx].unfreed_cnt, 0,
                                   memory_order_relaxed);
+          atomic_store_explicit (&caller_tbl[idx].max_sz, sz,
+                                  memory_order_relaxed);
           /* Clear and increment type frequency */
           for (int t = 0; t < 12; t++)
             atomic_store_explicit (&caller_tbl[idx].types[t], 0,
@@ -546,6 +590,14 @@ stats_caller (unsigned long long ip, size_t sz,
                                       memory_order_relaxed);
           atomic_fetch_add_explicit (&caller_tbl[idx].tot_lt, cycles_delta,
                                       memory_order_relaxed);
+          /* Update max_sz if this allocation is larger */
+          {
+            size_t cur = atomic_load_explicit (&caller_tbl[idx].max_sz, memory_order_relaxed);
+            while (sz > cur) {
+              if (atomic_compare_exchange_weak (&caller_tbl[idx].max_sz, &cur, sz))
+                break;
+            }
+          }
           if (type < 12)
             atomic_fetch_add_explicit (&caller_tbl[idx].types[type], 1,
                                         memory_order_relaxed);
@@ -1833,14 +1885,14 @@ output_table_peak_objs (FILE *fp)
   }
 }
 
-/* Table 2: Top Caller IP Statistics (matches Python: type from frequency, sort by avg_size) */
+/* Table 2: Top Caller IP Statistics (sorted by max object size descending) */
 static void
 output_table_caller (FILE *fp)
 {
   int i, ncallers = 0;
   for (i = 0; i < CALLER_HASH_SIZE; i++)
     if (caller_tbl[i].ip != 0) ncallers++;
-  fprintf (fp, "\n=== Caller IP Statistics (sorted by average size) ===\n");
+  fprintf (fp, "\n=== Caller IP Statistics (sorted by max object size) ===\n");
   if (ncallers == 0) { fprintf (fp, "  (no caller IP data collected)\n"); return; }
   int n = 0;
   int *sorted = (int *) (*mallocp) (ncallers * sizeof (int));
@@ -1848,23 +1900,19 @@ output_table_caller (FILE *fp)
     { fprintf (fp, "  (malloc failed for sorting)\n"); return; }
   for (i = 0; i < CALLER_HASH_SIZE; i++)
     if (caller_tbl[i].ip != 0) sorted[n++] = i;
-  /* Sort by avg_size descending (matching Python) */
+  /* Sort by max_sz descending */
   for (int a = 0; a < n - 1; a++)
     for (int b = 0; b < n - 1 - a; b++)
       {
-        unsigned long long cnt_a = atomic_load_explicit (&caller_tbl[sorted[b]].count, memory_order_relaxed);
-        unsigned long long cnt_b = atomic_load_explicit (&caller_tbl[sorted[b + 1]].count, memory_order_relaxed);
-        unsigned long long sz_a = atomic_load_explicit (&caller_tbl[sorted[b]].tot_sz, memory_order_relaxed);
-        unsigned long long sz_b = atomic_load_explicit (&caller_tbl[sorted[b + 1]].tot_sz, memory_order_relaxed);
-        unsigned long long avg_a = cnt_a ? sz_a / cnt_a : 0;
-        unsigned long long avg_b = cnt_b ? sz_b / cnt_b : 0;
-        if (avg_a < avg_b)
+        size_t max_a = atomic_load_explicit (&caller_tbl[sorted[b]].max_sz, memory_order_relaxed);
+        size_t max_b = atomic_load_explicit (&caller_tbl[sorted[b + 1]].max_sz, memory_order_relaxed);
+        if (max_a < max_b)
           { int t = sorted[b]; sorted[b] = sorted[b + 1]; sorted[b + 1] = t; }
       }
-  /* Python output: Caller IP, Type, Alloc Count, Avg Size, Total Size, Avg Lifetime */
-  fprintf (fp, "  %18s %8s %12s %10s %15s %18s\n",
-           "Caller IP", "Type", "Alloc Count", "Avg Size", "Total Size", "Avg Lifetime(cyc)");
-  for (i = 0; i < 95; i++) fputc ('-', fp);
+  /* Output: Caller IP, Type, Alloc Count, Avg Size, Total Size, Max Object, Avg Lifetime */
+  fprintf (fp, "  %18s %8s %12s %10s %15s %15s %18s\n",
+           "Caller IP", "Type", "Alloc Count", "Avg Size", "Total Size", "Max Object", "Avg Lifetime(cyc)");
+  for (i = 0; i < 112; i++) fputc ('-', fp);
   fputc ('\n', fp);
   int limit = n;
   for (int ri = 0; ri < limit; ri++)
@@ -1874,6 +1922,7 @@ output_table_caller (FILE *fp)
       unsigned long long cnt = atomic_load_explicit (&caller_tbl[idx].count, memory_order_relaxed);
       unsigned long long tot_sz = atomic_load_explicit (&caller_tbl[idx].tot_sz, memory_order_relaxed);
       unsigned long long tot_lt = atomic_load_explicit (&caller_tbl[idx].tot_lt, memory_order_relaxed);
+      size_t max_sz = atomic_load_explicit (&caller_tbl[idx].max_sz, memory_order_relaxed);
       /* Determine primary type (most frequent) */
       unsigned int max_type = 0, max_cnt = 0;
       for (int ti = 1; ti < 12; ti++)
@@ -1889,11 +1938,12 @@ output_table_caller (FILE *fp)
         case 7: typestr = "mremap"; break; case 8: typestr = "munmap"; break;
         case 10: typestr = "posix_memalign"; break; case 11: typestr = "aligned_alloc"; break;
       }
-      char sb[32];
-      fprintf (fp, "  0x%016llx %8s %12llu %10llu %15s %18llu\n",
+      char sb[32], mb[32];
+      fprintf (fp, "  0x%016llx %8s %12llu %10llu %15s %15s %18llu\n",
                ip, typestr, cnt,
                cnt ? tot_sz / cnt : 0ULL,
                fmt_sz (tot_sz, sb, sizeof (sb)),
+               fmt_sz ((unsigned long long)max_sz, mb, sizeof (mb)),
                cnt ? tot_lt / cnt : 0ULL);
 
     }
@@ -1935,6 +1985,29 @@ output_table_pow2 (FILE *fp)
                total_sz ? 100.0 * sz / total_sz : 0.0,
                total_objs ? 100.0 * cum_o / total_objs : 0.0,
                total_sz ? 100.0 * cum_s / total_sz : 0.0);
+    }
+}
+
+
+/* Table 4: Top-64 Largest Allocations (by size, descending) */
+static void
+output_table_top_n (FILE *fp)
+{
+  int n = top_n_count;
+  fprintf (fp, "\n=== Top-%d Largest Allocations (by size, descending) ===\n", TOP_N);
+  if (n == 0) { fprintf (fp, "  (no allocation data collected)\n"); return; }
+  fprintf (fp, "  %4s %15s %18s\n", "Rank", "Size", "Caller IP");
+  for (int i = 0; i < 42; i++) fputc ('-', fp);
+  fputc ('\n', fp);
+  int limit = (n < TOP_N) ? n : TOP_N;
+  for (int i = 0; i < limit; i++)
+    {
+      size_t sz = top_n_sizes[i];
+      unsigned long long ip = top_n_ips[i];
+      if (sz == 0) break;
+      char sb[32];
+      fprintf (fp, "  %4d %15s   0x%016llx\n",
+               i + 1, fmt_sz ((unsigned long long)sz, sb, sizeof (sb)), ip);
     }
 }
 
@@ -2135,6 +2208,31 @@ dest (void)
                (unsigned long int) calls[idx_aligned_alloc],
                (unsigned long long int) total[idx_aligned_alloc],
                (unsigned long int) failed[idx_aligned_alloc]);
+      if (trace_mmap)
+        {
+          fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "mmap(r)|",
+                   (unsigned long int) calls[idx_mmap_r],
+                   (unsigned long long int) total[idx_mmap_r],
+                   (unsigned long int) failed[idx_mmap_r]);
+          fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "mmap(w)|",
+                   (unsigned long int) calls[idx_mmap_w],
+                   (unsigned long long int) total[idx_mmap_w],
+                   (unsigned long int) failed[idx_mmap_w]);
+          fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "mmap(a)|",
+                   (unsigned long int) calls[idx_mmap_a],
+                   (unsigned long long int) total[idx_mmap_a],
+                   (unsigned long int) failed[idx_mmap_a]);
+          fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu  (nomove: %ld, dec:%ld)\n", "mremap|",
+                   (unsigned long int) calls[idx_mremap],
+                   (unsigned long long int) total[idx_mremap],
+                   (unsigned long int) failed[idx_mremap],
+                   (unsigned long int) inplace_mremap,
+                   (unsigned long int) decreasing_mremap);
+          fprintf (summary_fp, "%-16s %10lu   %12llu   %12lu\n", "munmap|",
+                   (unsigned long int) calls[idx_munmap],
+                   (unsigned long long int) total[idx_munmap],
+                   (unsigned long int) failed[idx_munmap]);
+        }
 
       /* Output tables to summary_fp */
       output_table_peak (summary_fp);
@@ -2161,6 +2259,7 @@ dest (void)
       }
       output_table_caller (summary_fp);
       output_table_pow2 (summary_fp);
+      output_table_top_n (summary_fp);
 
       /* Close summary file */
       fflush(summary_fp); fsync(fileno(summary_fp));
@@ -2192,6 +2291,7 @@ dest (void)
        }
        output_table_caller (stderr);
        output_table_pow2 (stderr);
+       output_table_top_n (stderr);
     }
   else
     {
