@@ -75,18 +75,22 @@ TYPE_MAP = {
     7: 'mremap',
     8: 'munmap',
     9: 'main_begin',
+    10: 'posix_memalign',
+    11: 'aligned_alloc',
 }
 
-_ALLOC_TYPES = {1, 2, 3, 5, 6, 7}
+_ALLOC_TYPES = {1, 2, 3, 5, 6, 7, 10, 11}
 _FREE_TYPES = {4, 8}
 
 _ALLOC_GROUPS = [
-    ("malloc",        [1]),
-    ("calloc",        [2]),
-    ("realloc",       [3]),
-    ("mmap",          [5]),
-    ("mmap64",        [6]),
-    ("mremap",        [7]),
+    ("malloc",          [1]),
+    ("calloc",          [2]),
+    ("realloc",         [3]),
+    ("mmap",            [5]),
+    ("mmap64",          [6]),
+    ("mremap",          [7]),
+    ("posix_memalign",  [10]),
+    ("aligned_alloc",   [11]),
 ]
 _FREE_GROUPS = [
     ("free",          [4]),

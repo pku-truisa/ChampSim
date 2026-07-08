@@ -33,7 +33,7 @@
  *  - tracked_addresses set to filter free/munmap (suppress glibc-internal noise)
  *  - Independent mmap depth tracking
  *  - realloc in-place detection (via source_memory[0] == destination_memory[0])
- *  - aligned_alloc and memalign are NOT hooked (thin wrappers that call malloc internally)
+ *  - posix_memalign (type=10) and aligned_alloc (type=11) are hooked via RTN_ReplaceSignature
  */
 
 #include <fstream>
@@ -88,6 +88,8 @@ static void  (*real_free)(void*) = nullptr;
 static void* (*real_mmap)(void*, size_t, int, int, int, off_t) = nullptr;
 static int   (*real_munmap)(void*, size_t) = nullptr;
 static void* (*real_mremap)(void*, size_t, size_t, int, ...) = nullptr;
+static int   (*real_posix_memalign)(void**, size_t, size_t) = nullptr;
+static void* (*real_aligned_alloc)(size_t, size_t) = nullptr;
 
 // Forward declarations
 VOID insert_analysis_functions(INS ins);
@@ -608,6 +610,8 @@ static const char* malloc_type_name(unsigned char t)
     case 7:   return "mremap";
     case 8:   return "munmap";
     case 9:   return "main-begin";
+    case 10:  return "posix_memalign";
+    case 11:  return "aligned_alloc";
     default:  return "UNKNOWN";
   }
 }
@@ -724,7 +728,7 @@ static void* NewCalloc(size_t nmemb, size_t elem_size, ADDRINT caller_ip)
   void* ret = real_calloc(nmemb, elem_size);
   ts->alloc_depth = 0;
 
-  wrapper_record_alloc(2, (unsigned long long)nmemb, (unsigned long long)elem_size,
+  wrapper_record_alloc(2, (unsigned long long)(nmemb * elem_size), 0,
                        (ADDRINT)ret, (ADDRINT)(nmemb * elem_size), 2, caller_ip);
   return ret;
 }
@@ -910,6 +914,46 @@ static int NewMunmap(void* addr, size_t length, ADDRINT caller_ip)
   PIN_ReleaseLock(&malloc_lock);
 
   return real_munmap(addr, length);
+}
+
+// --- NEW POSIX_MEMALIGN (type=10) ---
+// posix_memalign cannot use a header due to alignment constraints,
+// so we cannot do free tracking. We just record the allocation event.
+static int NewPosixMemalign(void** memptr, size_t alignment, size_t size, ADDRINT caller_ip)
+{
+  if (compat_mode)
+    return real_posix_memalign(memptr, alignment, size);
+
+  int ret = real_posix_memalign(memptr, alignment, size);
+  if (ret == 0 && *memptr != nullptr) {
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    record_alloc_event(10, (unsigned long long)size, (unsigned long long)alignment,
+                       (unsigned long long)*memptr, (ADDRINT)size, 10,
+                       (unsigned long long)caller_ip);
+    tracked_addresses.insert((ADDRINT)*memptr);
+    PIN_ReleaseLock(&malloc_lock);
+  }
+  return ret;
+}
+
+// --- NEW ALIGNED_ALLOC (type=11) ---
+// aligned_alloc cannot use a header due to alignment constraints,
+// so we cannot do free tracking. We just record the allocation event.
+static void* NewAlignedAlloc(size_t alignment, size_t size, ADDRINT caller_ip)
+{
+  if (compat_mode)
+    return real_aligned_alloc(alignment, size);
+
+  void* ret = real_aligned_alloc(alignment, size);
+  if (ret != nullptr) {
+    PIN_GetLock(&malloc_lock, PIN_ThreadId());
+    record_alloc_event(11, (unsigned long long)size, (unsigned long long)alignment,
+                       (unsigned long long)ret, (ADDRINT)size, 11,
+                       (unsigned long long)caller_ip);
+    tracked_addresses.insert((ADDRINT)ret);
+    PIN_ReleaseLock(&malloc_lock);
+  }
+  return ret;
 }
 
 // =========================================================================
@@ -1129,6 +1173,37 @@ VOID ImageLoad(IMG img, VOID* v)
                            IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
                            IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
                            IARG_FUNCARG_ENTRYPOINT_VALUE, 4,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- POSIX_MEMALIGN (type=10) ---
+  for (const char* name : {"posix_memalign", "__libc_posix_memalign"}) {
+    if (real_posix_memalign != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_posix_memalign = (int (*)(void**, size_t, size_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewPosixMemalign,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                           IARG_RETURN_IP,
+                           IARG_END);
+      break;
+    }
+  }
+
+  // --- ALIGNED_ALLOC (type=11) ---
+  for (const char* name : {"aligned_alloc", "__libc_aligned_alloc"}) {
+    if (real_aligned_alloc != nullptr) break;
+    rtn = RTN_FindByName(img, name);
+    if (RTN_Valid(rtn)) {
+      real_aligned_alloc = (void* (*)(size_t, size_t))RTN_Funptr(rtn);
+      RTN_ReplaceSignature(rtn, (AFUNPTR)NewAlignedAlloc,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                           IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
                            IARG_RETURN_IP,
                            IARG_END);
       break;
