@@ -525,11 +525,8 @@ void insert_instrumentation(TRACE trace, void* v)
   } else {
     for_ins_in_trace(trace, [](const INS& ins) {
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
+      insert_analysis_functions(ins);
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
-      // Skip expensive analysis callbacks while still in per-insn fast-forward
-      if (!skip_dumping_instructions) {
-        insert_analysis_functions(ins);
-      }
     });
   }
 }
@@ -681,6 +678,10 @@ static void wrapper_record_alloc(unsigned char mtype,
   if (compat_mode) return;
   if (ret == 0 || ret == (ADDRINT)-1) return;
 
+  // In embedded_alloc mode, apply -k threshold filter
+  if (embedded_alloc_mode && size_for_tracking < (ADDRINT)KnobMallocThreshold.Value())
+    return;
+
   PIN_GetLock(&malloc_lock, PIN_ThreadId());
   record_alloc_event(mtype, arg1, arg2, (unsigned long long)ret,
                      size_for_tracking, coarse_for_tracking,
@@ -768,10 +769,13 @@ static void* NewRealloc(void* ptr, size_t new_size, ADDRINT caller_ip)
       tracked_allocations.erase(old_ptr);
       tracked_addresses.erase(old_ptr);
     }
-    record_alloc_event(3, (unsigned long long)old_ptr, (unsigned long long)new_size,
-                       (unsigned long long)ret, (ADDRINT)new_size, 3,
-                       (unsigned long long)caller_ip);
-    tracked_addresses.insert((ADDRINT)ret);
+    // In embedded_alloc mode, apply -k threshold filter
+    if (!embedded_alloc_mode || new_size >= KnobMallocThreshold.Value()) {
+      record_alloc_event(3, (unsigned long long)old_ptr, (unsigned long long)new_size,
+                         (unsigned long long)ret, (ADDRINT)new_size, 3,
+                         (unsigned long long)caller_ip);
+      tracked_addresses.insert((ADDRINT)ret);
+    }
   }
 
   PIN_ReleaseLock(&malloc_lock);
@@ -821,11 +825,14 @@ static void* NewMmap(void* addr, size_t length, int prot, int flags, int fd, off
   ts->mmap_depth = 0;
 
   if (ret != MAP_FAILED && !compat_mode) {
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    record_alloc_event(5, (unsigned long long)length, 0, (unsigned long long)ret,
-                       (ADDRINT)length, 5, (unsigned long long)caller_ip);
-    tracked_addresses.insert((ADDRINT)ret);
-    PIN_ReleaseLock(&malloc_lock);
+    // In embedded_alloc mode, apply -k threshold filter
+    if (!embedded_alloc_mode || length >= KnobMallocThreshold.Value()) {
+      PIN_GetLock(&malloc_lock, PIN_ThreadId());
+      record_alloc_event(5, (unsigned long long)length, 0, (unsigned long long)ret,
+                         (ADDRINT)length, 5, (unsigned long long)caller_ip);
+      tracked_addresses.insert((ADDRINT)ret);
+      PIN_ReleaseLock(&malloc_lock);
+    }
   }
   return ret;
 }
@@ -852,11 +859,14 @@ static void* NewMmap64(void* addr, size_t length, int prot, int flags, int fd, o
   ts->mmap_depth = 0;
 
   if (ret != MAP_FAILED && !compat_mode) {
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    record_alloc_event(6, (unsigned long long)length, 0, (unsigned long long)ret,
-                       (ADDRINT)length, 6, (unsigned long long)caller_ip);
-    tracked_addresses.insert((ADDRINT)ret);
-    PIN_ReleaseLock(&malloc_lock);
+    // In embedded_alloc mode, apply -k threshold filter
+    if (!embedded_alloc_mode || length >= KnobMallocThreshold.Value()) {
+      PIN_GetLock(&malloc_lock, PIN_ThreadId());
+      record_alloc_event(6, (unsigned long long)length, 0, (unsigned long long)ret,
+                         (ADDRINT)length, 6, (unsigned long long)caller_ip);
+      tracked_addresses.insert((ADDRINT)ret);
+      PIN_ReleaseLock(&malloc_lock);
+    }
   }
   return ret;
 }
@@ -883,16 +893,19 @@ static void* NewMremap(void* old_addr, size_t old_size, size_t new_size, int fla
   ts->mmap_depth = 0;
 
   if (ret != MAP_FAILED && !compat_mode) {
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    record_alloc_event(7, (unsigned long long)old_addr, (unsigned long long)old_size,
-                       (unsigned long long)ret, (ADDRINT)new_size, 7,
-                       (unsigned long long)caller_ip);
-    tracked_addresses.insert((ADDRINT)ret);
-    if ((ADDRINT)old_addr != 0) {
-      tracked_addresses.erase((ADDRINT)old_addr);
-      tracked_allocations.erase((ADDRINT)old_addr);
+    // In embedded_alloc mode, apply -k threshold filter
+    if (!embedded_alloc_mode || new_size >= KnobMallocThreshold.Value()) {
+      PIN_GetLock(&malloc_lock, PIN_ThreadId());
+      record_alloc_event(7, (unsigned long long)old_addr, (unsigned long long)old_size,
+                         (unsigned long long)ret, (ADDRINT)new_size, 7,
+                         (unsigned long long)caller_ip);
+      tracked_addresses.insert((ADDRINT)ret);
+      if ((ADDRINT)old_addr != 0) {
+        tracked_addresses.erase((ADDRINT)old_addr);
+        tracked_allocations.erase((ADDRINT)old_addr);
+      }
+      PIN_ReleaseLock(&malloc_lock);
     }
-    PIN_ReleaseLock(&malloc_lock);
   }
   return ret;
 }
@@ -926,12 +939,15 @@ static int NewPosixMemalign(void** memptr, size_t alignment, size_t size, ADDRIN
 
   int ret = real_posix_memalign(memptr, alignment, size);
   if (ret == 0 && *memptr != nullptr) {
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    record_alloc_event(10, (unsigned long long)size, (unsigned long long)alignment,
-                       (unsigned long long)*memptr, (ADDRINT)size, 10,
-                       (unsigned long long)caller_ip);
-    tracked_addresses.insert((ADDRINT)*memptr);
-    PIN_ReleaseLock(&malloc_lock);
+    // In embedded_alloc mode, apply -k threshold filter
+    if (!embedded_alloc_mode || size >= KnobMallocThreshold.Value()) {
+      PIN_GetLock(&malloc_lock, PIN_ThreadId());
+      record_alloc_event(10, (unsigned long long)size, (unsigned long long)alignment,
+                         (unsigned long long)*memptr, (ADDRINT)size, 10,
+                         (unsigned long long)caller_ip);
+      tracked_addresses.insert((ADDRINT)*memptr);
+      PIN_ReleaseLock(&malloc_lock);
+    }
   }
   return ret;
 }
@@ -946,12 +962,15 @@ static void* NewAlignedAlloc(size_t alignment, size_t size, ADDRINT caller_ip)
 
   void* ret = real_aligned_alloc(alignment, size);
   if (ret != nullptr) {
-    PIN_GetLock(&malloc_lock, PIN_ThreadId());
-    record_alloc_event(11, (unsigned long long)size, (unsigned long long)alignment,
-                       (unsigned long long)ret, (ADDRINT)size, 11,
-                       (unsigned long long)caller_ip);
-    tracked_addresses.insert((ADDRINT)ret);
-    PIN_ReleaseLock(&malloc_lock);
+    // In embedded_alloc mode, apply -k threshold filter
+    if (!embedded_alloc_mode || size >= KnobMallocThreshold.Value()) {
+      PIN_GetLock(&malloc_lock, PIN_ThreadId());
+      record_alloc_event(11, (unsigned long long)size, (unsigned long long)alignment,
+                         (unsigned long long)ret, (ADDRINT)size, 11,
+                         (unsigned long long)caller_ip);
+      tracked_addresses.insert((ADDRINT)ret);
+      PIN_ReleaseLock(&malloc_lock);
+    }
   }
   return ret;
 }
@@ -1458,7 +1477,8 @@ int main(int argc, char* argv[])
   std::cout << "[ChampSim Tracer] Compat mode: instruction trace only, no allocation events.\n";
 
   TRACE_AddInstrumentFunction(insert_instrumentation, 0);
-  IMG_AddInstrumentFunction(ImageLoad, 0);
+  // In compat mode, do NOT register ImageLoad — no allocator interception needed.
+  // This avoids the runtime overhead of RTN_ReplaceSignature on malloc/calloc/realloc/free/mmap/etc.
   PIN_AddFiniFunction(Fini, 0);
   PIN_StartProgram();
 
