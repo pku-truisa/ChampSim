@@ -134,18 +134,27 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
       if (t.instr_type == 2) {
         uint8_t alloc_type = t.instr_info;
         switch (alloc_type) {
-          case 1: case 3: case 5: case 8:
+          case 1: // malloc      src[0]=size,                    dst[0]=addr
+          case 2: // calloc      src[0]=total_size,              dst[0]=addr
+          case 5: // mmap        src[0]=length,                  dst[0]=addr
+          case 6: // mmap64      src[0]=length,                  dst[0]=addr
+          case 10: // posix_memalign  src[0]=size,               dst[0]=addr
+          case 11: // aligned_alloc   src[0]=size,               dst[0]=addr
             mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
             break;
-          case 6: // realloc
-            if (t.source_memory[1] != 0)
-              mol_table.record_free(champsim::address{t.source_memory[1]});
-            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
+          case 3: // realloc     src[0]=old_ptr, src[1]=new_size, dst[0]=new_ptr
+          case 7: // mremap      src[0]=old_addr,src[1]=old_size, dst[0]=new_addr
+            if (t.source_memory[0] != 0)
+              mol_table.record_free(champsim::address{t.source_memory[0]});
+            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[1], alloc_type);
             break;
-          case 2: case 4:
+          case 4: // free        src[0]=ptr
+          case 8: // munmap      src[0]=addr
             mol_table.record_free(champsim::address{t.source_memory[0]});
             break;
-          default: break;
+          case 9: // main-begin marker
+          default:
+            break;
         }
         // Skip allocation instructions: they are not real instructions
         continue;
