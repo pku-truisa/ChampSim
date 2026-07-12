@@ -122,7 +122,7 @@ public:
   void register_mapping(champsim::page_number vpage, champsim::page_number ppage);
 
   // Called by Cache/DRAM to find which object owns a physical page
-  // Returns alloc_id (0 if no active object found for this page)
+  // Returns alloc_id (0 if no mapping found for this page)
   uint64_t lookup_alloc_id_by_pa(champsim::page_number ppage) const;
 
   // Access the per-object stats by alloc_id
@@ -131,6 +131,7 @@ public:
 
   // Get all object records (for output)
   const std::vector<ObjectRecord>& get_all_objects() const { return all_objects; }
+
 
   // Register known cache/DRAM names (for output, ensures all-zero stats are also printed)
   void register_cache_name(const std::string& name) { known_cache_names.push_back(name); }
@@ -142,8 +143,8 @@ private:
   // Structure 1: active VA ranges (sorted by vaddr_start)
   std::vector<ActiveObject> active_objects;
 
-  // Structure 2: reverse page table (PA page → VA page)
-  std::map<champsim::page_number, champsim::page_number> ppage_to_vpage;
+  // Structure 2: direct PA page → alloc_id mapping (replaces old two-step ppage_to_vpage)
+  std::map<champsim::page_number, uint64_t> ppage_to_allocid;
 
   // Structure 3: all historical allocations with stats
   std::vector<ObjectRecord> all_objects;
@@ -157,6 +158,9 @@ private:
 
   // Find active object by VA (binary search in active_objects)
   const ActiveObject* find_active_by_va(champsim::address vaddr) const;
+
+  // Find alloc_id by VA page overlap (searches all_objects, not just active)
+  uint64_t find_alloc_id_by_va(champsim::address vaddr) const;
 
   // Find ObjectRecord by alloc_id
   ObjectRecord* find_record(uint64_t alloc_id);

@@ -47,40 +47,31 @@ void MemoryObjectTable::record_free(champsim::address vaddr)
     active_objects.erase(it);
   }
 
-  // Note: We do NOT remove from ppage_to_vpage here. Old mappings will be
+  // Note: We do NOT remove from ppage_to_allocid here. Old mappings will be
   // overwritten when the same physical page is reused for a new allocation.
 }
 
 void MemoryObjectTable::register_mapping(champsim::page_number vpage, champsim::page_number ppage)
 {
-  // Check if this virtual page belongs to an active allocation
+  // Check if this virtual page belongs to an active or historical allocation
   champsim::address vaddr{vpage.to<uint64_t>() << champsim::lg2(PAGE_SIZE)};
+  uint64_t alloc_id = find_alloc_id_by_va(vaddr);
 
-  const ActiveObject* obj = find_active_by_va(vaddr);
-  if (obj != nullptr) {
-    // This physical page now maps to this virtual page (belonging to obj)
-    ppage_to_vpage[ppage] = vpage;
+  if (alloc_id > 0) {
+    // Store the alloc_id directly for this physical page
+    ppage_to_allocid[ppage] = alloc_id;
   }
-  // If the VA is not in any active allocation, we don't register the mapping.
-  // Old mappings for freed objects remain until overwritten.
 }
 
 uint64_t MemoryObjectTable::lookup_alloc_id_by_pa(champsim::page_number ppage) const
 {
-  // Step 1: PA → VA via reverse page table
-  auto it = ppage_to_vpage.find(ppage);
-  if (it == ppage_to_vpage.end()) {
+  // Direct lookup: PA → alloc_id
+  auto it = ppage_to_allocid.find(ppage);
+  if (it == ppage_to_allocid.end()) {
     return 0; // No known mapping
   }
 
-  // Step 2: VA → active object lookup
-  champsim::address vaddr{it->second.to<uint64_t>() << champsim::lg2(PAGE_SIZE)};
-  const ActiveObject* obj = find_active_by_va(vaddr);
-  if (obj != nullptr) {
-    return obj->alloc_id;
-  }
-
-  return 0; // Object was freed, no longer active
+  return it->second;
 }
 
 PerCacheStats& MemoryObjectTable::get_cache_stats(uint64_t alloc_id, const std::string& cache_name)
@@ -120,6 +111,27 @@ const MemoryObjectTable::ActiveObject* MemoryObjectTable::find_active_by_va(cham
   }
 
   return nullptr;
+}
+
+// Search all_objects (both active and freed) for an alloc_id by VA page overlap
+uint64_t MemoryObjectTable::find_alloc_id_by_va(champsim::address vaddr) const
+{
+  // Check active objects first
+  const ActiveObject* active = find_active_by_va(vaddr);
+  if (active != nullptr) {
+    return active->alloc_id;
+  }
+
+  // Fall back to historical objects (freed allocations)
+  champsim::address page_end{vaddr.to<uint64_t>() + PAGE_SIZE};
+  for (const ObjectRecord& rec : all_objects) {
+    champsim::address obj_end{rec.vaddr_start.to<uint64_t>() + rec.size};
+    if (vaddr < obj_end && page_end > rec.vaddr_start) {
+      return rec.alloc_id;
+    }
+  }
+
+  return 0; // Not found
 }
 
 MemoryObjectTable::ObjectRecord* MemoryObjectTable::find_record(uint64_t alloc_id)

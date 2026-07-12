@@ -573,7 +573,7 @@ void BranchOrNot(UINT32 taken)
 }
 
 template <typename T>
-void WriteToSet(T* begin, T* end, UINT32 r)
+void WriteToSet(T* begin, T* end, T r)
 {
   auto set_end = std::find(begin, end, 0);
   // If the set is full (no zero slot found), do nothing
