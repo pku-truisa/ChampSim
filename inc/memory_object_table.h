@@ -23,18 +23,25 @@
 #include "address.h"
 #include "champsim.h"
 
-// Memory allocation event types (matching input_instr.is_malloc)
+// Memory allocation event types
+// These values MUST match the instr_info encoding produced by
+// champsim_object_tracer.cpp (tracer/pin-object/):
+//   1= malloc,  2= calloc,  3= realloc,  4= free,
+//   5= mmap,    6= mmap64,  7= mremap,   8= munmap,
+//   9= main-begin,  10= posix_memalign,  11= aligned_alloc
 enum class malloc_type : uint8_t {
   NORMAL = 0,
   MALLOC = 1,
-  FREE = 2,
-  MMAP = 3,
-  MUNMAP = 4,
-  CALLOC = 5,
-  REALLOC = 6,
-  ALIGNED_ALLOC = 7,
-  POSIX_MEMALIGN = 8,
-  MEMALIGN = 9,
+  CALLOC = 2,
+  REALLOC = 3,
+  FREE = 4,
+  MMAP = 5,
+  MMAP64 = 6,
+  MREMAP = 7,
+  MUNMAP = 8,
+  MAIN_BEGIN = 9,
+  POSIX_MEMALIGN = 10,
+  ALIGNED_ALLOC = 11,
 };
 
 inline const char* malloc_type_name(malloc_type t)
@@ -42,14 +49,16 @@ inline const char* malloc_type_name(malloc_type t)
   switch (t) {
     case malloc_type::NORMAL: return "NORMAL";
     case malloc_type::MALLOC: return "MALLOC";
-    case malloc_type::FREE: return "FREE";
-    case malloc_type::MMAP: return "MMAP";
-    case malloc_type::MUNMAP: return "MUNMAP";
     case malloc_type::CALLOC: return "CALLOC";
     case malloc_type::REALLOC: return "REALLOC";
-    case malloc_type::ALIGNED_ALLOC: return "ALIGNED_ALLOC";
+    case malloc_type::FREE: return "FREE";
+    case malloc_type::MMAP: return "MMAP";
+    case malloc_type::MMAP64: return "MMAP64";
+    case malloc_type::MREMAP: return "MREMAP";
+    case malloc_type::MUNMAP: return "MUNMAP";
+    case malloc_type::MAIN_BEGIN: return "MAIN_BEGIN";
     case malloc_type::POSIX_MEMALIGN: return "POSIX_MEMALIGN";
-    case malloc_type::MEMALIGN: return "MEMALIGN";
+    case malloc_type::ALIGNED_ALLOC: return "ALIGNED_ALLOC";
     default: return "UNKNOWN";
   }
 }
@@ -123,6 +132,12 @@ public:
   // Get all object records (for output)
   const std::vector<ObjectRecord>& get_all_objects() const { return all_objects; }
 
+  // Register known cache/DRAM names (for output, ensures all-zero stats are also printed)
+  void register_cache_name(const std::string& name) { known_cache_names.push_back(name); }
+  void register_dram_name(const std::string& name) { known_dram_names.push_back(name); }
+  const std::vector<std::string>& get_known_cache_names() const { return known_cache_names; }
+  const std::vector<std::string>& get_known_dram_names() const { return known_dram_names; }
+
 private:
   // Structure 1: active VA ranges (sorted by vaddr_start)
   std::vector<ActiveObject> active_objects;
@@ -132,6 +147,10 @@ private:
 
   // Structure 3: all historical allocations with stats
   std::vector<ObjectRecord> all_objects;
+
+  // Known cache/DRAM channel names for output (even if all stats are zero)
+  std::vector<std::string> known_cache_names;
+  std::vector<std::string> known_dram_names;
 
   // ID counter
   uint64_t next_alloc_id = 1;

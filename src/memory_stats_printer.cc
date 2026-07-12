@@ -15,34 +15,6 @@
 
 namespace {
 
-// Helper: collect all cache names across all objects
-std::vector<std::string> collect_cache_names(const std::vector<MemoryObjectTable::ObjectRecord>& objects)
-{
-  std::vector<std::string> names;
-  for (const auto& obj : objects) {
-    for (const auto& [name, stats] : obj.cache_stats) {
-      if (std::find(names.begin(), names.end(), name) == names.end()) {
-        names.push_back(name);
-      }
-    }
-  }
-  return names;
-}
-
-// Helper: collect all DRAM names across all objects
-std::vector<std::string> collect_dram_names(const std::vector<MemoryObjectTable::ObjectRecord>& objects)
-{
-  std::vector<std::string> names;
-  for (const auto& obj : objects) {
-    for (const auto& [name, stats] : obj.dram_stats) {
-      if (std::find(names.begin(), names.end(), name) == names.end()) {
-        names.push_back(name);
-      }
-    }
-  }
-  return names;
-}
-
 void print_cache_stats(std::ostream& os, const PerCacheStats& st)
 {
   // Per access_type hits and misses
@@ -108,8 +80,8 @@ void print_memory_object_stats(const std::string& filename)
   auto sorted = all_objects;
   std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.size > b.size; });
 
-  auto cache_names = collect_cache_names(all_objects);
-  auto dram_names = collect_dram_names(all_objects);
+  auto cache_names = mol_table.get_known_cache_names();
+  auto dram_names = mol_table.get_known_dram_names();
 
   fmt::print(out, "=== Memory Object Statistics ({} objects, sorted by size descending) ===\n\n", sorted.size());
 
@@ -118,21 +90,27 @@ void print_memory_object_stats(const std::string& filename)
                obj.vaddr_start.to<uint64_t>());
     fmt::print(out, "{:-<80}\n", "");
 
-    // Cache/TLB stats
+    // Cache/TLB stats (always print the section, even if all stats are zero)
     for (const auto& cname : cache_names) {
+      fmt::print(out, "  [{}]\n", cname);
       auto it = obj.cache_stats.find(cname);
       if (it != obj.cache_stats.end()) {
-        fmt::print(out, "  [{}]\n", cname);
         print_cache_stats(out, it->second);
+      } else {
+        // Print all-zero stats when no data was recorded for this object
+        print_cache_stats(out, PerCacheStats{});
       }
     }
 
-    // DRAM stats
+    // DRAM stats (always print the section, even if all stats are zero)
     for (const auto& dname : dram_names) {
+      fmt::print(out, "  [{}]\n", dname);
       auto it = obj.dram_stats.find(dname);
       if (it != obj.dram_stats.end()) {
-        fmt::print(out, "  [{}]\n", dname);
         print_dram_stats(out, it->second);
+      } else {
+        // Print all-zero stats when no data was recorded for this object
+        print_dram_stats(out, PerDRAMStats{});
       }
     }
 

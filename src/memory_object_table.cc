@@ -103,13 +103,18 @@ PerDRAMStats& MemoryObjectTable::get_dram_stats(uint64_t alloc_id, const std::st
 
 const MemoryObjectTable::ActiveObject* MemoryObjectTable::find_active_by_va(champsim::address vaddr) const
 {
-  // Binary search: find the active_range whose [vaddr_start, vaddr_end) contains vaddr
+  // Binary search: find the active_range whose page [vaddr, vaddr+PAGE_SIZE) 
+  // overlaps with the object's [vaddr_start, vaddr_end).
+  // Because vaddr is page-aligned and object boundaries may not be page-aligned,
+  // we use an overlap check rather than exact containment.
   auto it = std::upper_bound(active_objects.begin(), active_objects.end(), vaddr,
                              [](champsim::address va, const ActiveObject& obj) { return va < obj.vaddr_start; });
 
   if (it != active_objects.begin()) {
     --it;
-    if (vaddr >= it->vaddr_start && vaddr < it->vaddr_end) {
+    // Check page overlap: Page [vaddr, vaddr+PAGE_SIZE) overlaps [it->vaddr_start, it->vaddr_end)?
+    champsim::address page_end{vaddr.to<uint64_t>() + PAGE_SIZE};
+    if (vaddr < it->vaddr_end && page_end > it->vaddr_start) {
       return &(*it);
     }
   }

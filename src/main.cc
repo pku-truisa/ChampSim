@@ -157,6 +157,15 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
     }
   }
 
+  // Register known cache and DRAM channel names for per-object statistics output.
+  // Even if per-object stats are all zero, we still want to print the sections.
+  for (CACHE& cache : gen_environment.cache_view()) {
+    mol_table.register_cache_name(cache.NAME);
+  }
+  for (auto& chan : gen_environment.dram_view().channels) {
+    mol_table.register_dram_name(chan.sim_stats.name);
+  }
+
   auto phase_stats = champsim::main(gen_environment, phases, traces);
 
   fmt::print("\nChampSim completed all CPUs\n\n");
