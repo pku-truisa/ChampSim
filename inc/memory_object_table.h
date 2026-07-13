@@ -2,7 +2,7 @@
  * Memory Object Table - Tracks memory allocations and per-object statistics
  *
  * Maintains three internal structures:
- *   1. active_objects - currently allocated VA ranges (sorted by vaddr_start)
+ *   1. active_objects - currently allocated VA ranges (sorted by vaddr_start via map)
  *   2. ppage_to_vpage  - reverse page table: physical page → virtual page
  *   3. all_objects     - all historical allocations with per-object statistics
  *
@@ -140,8 +140,9 @@ public:
   const std::vector<std::string>& get_known_dram_names() const { return known_dram_names; }
 
 private:
-  // Structure 1: active VA ranges (sorted by vaddr_start)
-  std::vector<ActiveObject> active_objects;
+  // Structure 1: active VA ranges (sorted by vaddr_start, using map for O(log n) insert/erase)
+  // Keyed by vaddr_start to enable efficient overlap queries and insertion.
+  std::map<champsim::address, ActiveObject> active_objects;
 
   // Structure 2: direct PA page → alloc_id mapping (replaces old two-step ppage_to_vpage)
   std::map<champsim::page_number, uint64_t> ppage_to_allocid;

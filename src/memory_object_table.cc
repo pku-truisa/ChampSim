@@ -13,7 +13,7 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
 {
   uint64_t id = next_alloc_id++;
 
-  // Add to active_objects (keep sorted by vaddr_start)
+  // Add to active_objects (map keyed by vaddr_start, O(log n) insert)
   ActiveObject obj;
   obj.vaddr_start = vaddr;
   obj.vaddr_end = champsim::address{static_cast<uint64_t>(vaddr.to<uint64_t>() + size)};
@@ -21,9 +21,7 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
   obj.alloc_id = id;
   obj.size = size;
 
-  auto pos = std::lower_bound(active_objects.begin(), active_objects.end(), obj,
-                              [](const ActiveObject& a, const ActiveObject& b) { return a.vaddr_start < b.vaddr_start; });
-  active_objects.insert(pos, obj);
+  active_objects.emplace(vaddr, obj);
 
   // Add to all_objects
   ObjectRecord record;
@@ -38,12 +36,9 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
 
 void MemoryObjectTable::record_free(champsim::address vaddr)
 {
-  // Find and remove from active_objects
-  auto it =
-      std::lower_bound(active_objects.begin(), active_objects.end(), vaddr,
-                       [](const ActiveObject& obj, champsim::address va) { return obj.vaddr_start < va; });
-
-  if (it != active_objects.end() && it->vaddr_start == vaddr) {
+  // Find and remove from active_objects (map, O(log n))
+  auto it = active_objects.find(vaddr);
+  if (it != active_objects.end()) {
     active_objects.erase(it);
   }
 
@@ -98,15 +93,15 @@ const MemoryObjectTable::ActiveObject* MemoryObjectTable::find_active_by_va(cham
   // overlaps with the object's [vaddr_start, vaddr_end).
   // Because vaddr is page-aligned and object boundaries may not be page-aligned,
   // we use an overlap check rather than exact containment.
-  auto it = std::upper_bound(active_objects.begin(), active_objects.end(), vaddr,
-                             [](champsim::address va, const ActiveObject& obj) { return va < obj.vaddr_start; });
+  // Uses map::upper_bound for O(log n) search on the sorted map.
+  auto it = active_objects.upper_bound(vaddr);
 
   if (it != active_objects.begin()) {
     --it;
     // Check page overlap: Page [vaddr, vaddr+PAGE_SIZE) overlaps [it->vaddr_start, it->vaddr_end)?
     champsim::address page_end{vaddr.to<uint64_t>() + PAGE_SIZE};
-    if (vaddr < it->vaddr_end && page_end > it->vaddr_start) {
-      return &(*it);
+    if (vaddr < it->second.vaddr_end && page_end > it->second.vaddr_start) {
+      return &it->second;
     }
   }
 

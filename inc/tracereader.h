@@ -111,8 +111,17 @@ void set_branch_targets(It begin, It end)
 template <typename T, typename F>
 ooo_model_instr bulk_tracereader<T, F>::operator()()
 {
-  // Keep reading until we have at least one real instruction in the buffer
-  // (allocation-only batches can leave the buffer empty)
+  // Refill buffer if we're running low on instructions.
+  // Use a do-while loop to re-read if the batch contained only allocation events
+  // (instr_type==2) and instr_buffer is still empty. The !trace_file.eof() guard
+  // prevents infinite looping when the trace has no real instructions.
+  // Progress counter for allocation baseline processing
+  uint64_t alloc_records_seen = 0;
+  constexpr uint64_t alloc_progress_interval = 500000;
+
+  // Loop to skip batches that contain only allocation events (instr_type==2).
+  // Safe against infinite loop: every iteration advances the file position via
+  // trace_file.read(), and !trace_file.eof() terminates when the file is exhausted.
   while (std::size(instr_buffer) <= refresh_thresh && !trace_file.eof()) {
     std::array<T, buffer_size - refresh_thresh> trace_read_buf;
     std::array<char, std::size(trace_read_buf) * sizeof(T)> raw_buf;
@@ -131,6 +140,12 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
     auto end = std::next(begin, bytes_read / sizeof(T));
     // Process trace records: record memory operations, skip allocation events
     for (auto it = begin; it != end; ++it) {
+      if (it->instr_type == 2) {
+        alloc_records_seen++;
+        if (alloc_records_seen % alloc_progress_interval == 0) {
+          fmt::print("[TRACE] Processed {} allocation baseline records...\n", alloc_records_seen);
+        }
+      }
       T t = *it;
       // Process memory allocation/deallocation events (shared logic for both formats)
       if (t.instr_type == 2) {
@@ -167,6 +182,10 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
 
     // Set branch targets
     set_branch_targets(std::begin(instr_buffer), std::end(instr_buffer));
+  }
+
+  if (alloc_records_seen > 0) {
+    fmt::print("[TRACE] Finished processing allocation baseline: {} records total.\n", alloc_records_seen);
   }
 
   auto retval = instr_buffer.front();
