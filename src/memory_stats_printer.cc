@@ -1,6 +1,7 @@
 /*
  * Memory Object Statistics Printer
  * Outputs per-object cache/TLB/DRAM statistics sorted by object size (descending)
+ * Objects or sections with no access data are omitted from output.
  */
 
 #include <algorithm>
@@ -14,6 +15,33 @@
 #include "util/to_underlying.h"
 
 namespace {
+
+// Check if a PerCacheStats record has any non-zero data
+inline bool has_any_data(const PerCacheStats& st)
+{
+  for (int i = 0; i < 5; ++i)
+    if (st.hits[i] > 0 || st.misses[i] > 0)
+      return true;
+  if (st.mshr_merge > 0 || st.mshr_return > 0)
+    return true;
+  if (st.pf_requested > 0 || st.pf_issued > 0 || st.pf_useful > 0 || st.pf_useless > 0 || st.pf_fill > 0)
+    return true;
+  return false;
+}
+
+// Check if a PerDRAMStats record has any non-zero data
+inline bool has_any_data(const PerDRAMStats& st)
+{
+  if (st.rq_row_buffer_hit > 0 || st.rq_row_buffer_miss > 0)
+    return true;
+  if (st.wq_row_buffer_hit > 0 || st.wq_row_buffer_miss > 0)
+    return true;
+  if (st.wq_full > 0)
+    return true;
+  if (st.dbus_cycle_congested > 0 || st.dbus_count_congested > 0)
+    return true;
+  return false;
+}
 
 void print_cache_stats(std::ostream& os, const PerCacheStats& st)
 {
@@ -85,37 +113,52 @@ void print_memory_object_stats(const std::string& filename)
 
   fmt::print(out, "=== Memory Object Statistics ({} objects, sorted by size descending) ===\n\n", sorted.size());
 
+  uint64_t printed_count = 0;
   for (const auto& obj : sorted) {
+    // Collect which cache levels actually have data for this object
+    std::vector<std::string> active_cache_names;
+    for (const auto& cname : cache_names) {
+      auto it = obj.cache_stats.find(cname);
+      if (it != obj.cache_stats.end() && has_any_data(it->second)) {
+        active_cache_names.push_back(cname);
+      }
+    }
+
+    // Collect which DRAM channels actually have data for this object
+    std::vector<std::string> active_dram_names;
+    for (const auto& dname : dram_names) {
+      auto it = obj.dram_stats.find(dname);
+      if (it != obj.dram_stats.end() && has_any_data(it->second)) {
+        active_dram_names.push_back(dname);
+      }
+    }
+
+    // Skip objects with no data at all
+    if (active_cache_names.empty() && active_dram_names.empty()) {
+      continue;
+    }
+
+    printed_count++;
     fmt::print(out, "Object ID={}  Type={}  Size={}  VA_Start=0x{:x}\n", obj.alloc_id, malloc_type_name(static_cast<malloc_type>(obj.alloc_type)), obj.size,
                obj.vaddr_start.to<uint64_t>());
     fmt::print(out, "{:-<80}\n", "");
 
-    // Cache/TLB stats (always print the section, even if all stats are zero)
-    for (const auto& cname : cache_names) {
+    // Cache/TLB stats (only if the object has data for this cache)
+    for (const auto& cname : active_cache_names) {
       fmt::print(out, "  [{}]\n", cname);
       auto it = obj.cache_stats.find(cname);
-      if (it != obj.cache_stats.end()) {
-        print_cache_stats(out, it->second);
-      } else {
-        // Print all-zero stats when no data was recorded for this object
-        print_cache_stats(out, PerCacheStats{});
-      }
+      print_cache_stats(out, it->second);
     }
 
-    // DRAM stats (always print the section, even if all stats are zero)
-    for (const auto& dname : dram_names) {
+    // DRAM stats (only if the object has data for this DRAM channel)
+    for (const auto& dname : active_dram_names) {
       fmt::print(out, "  [{}]\n", dname);
       auto it = obj.dram_stats.find(dname);
-      if (it != obj.dram_stats.end()) {
-        print_dram_stats(out, it->second);
-      } else {
-        // Print all-zero stats when no data was recorded for this object
-        print_dram_stats(out, PerDRAMStats{});
-      }
+      print_dram_stats(out, it->second);
     }
 
     fmt::print(out, "\n");
   }
 
-  fmt::print("[MOL] Memory object statistics written to: {}\n", filename);
+  fmt::print("[MOL] Memory object statistics written to: {} ({} objects with data)\n", filename, printed_count);
 }
