@@ -166,7 +166,8 @@ class ActiveObjectTable:
 def process_trace(filename, top_n=None):
     """Main analysis: read trace file and compute per-object load/store counts.
 
-    Returns (obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs)
+    Returns (obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs,
+             unowned_loads, unowned_stores, total_memory_ops)
     where obj_stats is a dict: alloc_id -> {
         'loads': int, 'stores': int, 'size': int, 'alloc_type': int,
         'vaddr_start': int, 'vaddr_end': int
@@ -185,6 +186,9 @@ def process_trace(filename, top_n=None):
     total_records = 0
     total_alloc_events = 0
     total_normal_instrs = 0
+    unowned_loads = 0
+    unowned_stores = 0
+    total_memory_ops = 0
 
     for ip, itype, iinfo, dst_mem, src_mem in read_records(filename):
         total_records += 1
@@ -262,18 +266,24 @@ def process_trace(filename, top_n=None):
         # Process load addresses (source_memory[0..3])
         for addr in src_mem[:4]:
             if addr != 0:
+                total_memory_ops += 1
                 obj_id = active_table.find(addr)
                 if obj_id is not None and obj_id in obj_stats:
                     obj_stats[obj_id]['loads'] += 1
+                else:
+                    unowned_loads += 1
 
         # Process store addresses (destination_memory[0..1])
         for addr in dst_mem[:2]:
             if addr != 0:
+                total_memory_ops += 1
                 obj_id = active_table.find(addr)
                 if obj_id is not None and obj_id in obj_stats:
                     obj_stats[obj_id]['stores'] += 1
+                else:
+                    unowned_stores += 1
 
-    return obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs
+    return obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops
 
 
 def simplify_size(n):
@@ -320,7 +330,8 @@ class Tee:
 
 
 def output_results(obj_stats, active_table, total_records, total_alloc_events,
-                   total_normal_instrs, filename, top_n=None, output_path=None):
+                   total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops,
+                   filename, top_n=None, output_path=None):
     """Print analysis results as a formatted table.
 
     Results are sorted by total accesses (loads + stores) descending.
@@ -354,20 +365,21 @@ def output_results(obj_stats, active_table, total_records, total_alloc_events,
             sys.stdout = sys.__stdout__
             return
 
-        # Build rows sorted by total accesses descending
+        # Build rows sorted by total accesses descending, filter out zero-access objects
         rows = []
         for oid, stats in obj_stats.items():
             total_accesses = stats['loads'] + stats['stores']
-            rows.append((
-                total_accesses,
-                stats['loads'],
-                stats['stores'],
-                stats['size'],
-                stats['alloc_type'],
-                stats['vaddr_start'],
-                stats['vaddr_end'],
-                oid,
-            ))
+            if total_accesses > 0:
+                rows.append((
+                    total_accesses,
+                    stats['loads'],
+                    stats['stores'],
+                    stats['size'],
+                    stats['alloc_type'],
+                    stats['vaddr_start'],
+                    stats['vaddr_end'],
+                    oid,
+                ))
 
         rows.sort(key=lambda r: -r[0])  # sort by total_accesses descending
 
@@ -445,6 +457,25 @@ def output_results(obj_stats, active_table, total_records, total_alloc_events,
         print()
         print(f"  Objects still active at end of trace: {len(active_table.starts):,}")
         print(f"  Total objects ever allocated:         {len(obj_stats):,}")
+
+        # ---- Unowned access summary ----
+        owned_loads = sum(stats['loads'] for stats in obj_stats.values())
+        owned_stores = sum(stats['stores'] for stats in obj_stats.values())
+        print()
+        print("  --- Access Coverage Summary ---")
+        print(f"  Total memory operations:        {total_memory_ops:>14,}")
+        print(f"  Loads within known objects:     {owned_loads:>14,}")
+        print(f"  Stores within known objects:    {owned_stores:>14,}")
+        print(f"  Unowned loads:                  {unowned_loads:>14,}")
+        print(f"  Unowned stores:                 {unowned_stores:>14,}")
+        unowned_total = unowned_loads + unowned_stores
+        if total_memory_ops > 0:
+            pct = unowned_total / total_memory_ops * 100
+            print(f"  Unowned access percentage:      {pct:>13.2f}%")
+            owned_pct = (owned_loads + owned_stores) / total_memory_ops * 100
+            print(f"  Owned access percentage:        {owned_pct:>13.2f}%")
+        print()
+        print(f"  (Objects with zero accesses: {len(obj_stats) - len(rows)}  — hidden from table)")
         print("=" * 70)
 
         sys.stdout = sys.__stdout__
@@ -490,11 +521,12 @@ Examples:
     print(f"Processing trace file: {args.input}")
     print("Streaming analysis in progress...")
 
-    obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs = \
+    obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops = \
         process_trace(args.input, top_n=top_n)
 
     output_results(obj_stats, active_table, total_records, total_alloc_events,
-                   total_normal_instrs, args.input, top_n=top_n,
+                   total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops,
+                   args.input, top_n=top_n,
                    output_path=args.output)
 
     print("\nDone.")
