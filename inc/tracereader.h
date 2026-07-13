@@ -111,7 +111,9 @@ void set_branch_targets(It begin, It end)
 template <typename T, typename F>
 ooo_model_instr bulk_tracereader<T, F>::operator()()
 {
-  if (std::size(instr_buffer) <= refresh_thresh) {
+  // Keep reading until we have at least one real instruction in the buffer
+  // (allocation-only batches can leave the buffer empty)
+  while (std::size(instr_buffer) <= refresh_thresh && !trace_file.eof()) {
     std::array<T, buffer_size - refresh_thresh> trace_read_buf;
     std::array<char, std::size(trace_read_buf) * sizeof(T)> raw_buf;
     std::size_t bytes_read;
