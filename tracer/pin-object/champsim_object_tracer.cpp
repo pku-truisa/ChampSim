@@ -537,26 +537,29 @@ void insert_instrumentation(TRACE trace, void* v)
 
 void ResetCurrentInstruction(VOID* ip)
 {
-  curr_instr = {};
-  curr_instr.ip = (unsigned long long int)ip;
-
-  // In compat mode, skip embedding allocation events into instructions
-  if (compat_mode) {
-    pending_instr_malloc = {};
-    return;
-  }
-
-  // Embed pending malloc event into this instruction's trace record
-  // (embedded_alloc_mode only)
-  if (pending_instr_malloc.type != 0) {
-    curr_instr.instr_type = 2;  // allocation event
-    curr_instr.instr_info = pending_instr_malloc.type;
-    curr_instr.source_memory[0] = pending_instr_malloc.arg1;
-    curr_instr.source_memory[1] = pending_instr_malloc.arg2;
-    curr_instr.destination_memory[0] = pending_instr_malloc.ret;
-    curr_instr.destination_memory[1] = pending_instr_malloc.caller_ip;
+  // Step 1: If there is a pending allocation event, write it as an extra record
+  // into the trace buffer BEFORE the current instruction. This preserves the
+  // original instruction's IP and makes the allocation marker a no-op that
+  // the tracereader will simply skip, without breaking the IP adjacency
+  // needed for correct branch target computation (CALL → return address).
+  if (pending_instr_malloc.type != 0 && !compat_mode) {
+    trace_instr_format_t alloc_rec = {};
+    alloc_rec.ip = (unsigned long long int)ip;
+    alloc_rec.instr_type = 2;  // allocation event
+    alloc_rec.instr_info = pending_instr_malloc.type;
+    alloc_rec.source_memory[0] = pending_instr_malloc.arg1;
+    alloc_rec.source_memory[1] = pending_instr_malloc.arg2;
+    alloc_rec.destination_memory[0] = pending_instr_malloc.ret;
+    alloc_rec.destination_memory[1] = pending_instr_malloc.caller_ip;
+    trace_buffer.push(alloc_rec, outfile);
     pending_instr_malloc = {};  // consume the event
   }
+
+  // Step 2: Record the current instruction normally (no longer overwritten
+  // by allocation events). This ensures the instruction stream remains
+  // contiguous and branch targets are computed correctly.
+  curr_instr = {};
+  curr_instr.ip = (unsigned long long int)ip;
 }
 
 void WriteCurrentInstruction()
