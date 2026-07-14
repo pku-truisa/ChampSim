@@ -1,13 +1,14 @@
 /*
  * Memory Object Table - Tracks memory allocations and per-object statistics
  *
- * Maintains three internal structures:
+ * Maintains four internal structures:
  *   1. active_objects - currently allocated VA ranges (sorted by vaddr_start via map)
- *   2. ppage_to_vpage  - reverse page table: physical page → virtual page
+ *   2. ppage_to_allocid - reverse page table: physical page → alloc_id
  *   3. all_objects     - all historical allocations with per-object statistics
+ *   4. allocid_to_record - fast index: alloc_id → ObjectRecord* (O(log n) lookup)
  *
  * tracereader → record_alloc() / record_free() → active_objects + all_objects
- * VirtualMemory::va_to_pa() → register_mapping() → ppage_to_vpage
+ * VirtualMemory::va_to_pa() → register_mapping() → ppage_to_allocid
  * Cache/DRAM → lookup_alloc_id_by_pa() → find object → accumulate stats
  */
 
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "access_type.h"
@@ -150,6 +152,10 @@ private:
   // Structure 3: all historical allocations with stats
   std::vector<ObjectRecord> all_objects;
 
+  // Structure 4: fast index for alloc_id → ObjectRecord lookup (O(1) instead of O(N))
+  // Uses vector index (not pointer) to avoid invalidation from vector reallocation
+  std::unordered_map<uint64_t, std::size_t> allocid_to_record;
+
   // Known cache/DRAM channel names for output (even if all stats are zero)
   std::vector<std::string> known_cache_names;
   std::vector<std::string> known_dram_names;
@@ -160,10 +166,10 @@ private:
   // Find active object by VA (binary search in active_objects)
   const ActiveObject* find_active_by_va(champsim::address vaddr) const;
 
-  // Find alloc_id by VA page overlap (searches all_objects, not just active)
+  // Find alloc_id by VA page overlap (active objects only)
   uint64_t find_alloc_id_by_va(champsim::address vaddr) const;
 
-  // Find ObjectRecord by alloc_id
+  // Find ObjectRecord by alloc_id (uses fast index)
   ObjectRecord* find_record(uint64_t alloc_id);
 };
 

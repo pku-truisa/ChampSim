@@ -31,6 +31,9 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
   record.alloc_id = id;
   all_objects.push_back(record);
 
+  // Index the new record for O(1) lookup by alloc_id
+  allocid_to_record[id] = all_objects.size() - 1;
+
   return id;
 }
 
@@ -108,30 +111,25 @@ const MemoryObjectTable::ActiveObject* MemoryObjectTable::find_active_by_va(cham
   return nullptr;
 }
 
-// Search all_objects (both active and freed) for an alloc_id by VA page overlap
+// Search active objects for an alloc_id by VA page overlap.
+// Only active (currently allocated) objects are valid targets.
+// Freed objects are intentionally not searched — a freed object should
+// not be associated with any new memory access.
 uint64_t MemoryObjectTable::find_alloc_id_by_va(champsim::address vaddr) const
 {
-  // Check active objects first
   const ActiveObject* active = find_active_by_va(vaddr);
   if (active != nullptr) {
     return active->alloc_id;
   }
 
-  // Fall back to historical objects (freed allocations)
-  champsim::address page_end{vaddr.to<uint64_t>() + PAGE_SIZE};
-  for (const ObjectRecord& rec : all_objects) {
-    champsim::address obj_end{rec.vaddr_start.to<uint64_t>() + rec.size};
-    if (vaddr < obj_end && page_end > rec.vaddr_start) {
-      return rec.alloc_id;
-    }
-  }
-
-  return 0; // Not found
+  return 0; // Not found in active allocations
 }
 
 MemoryObjectTable::ObjectRecord* MemoryObjectTable::find_record(uint64_t alloc_id)
 {
-  auto it = std::find_if(all_objects.begin(), all_objects.end(),
-                         [alloc_id](const ObjectRecord& r) { return r.alloc_id == alloc_id; });
-  return (it != all_objects.end()) ? &(*it) : nullptr;
+  auto it = allocid_to_record.find(alloc_id);
+  if (it != allocid_to_record.end()) {
+    return &all_objects[it->second];
+  }
+  return nullptr;
 }
