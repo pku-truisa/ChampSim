@@ -83,6 +83,7 @@ class bulk_tracereader
 
   uint8_t cpu;
   bool eof_ = false;
+  bool alloc_baseline_complete = false;
   F trace_file;
 
   constexpr static std::size_t buffer_size = 128;
@@ -142,7 +143,7 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
     for (auto it = begin; it != end; ++it) {
       if (it->instr_type == 2) {
         alloc_records_seen++;
-        if (alloc_records_seen % alloc_progress_interval == 0) {
+        if (!alloc_baseline_complete && alloc_records_seen % alloc_progress_interval == 0) {
           fmt::print("[TRACE] Processed {} allocation baseline records...\n", alloc_records_seen);
         }
       }
@@ -184,8 +185,9 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
     set_branch_targets(std::begin(instr_buffer), std::end(instr_buffer));
   }
 
-  if (alloc_records_seen > 0) {
+  if (!alloc_baseline_complete && alloc_records_seen > 0) {
     fmt::print("[TRACE] Finished processing allocation baseline: {} records total.\n", alloc_records_seen);
+    alloc_baseline_complete = true;
   }
 
   auto retval = instr_buffer.front();
