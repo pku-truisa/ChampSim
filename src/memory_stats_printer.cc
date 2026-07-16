@@ -139,8 +139,8 @@ void print_memory_object_stats(const std::string& filename)
     }
 
     printed_count++;
-    fmt::print(out, "Object ID={}  Type={}  Size={}  VA_Start=0x{:x}\n", obj.alloc_id, malloc_type_name(static_cast<malloc_type>(obj.alloc_type)), obj.size,
-               obj.vaddr_start.to<uint64_t>());
+    fmt::print(out, "Object ID={}  Type={}  Size={}  VA_Start=0x{:x}  Caller=0x{:x}\n", obj.alloc_id, malloc_type_name(static_cast<malloc_type>(obj.alloc_type)), obj.size,
+               obj.vaddr_start.to<uint64_t>(), obj.caller_ip);
     fmt::print(out, "{:-<80}\n", "");
 
     // Cache/TLB stats (only if the object has data for this cache)

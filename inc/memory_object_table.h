@@ -102,6 +102,7 @@ public:
     uint8_t alloc_type;          // from input_instr.is_malloc
     uint64_t alloc_id;
     uint64_t size;
+    uint64_t caller_ip = 0;      // return address from the allocator call site
   };
 
   // Historical record of all allocations with per-object statistics
@@ -110,12 +111,13 @@ public:
     uint64_t size;
     uint8_t alloc_type;
     uint64_t alloc_id;
+    uint64_t caller_ip = 0;      // return address from the allocator call site
     std::map<std::string, PerCacheStats> cache_stats;  // key: cache name (L1D, L1I, L2, LLC, PTW, ...)
     std::map<std::string, PerDRAMStats> dram_stats;    // key: DRAM channel name
   };
 
   // Called by tracereader when is_malloc > 0 (alloc event)
-  uint64_t record_alloc(champsim::address vaddr, uint64_t size, uint8_t alloc_type);
+  uint64_t record_alloc(champsim::address vaddr, uint64_t size, uint8_t alloc_type, uint64_t caller_ip = 0);
 
   // Called by tracereader when is_malloc == 2 (free) or 4 (munmap)
   void record_free(champsim::address vaddr);

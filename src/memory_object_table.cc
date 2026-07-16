@@ -9,7 +9,7 @@
 // Global singleton instance
 MemoryObjectTable mol_table;
 
-uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size, uint8_t alloc_type)
+uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size, uint8_t alloc_type, uint64_t caller_ip)
 {
   uint64_t id = next_alloc_id++;
 
@@ -21,6 +21,7 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
   obj.alloc_id = id;
   obj.size = size;
 
+  obj.caller_ip = caller_ip;
   active_objects.emplace(vaddr, obj);
 
   // Add to all_objects
@@ -29,6 +30,7 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
   record.size = size;
   record.alloc_type = alloc_type;
   record.alloc_id = id;
+  record.caller_ip = caller_ip;
   all_objects.push_back(record);
 
   // Index the new record for O(1) lookup by alloc_id

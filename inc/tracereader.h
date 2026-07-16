@@ -152,19 +152,19 @@ ooo_model_instr bulk_tracereader<T, F>::operator()()
       if (t.instr_type == 2) {
         uint8_t alloc_type = t.instr_info;
         switch (alloc_type) {
-          case 1: // malloc      src[0]=size,                    dst[0]=addr
-          case 2: // calloc      src[0]=total_size,              dst[0]=addr
-          case 5: // mmap        src[0]=length,                  dst[0]=addr
-          case 6: // mmap64      src[0]=length,                  dst[0]=addr
-          case 10: // posix_memalign  src[0]=size,               dst[0]=addr
-          case 11: // aligned_alloc   src[0]=size,               dst[0]=addr
-            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type);
+          case 1: // malloc      src[0]=size,                    dst[0]=addr,  dst[1]=caller_ip
+          case 2: // calloc      src[0]=total_size,              dst[0]=addr,  dst[1]=caller_ip
+          case 5: // mmap        src[0]=length,                  dst[0]=addr,  dst[1]=caller_ip
+          case 6: // mmap64      src[0]=length,                  dst[0]=addr,  dst[1]=caller_ip
+          case 10: // posix_memalign  src[0]=size,               dst[0]=addr,  dst[1]=caller_ip
+          case 11: // aligned_alloc   src[0]=size,               dst[0]=addr,  dst[1]=caller_ip
+            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[0], alloc_type, t.destination_memory[1]);
             break;
-          case 3: // realloc     src[0]=old_ptr, src[1]=new_size, dst[0]=new_ptr
-          case 7: // mremap      src[0]=old_addr,src[1]=old_size, dst[0]=new_addr
+          case 3: // realloc     src[0]=old_ptr, src[1]=new_size, dst[0]=new_ptr, dst[1]=caller_ip
+          case 7: // mremap      src[0]=old_addr,src[1]=old_size, dst[0]=new_addr, dst[1]=caller_ip
             if (t.source_memory[0] != 0)
               mol_table.record_free(champsim::address{t.source_memory[0]});
-            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[1], alloc_type);
+            mol_table.record_alloc(champsim::address{t.destination_memory[0]}, t.source_memory[1], alloc_type, t.destination_memory[1]);
             break;
           case 4: // free        src[0]=ptr
           case 8: // munmap      src[0]=addr

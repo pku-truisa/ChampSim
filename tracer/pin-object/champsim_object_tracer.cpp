@@ -98,7 +98,7 @@ VOID ResetCurrentInstruction(VOID* ip);
 /* ================================================================== */
 // Allocation tracking state — from object_tracer v5
 /* ================================================================== */
-struct TrackedAlloc { ADDRINT size; unsigned char type; };
+struct TrackedAlloc { ADDRINT size; unsigned char type; ADDRINT caller_ip = 0; };
 std::unordered_map<ADDRINT, TrackedAlloc> tracked_allocations;
 static PIN_LOCK malloc_lock;
 
@@ -299,6 +299,7 @@ void dump_tracked_allocations(std::ofstream& of)
     curr_instr.instr_info = info.type;
     curr_instr.source_memory[0] = info.size;
     curr_instr.destination_memory[0] = addr;
+    curr_instr.destination_memory[1] = info.caller_ip;
 
     std::ofstream::char_type buf[sizeof(trace_instr_format_t)];
     std::memcpy(buf, &curr_instr, sizeof(trace_instr_format_t));
@@ -1004,7 +1005,7 @@ static void record_alloc_event(unsigned char coarse, unsigned long long arg1,
     write_alloc_record_locked(coarse, arg1, arg2, ret, caller_ip);
   }
   if (!compat_mode && ret != 0 && ret != (ADDRINT)-1) {
-    tracked_allocations[ret] = {size_for_tracking, coarse_for_tracking};
+    tracked_allocations[ret] = {size_for_tracking, coarse_for_tracking, static_cast<ADDRINT>(caller_ip)};
   }
 }
 
