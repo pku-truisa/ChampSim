@@ -3,13 +3,14 @@
 Trace Memory Object Access Analyzer
 ====================================
 Analyzes a ChampSim 64-byte instruction trace (.xz or raw binary) to compute
-per-object load/store counts.
+per-object load/store counts and aggregate statistics by caller IP.
 
 The trace format is the 64-byte input_instr struct defined in inc/trace_instruction.h:
   - instr_type == 2 : memory allocation/deallocation event
       instr_info encodes the type (1=malloc,2=calloc,3=realloc,4=free,
                                     5=mmap,6=mmap64,7=mremap,8=munmap,
                                     9=main-begin,10=posix_memalign,11=aligned_alloc)
+      ip = caller IP (return address of the allocation call site)
   - instr_type == 0/1 : normal/branch instruction
       source_memory[0..3] = load addresses
       destination_memory[0..1] = store addresses
@@ -18,12 +19,17 @@ The tool maintains a sorted list of currently-active memory objects (VA ranges),
 and for each instruction's load/store addresses, it looks up the owning object
 via binary search and increments the corresponding counter.
 
+It also aggregates per-object statistics by caller_ip to produce a consolidated
+summary of which code paths allocate the most memory and generate the most
+access traffic.
+
 Usage:
     python trace_object_analyzer.py <trace.xz> [-o output.log] [-n topN]
     python trace_object_analyzer.py <trace.bin> [-o output.log] [-n topN]
 
 Output:
-    A tab-separated table sorted by total accesses (loads+stores) descending.
+    1. A tab-separated table sorted by total accesses (loads+stores) descending.
+    2. A per-caller-IP summary table sorted by total accesses descending.
 """
 
 import struct
@@ -167,10 +173,11 @@ def process_trace(filename, top_n=None):
     """Main analysis: read trace file and compute per-object load/store counts.
 
     Returns (obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs,
-             unowned_loads, unowned_stores, total_memory_ops)
+             unowned_loads, unowned_stores, total_memory_ops,
+             baseline_alloc_count, runtime_alloc_count, runtime_free_count)
     where obj_stats is a dict: alloc_id -> {
         'loads': int, 'stores': int, 'size': int, 'alloc_type': int,
-        'vaddr_start': int, 'vaddr_end': int
+        'vaddr_start': int, 'vaddr_end': int, 'caller_ip': int
     }
     """
     active_table = ActiveObjectTable()
@@ -189,14 +196,31 @@ def process_trace(filename, top_n=None):
     unowned_loads = 0
     unowned_stores = 0
     total_memory_ops = 0
+    baseline_phase = True
+    baseline_alloc_count = 0
+    runtime_alloc_count = 0
+    runtime_free_count = 0
 
     for ip, itype, iinfo, dst_mem, src_mem in read_records(filename):
         total_records += 1
+
+        # Detect end of baseline phase: first non-alloc instruction
+        if baseline_phase and itype != 2:
+            baseline_phase = False
 
         # ---- Handle allocation events (instr_type == 2) ----
         if itype == 2:
             total_alloc_events += 1
             atype = iinfo  # allocation type
+
+            # Track baseline vs runtime counts
+            if baseline_phase:
+                baseline_alloc_count += 1
+            else:
+                if atype in _ALLOC_CREATE or atype in _ALLOC_REPLACE:
+                    runtime_alloc_count += 1
+                elif atype in _ALLOC_FREE:
+                    runtime_free_count += 1
 
             # Type=9 (main_begin) is a marker record; just skip it
             if atype == 9:
@@ -206,6 +230,7 @@ def process_trace(filename, top_n=None):
                 # malloc, calloc, mmap, mmap64, posix_memalign, aligned_alloc
                 #   src_mem[0] = size
                 #   dst_mem[0] = allocated address
+                #   ip = caller IP (return address)
                 size = src_mem[0]
                 addr = dst_mem[0]
                 if addr != 0 and size > 0:
@@ -219,11 +244,13 @@ def process_trace(filename, top_n=None):
                         'alloc_type': atype,
                         'vaddr_start': addr,
                         'vaddr_end': addr + size,
+                        'caller_ip': dst_mem[1],
                     }
 
             elif atype in _ALLOC_REPLACE:
                 # realloc (3):    src_mem[0]=old_ptr, src_mem[1]=new_size, dst_mem[0]=new_ptr
                 # mremap (7):     src_mem[0]=old_addr, src_mem[1]=old_size, dst_mem[0]=new_addr
+                #   ip = caller IP (return address)
                 old_ptr = src_mem[0]
                 new_size = src_mem[1]
                 new_addr = dst_mem[0]
@@ -246,6 +273,7 @@ def process_trace(filename, top_n=None):
                         'alloc_type': atype,
                         'vaddr_start': new_addr,
                         'vaddr_end': new_addr + new_size,
+                        'caller_ip': dst_mem[1],
                     }
 
             elif atype in _ALLOC_FREE:
@@ -283,7 +311,42 @@ def process_trace(filename, top_n=None):
                 else:
                     unowned_stores += 1
 
-    return obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops
+    return obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops, baseline_alloc_count, runtime_alloc_count, runtime_free_count
+
+
+def aggregate_by_caller_ip(obj_stats):
+    """Aggregate per-object statistics by caller_ip.
+
+    Returns a list of dicts sorted by total_accesses descending:
+        {'caller_ip': int, 'object_count': int, 'total_size': int,
+         'loads': int, 'stores': int, 'total_accesses': int}
+    """
+    groups = defaultdict(lambda: {'object_count': 0, 'total_size': 0,
+                                   'loads': 0, 'stores': 0, 'total_accesses': 0})
+
+    for oid, stats in obj_stats.items():
+        ip = stats.get('caller_ip', 0)
+        g = groups[ip]
+        g['object_count'] += 1
+        g['total_size'] += stats['size']
+        g['loads'] += stats['loads']
+        g['stores'] += stats['stores']
+        g['total_accesses'] += stats['loads'] + stats['stores']
+
+    # Convert to list and sort by total_accesses descending
+    result = []
+    for ip, g in groups.items():
+        result.append({
+            'caller_ip': ip,
+            'object_count': g['object_count'],
+            'total_size': g['total_size'],
+            'loads': g['loads'],
+            'stores': g['stores'],
+            'total_accesses': g['total_accesses'],
+        })
+
+    result.sort(key=lambda r: -r['total_accesses'])
+    return result
 
 
 def simplify_size(n):
@@ -331,10 +394,14 @@ class Tee:
 
 def output_results(obj_stats, active_table, total_records, total_alloc_events,
                    total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops,
-                   filename, top_n=None, output_path=None):
-    """Print analysis results as a formatted table.
+                   filename, top_n=None, output_path=None,
+                   baseline_alloc_count=0, runtime_alloc_count=0, runtime_free_count=0):
+    """Print analysis results as formatted tables.
 
     Results are sorted by total accesses (loads + stores) descending.
+    Two tables are printed:
+      1. Per-object statistics (existing, with caller_ip column added)
+      2. Per-caller-IP aggregated statistics (new)
     """
     base_name = os.path.splitext(filename)[0]
     if base_name.endswith('.trace'):
@@ -379,6 +446,7 @@ def output_results(obj_stats, active_table, total_records, total_alloc_events,
                     stats['vaddr_start'],
                     stats['vaddr_end'],
                     oid,
+                    stats.get('caller_ip', 0),
                 ))
 
         rows.sort(key=lambda r: -r[0])  # sort by total_accesses descending
@@ -389,11 +457,11 @@ def output_results(obj_stats, active_table, total_records, total_alloc_events,
 
         # Determine column widths
         headers = ['Rank', 'Object ID', 'Start Address', 'End Address',
-                   'Size', 'Sizefmt', 'Type', 'Loads', 'Stores', 'Total']
+                   'Size', 'Sizefmt', 'Type', 'Loads', 'Stores', 'Total', 'Caller IP']
         col_widths = [len(h) for h in headers]
 
         formatted_rows = []
-        for rank, (total_acc, loads, stores, size, atype, vaddr_start, vaddr_end, oid) in enumerate(rows, 1):
+        for rank, (total_acc, loads, stores, size, atype, vaddr_start, vaddr_end, oid, caller_ip) in enumerate(rows, 1):
             rank_s = str(rank)
             oid_s = str(oid)
             start_s = f"0x{vaddr_start:016x}"
@@ -404,9 +472,10 @@ def output_results(obj_stats, active_table, total_records, total_alloc_events,
             loads_s = f"{loads:,}"
             stores_s = f"{stores:,}"
             total_s = f"{total_acc:,}"
+            caller_ip_s = f"0x{caller_ip:x}" if caller_ip != 0 else "-"
 
             formatted = (rank_s, oid_s, start_s, end_s, size_s, sizefmt_s,
-                         type_s, loads_s, stores_s, total_s)
+                         type_s, loads_s, stores_s, total_s, caller_ip_s)
             formatted_rows.append(formatted)
 
             # Update max column widths
@@ -458,6 +527,13 @@ def output_results(obj_stats, active_table, total_records, total_alloc_events,
         print(f"  Objects still active at end of trace: {len(active_table.starts):,}")
         print(f"  Total objects ever allocated:         {len(obj_stats):,}")
 
+        # ---- Allocation Phase Summary ----
+        print()
+        print("  --- Allocation Phase Summary ---")
+        print(f"  Baseline alloc events:           {baseline_alloc_count:>14,}")
+        print(f"  Runtime alloc events:            {runtime_alloc_count:>14,}")
+        print(f"  Runtime free events:             {runtime_free_count:>14,}")
+
         # ---- Unowned access summary ----
         owned_loads = sum(stats['loads'] for stats in obj_stats.values())
         owned_stores = sum(stats['stores'] for stats in obj_stats.values())
@@ -478,26 +554,104 @@ def output_results(obj_stats, active_table, total_records, total_alloc_events,
         print(f"  (Objects with zero accesses: {len(obj_stats) - len(rows)}  — hidden from table)")
         print("=" * 70)
 
+        # ---- Per-Caller IP Aggregated Statistics ----
+        caller_ip_groups = aggregate_by_caller_ip(obj_stats)
+        print()
+        print(f"  Per-Caller IP Aggregated Statistics ({len(caller_ip_groups)} unique IPs)")
+        print()
+
+        if caller_ip_groups:
+            # Column widths
+            ci_headers = ['Rank', 'Caller IP', 'Objects', 'Total Size', 'Sizefmt', 'Loads', 'Stores', 'Total']
+            ci_widths = [len(h) for h in ci_headers]
+
+            ci_formatted = []
+            for rank, g in enumerate(caller_ip_groups, 1):
+                rank_s = str(rank)
+                ip_s = f"0x{g['caller_ip']:x}" if g['caller_ip'] != 0 else "0x0 (unknown)"
+                obj_s = f"{g['object_count']:,}"
+                size_s = f"{g['total_size']:,}"
+                sizefmt_s = format_size(g['total_size'])
+                loads_s = f"{g['loads']:,}"
+                stores_s = f"{g['stores']:,}"
+                total_s = f"{g['total_accesses']:,}"
+
+                row = (rank_s, ip_s, obj_s, size_s, sizefmt_s, loads_s, stores_s, total_s)
+                ci_formatted.append(row)
+                for ci, val in enumerate(row):
+                    ci_widths[ci] = max(ci_widths[ci], len(val))
+
+            # Apply top-N if specified
+            if top_n is not None and top_n > 0:
+                ci_formatted = ci_formatted[:top_n]
+
+            # Print header
+            ci_header_line = ""
+            for ci, h in enumerate(ci_headers):
+                if ci <= 1:  # left-aligned: Rank, Caller IP
+                    ci_header_line += f"  {h:<{ci_widths[ci]}}"
+                elif ci == 4:  # skip Sizefmt
+                    continue
+                else:
+                    ci_header_line += f"  {h:>{ci_widths[ci]}}"
+            print(ci_header_line)
+
+            ci_sep = ""
+            for ci in range(len(ci_widths)):
+                if ci == 4:
+                    continue
+                ci_sep += "  " + "-" * ci_widths[ci]
+            print(ci_sep)
+
+            for row in ci_formatted:
+                line = ""
+                for ci in range(len(ci_widths)):
+                    if ci == 4:
+                        continue
+                    val = row[ci]
+                    if ci <= 1:
+                        line += f"  {val:<{ci_widths[ci]}}"
+                    else:
+                        line += f"  {val:>{ci_widths[ci]}}"
+                print(line)
+        else:
+            print("  No caller IP data available.")
+
+        print()
+        print("=" * 70)
+
         sys.stdout = sys.__stdout__
 
     # Also write a CSV version for easier analysis
     csv_path = output_path.rsplit('.', 1)[0] + '.objects.csv'
     with open(csv_path, 'w') as csv_out:
-        csv_out.write("rank,object_id,vaddr_start,vaddr_end,size,size_fmt,alloc_type,loads,stores,total\n")
-        for rank, (total_acc, loads, stores, size, atype, vaddr_start, vaddr_end, oid) in enumerate(rows, 1):
+        csv_out.write("rank,object_id,vaddr_start,vaddr_end,size,size_fmt,alloc_type,loads,stores,total,caller_ip\n")
+        for rank, (total_acc, loads, stores, size, atype, vaddr_start, vaddr_end, oid, caller_ip) in enumerate(rows, 1):
             type_s = ALLOC_TYPE_NAMES.get(atype, f"UNKNOWN({atype})")
             sizefmt_s = format_size(size)
-            csv_out.write(f"{rank},{oid},0x{vaddr_start:016x},0x{vaddr_end:016x},{size},{sizefmt_s},{type_s},{loads},{stores},{total_acc}\n")
+            caller_ip_s = f"0x{caller_ip:x}" if caller_ip != 0 else ""
+            csv_out.write(f"{rank},{oid},0x{vaddr_start:016x},0x{vaddr_end:016x},{size},{sizefmt_s},{type_s},{loads},{stores},{total_acc},{caller_ip_s}\n")
+
+    # Write a caller-IP aggregated CSV
+    ci_csv_path = output_path.rsplit('.', 1)[0] + '.caller_ip.csv'
+    with open(ci_csv_path, 'w') as csv_out:
+        csv_out.write("rank,caller_ip,object_count,total_size,size_fmt,loads,stores,total_accesses\n")
+        for rank, g in enumerate(caller_ip_groups, 1):
+            ip_s = f"0x{g['caller_ip']:x}" if g['caller_ip'] != 0 else "0x0"
+            sizefmt_s = format_size(g['total_size'])
+            csv_out.write(f"{rank},{ip_s},{g['object_count']},{g['total_size']},{sizefmt_s},"
+                          f"{g['loads']},{g['stores']},{g['total_accesses']}\n")
 
     print(f"  Analysis saved to: {output_path}")
     print(f"  CSV output saved to: {csv_path}")
+    print(f"  Caller-IP CSV saved to: {ci_csv_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Trace Memory Object Access Analyzer — '
                     'analyze a 64-byte ChampSim instruction trace (.xz or raw binary) '
-                    'to compute per-object load/store counts.',
+                    'to compute per-object load/store counts and aggregate by caller IP.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -521,13 +675,16 @@ Examples:
     print(f"Processing trace file: {args.input}")
     print("Streaming analysis in progress...")
 
-    obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops = \
+    obj_stats, active_table, total_records, total_alloc_events, total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops, baseline_alloc_count, runtime_alloc_count, runtime_free_count = \
         process_trace(args.input, top_n=top_n)
 
     output_results(obj_stats, active_table, total_records, total_alloc_events,
                    total_normal_instrs, unowned_loads, unowned_stores, total_memory_ops,
                    args.input, top_n=top_n,
-                   output_path=args.output)
+                   output_path=args.output,
+                   baseline_alloc_count=baseline_alloc_count,
+                   runtime_alloc_count=runtime_alloc_count,
+                   runtime_free_count=runtime_free_count)
 
     print("\nDone.")
 
