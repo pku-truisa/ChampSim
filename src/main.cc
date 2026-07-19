@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <numeric>
 #include <string>
@@ -189,8 +190,20 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
     }
   }
 
-  // Output per-object memory statistics
-  print_memory_object_stats("memory_object_stats.txt");
+  // Set trace prefix for output filenames
+  // Extract the stem (filename without extension) from the first trace path
+  {
+    std::string prefix = std::filesystem::path(trace_names.at(0)).stem().string();
+    // Handle double extensions like .trace.xz: apply stem() again
+    std::string second_stem = std::filesystem::path(prefix).stem().string();
+    if (!second_stem.empty() && second_stem != prefix) {
+      prefix = second_stem;
+    }
+    mol_table.set_trace_prefix(prefix);
+  }
+
+  // Output per-object memory statistics (prefixed with trace name)
+  print_memory_object_stats(mol_table.get_trace_prefix() + "_memory_object_stats.txt");
 
   return 0;
 }

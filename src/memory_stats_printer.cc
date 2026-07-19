@@ -2,10 +2,15 @@
  * Memory Object Statistics Printer
  * Outputs per-object cache/TLB/DRAM statistics sorted by object size (descending)
  * Objects or sections with no access data are omitted from output.
+ *
+ * Also outputs per-caller-IP aggregated statistics to a separate file.
  */
 
 #include <algorithm>
 #include <fstream>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <fmt/core.h>
 #include <fmt/ostream.h>
@@ -64,7 +69,7 @@ void print_cache_stats(std::ostream& os, const PerCacheStats& st)
   for (int i = 0; i < 5; ++i)
     total_misses += st.misses[i];
   if (total_misses > 0) {
-    fmt::print(os, "    AVG_MISS_LAT={:.2f}\n", static_cast<double>(st.total_miss_latency) / total_misses);
+    fmt::print(os, "    AVG_MISS_LAT={:.2f}\n", static_cast<double>(st.total_miss_latency) / static_cast<double>(total_misses));
   } else {
     fmt::print(os, "    AVG_MISS_LAT=-\n");
   }
@@ -81,10 +86,153 @@ void print_dram_stats(std::ostream& os, const PerDRAMStats& st)
   fmt::print(os, "    WQ_FULL={}\n", st.wq_full);
   if (st.dbus_count_congested > 0) {
     fmt::print(os, "    AVG_DBUS_CONGESTED={:.2f}\n",
-               static_cast<double>(st.dbus_cycle_congested) / st.dbus_count_congested);
+               static_cast<double>(st.dbus_cycle_congested) / static_cast<double>(st.dbus_count_congested));
   } else {
     fmt::print(os, "    AVG_DBUS_CONGESTED=-\n");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregated per-caller-IP statistics
+// ---------------------------------------------------------------------------
+
+// Data structure for one caller_ip group
+struct GroupedCallerIPStats {
+  uint64_t caller_ip = 0;
+  uint64_t object_count = 0;
+  uint64_t total_size = 0;
+  std::map<std::string, PerCacheStats> cache_stats;  // aggregated per cache name
+  std::map<std::string, PerDRAMStats> dram_stats;    // aggregated per DRAM name
+};
+
+// Add a single object's stats into the group
+void add_object_to_group(GroupedCallerIPStats& grp, const MemoryObjectTable::ObjectRecord& obj)
+{
+  grp.object_count++;
+  grp.total_size += obj.size;
+
+  // Aggregate cache stats
+  for (const auto& [cname, cstats] : obj.cache_stats) {
+    auto& dst = grp.cache_stats[cname];
+    for (int i = 0; i < 5; ++i) {
+      dst.hits[i] += cstats.hits[i];
+      dst.misses[i] += cstats.misses[i];
+    }
+    dst.mshr_merge += cstats.mshr_merge;
+    dst.mshr_return += cstats.mshr_return;
+    dst.total_miss_latency += cstats.total_miss_latency;
+    dst.pf_requested += cstats.pf_requested;
+    dst.pf_issued += cstats.pf_issued;
+    dst.pf_useful += cstats.pf_useful;
+    dst.pf_useless += cstats.pf_useless;
+    dst.pf_fill += cstats.pf_fill;
+  }
+
+  // Aggregate DRAM stats
+  for (const auto& [dname, dstats] : obj.dram_stats) {
+    auto& dst = grp.dram_stats[dname];
+    dst.rq_row_buffer_hit += dstats.rq_row_buffer_hit;
+    dst.rq_row_buffer_miss += dstats.rq_row_buffer_miss;
+    dst.wq_row_buffer_hit += dstats.wq_row_buffer_hit;
+    dst.wq_row_buffer_miss += dstats.wq_row_buffer_miss;
+    dst.wq_full += dstats.wq_full;
+    dst.dbus_cycle_congested += dstats.dbus_cycle_congested;
+    dst.dbus_count_congested += dstats.dbus_count_congested;
+  }
+}
+
+void print_caller_ip_grouped_stats(const std::string& output_path)
+{
+  std::ofstream out(output_path);
+  if (!out) {
+    fmt::print(stderr, "[MOL] ERROR: Cannot open output file: {}\n", output_path);
+    return;
+  }
+
+  const auto& all_objects = mol_table.get_all_objects();
+
+  // Group objects by caller_ip
+  std::unordered_map<uint64_t, GroupedCallerIPStats> groups_map;
+  for (const auto& obj : all_objects) {
+    uint64_t ip = obj.caller_ip;
+    auto it = groups_map.find(ip);
+    if (it == groups_map.end()) {
+      GroupedCallerIPStats grp;
+      grp.caller_ip = ip;
+      add_object_to_group(grp, obj);
+      groups_map[ip] = grp;
+    } else {
+      add_object_to_group(it->second, obj);
+    }
+  }
+
+  if (groups_map.empty()) {
+    fmt::print(out, "No memory objects recorded.\n");
+    return;
+  }
+
+  // Move groups into a vector for sorting
+  std::vector<GroupedCallerIPStats*> groups;
+  groups.reserve(groups_map.size());
+  for (auto& [ip, grp] : groups_map) {
+    groups.push_back(&grp);
+  }
+
+  // Sort by total_size descending
+  std::sort(groups.begin(), groups.end(), [](const GroupedCallerIPStats* a, const GroupedCallerIPStats* b) {
+    return a->total_size > b->total_size;
+  });
+
+  // Collect sorted cache/dram names (preserve order of first appearance)
+  std::vector<std::string> cache_names_sorted;
+  std::vector<std::string> dram_names_sorted;
+  {
+    std::unordered_set<std::string> seen_cache, seen_dram;
+    for (const auto* grp : groups) {
+      for (const auto& [cname, _] : grp->cache_stats) {
+        if (seen_cache.find(cname) == seen_cache.end()) {
+          cache_names_sorted.push_back(cname);
+          seen_cache.insert(cname);
+        }
+      }
+      for (const auto& [dname, _] : grp->dram_stats) {
+        if (seen_dram.find(dname) == seen_dram.end()) {
+          dram_names_sorted.push_back(dname);
+          seen_dram.insert(dname);
+        }
+      }
+    }
+  }
+
+  fmt::print(out, "=== Aggregated Memory Object Statistics by Caller IP ({} unique IPs) ===\n\n",
+             groups.size());
+
+  for (const auto* grp : groups) {
+    fmt::print(out, "Caller IP=0x{:x}  Objects={}  TotalSize={}\n", grp->caller_ip, grp->object_count, grp->total_size);
+    fmt::print(out, "{:-<80}\n", "");
+
+    // Cache/TLB stats
+    for (const auto& cname : cache_names_sorted) {
+      auto it = grp->cache_stats.find(cname);
+      if (it != grp->cache_stats.end() && has_any_data(it->second)) {
+        fmt::print(out, "  [{}]\n", cname);
+        print_cache_stats(out, it->second);
+      }
+    }
+
+    // DRAM stats
+    for (const auto& dname : dram_names_sorted) {
+      auto it = grp->dram_stats.find(dname);
+      if (it != grp->dram_stats.end() && has_any_data(it->second)) {
+        fmt::print(out, "  [{}]\n", dname);
+        print_dram_stats(out, it->second);
+      }
+    }
+
+    fmt::print(out, "\n");
+  }
+
+  fmt::print("[MOL] Aggregated caller-IP stats written to: {} ({} unique IPs)\n", output_path, groups.size());
 }
 
 } // namespace
@@ -161,4 +309,9 @@ void print_memory_object_stats(const std::string& filename)
   }
 
   fmt::print("[MOL] Memory object statistics written to: {} ({} objects with data)\n", filename, printed_count);
+
+  // Also output aggregated per-caller-IP stats
+  const auto& prefix = mol_table.get_trace_prefix();
+  std::string caller_ip_file = prefix.empty() ? "caller_ip_status.txt" : prefix + "_caller_ip_status.txt";
+  print_caller_ip_grouped_stats(caller_ip_file);
 }

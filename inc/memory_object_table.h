@@ -143,6 +143,10 @@ public:
   const std::vector<std::string>& get_known_cache_names() const { return known_cache_names; }
   const std::vector<std::string>& get_known_dram_names() const { return known_dram_names; }
 
+  // Trace prefix for output filenames (e.g. "bfs-3")
+  void set_trace_prefix(const std::string& prefix) { trace_prefix = prefix; }
+  const std::string& get_trace_prefix() const { return trace_prefix; }
+
 private:
   // Structure 1: active VA ranges (sorted by vaddr_start, using map for O(log n) insert/erase)
   // Keyed by vaddr_start to enable efficient overlap queries and insertion.
@@ -161,6 +165,9 @@ private:
   // Known cache/DRAM channel names for output (even if all stats are zero)
   std::vector<std::string> known_cache_names;
   std::vector<std::string> known_dram_names;
+
+  // Trace prefix for output filenames
+  std::string trace_prefix;
 
   // ID counter
   uint64_t next_alloc_id = 1;
