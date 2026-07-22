@@ -287,10 +287,11 @@ long DRAM_CHANNEL::populate_dbus()
       bankgroup_readytime[op_bankgroup] = current_time + DRAM_DBUS_RETURN_TIME + DRAM_DBUS_BANKGROUP_STALL;
 
       // Record row buffer hit/miss (includes per-object stats)
+      // DRAM only has PA, no VA available, so pass empty VA (PA fallback used)
       if (iter_next_process->row_buffer_hit) {
-        sim_stats.record_row_hit(iter_next_process->pkt->value().address, write_mode, warmup);
+        sim_stats.record_row_hit(champsim::address{}, iter_next_process->pkt->value().address, write_mode, warmup);
       } else {
-        sim_stats.record_row_miss(iter_next_process->pkt->value().address, write_mode, warmup);
+        sim_stats.record_row_miss(champsim::address{}, iter_next_process->pkt->value().address, write_mode, warmup);
       }
 
       ++progress;

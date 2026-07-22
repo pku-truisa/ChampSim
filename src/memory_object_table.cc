@@ -63,6 +63,12 @@ void MemoryObjectTable::register_mapping(champsim::page_number vpage, champsim::
   }
 }
 
+uint64_t MemoryObjectTable::lookup_alloc_id_by_va(champsim::address vaddr) const
+{
+  // Use the page-aligned VA to find which active object owns this address
+  return find_alloc_id_by_va(vaddr);
+}
+
 uint64_t MemoryObjectTable::lookup_alloc_id_by_pa(champsim::page_number ppage) const
 {
   // Direct lookup: PA → alloc_id

@@ -227,11 +227,11 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 
   if (way != set_end) {
     if (way->valid && way->prefetch) {
-      sim_stats.record_pf_useless(way->address, warmup);
+      sim_stats.record_pf_useless(way->v_address, way->address, warmup);
     }
 
     if (fill_mshr.type == access_type::PREFETCH) {
-      sim_stats.record_pf_fill(fill_mshr.address, warmup);
+      sim_stats.record_pf_fill(fill_mshr.v_address, fill_mshr.address, warmup);
     }
   }
 
@@ -250,9 +250,9 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
   // COLLECT STATS
   if (fill_mshr.type != access_type::PREFETCH) {
     auto miss_lat = (current_time - (fill_mshr.time_enqueued + clock_period)) / clock_period;
-    sim_stats.record_miss_latency(fill_mshr.address, miss_lat, warmup);
+    sim_stats.record_miss_latency(fill_mshr.v_address, fill_mshr.address, miss_lat, warmup);
   }
-  sim_stats.record_mshr_return(fill_mshr.type, fill_mshr.cpu, fill_mshr.address, warmup);
+  sim_stats.record_mshr_return(fill_mshr.type, fill_mshr.cpu, fill_mshr.v_address, fill_mshr.address, warmup);
 
   response_type response{fill_mshr.address, fill_mshr.v_address, fill_mshr.data_promise->data, metadata_thru, fill_mshr.instr_depend_on_me};
   for (auto* ret : fill_mshr.to_return) {
@@ -289,7 +289,7 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
                                 hit);
 
   if (hit) {
-    sim_stats.record_hit(handle_pkt.type, handle_pkt.cpu, handle_pkt.address, warmup);
+    sim_stats.record_hit(handle_pkt.type, handle_pkt.cpu, handle_pkt.v_address, handle_pkt.address, warmup);
 
     response_type response{handle_pkt.address, handle_pkt.v_address, way->data, metadata_thru, handle_pkt.instr_depend_on_me};
     for (auto* ret : handle_pkt.to_return) {
@@ -300,7 +300,7 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
 
     // update prefetch stats and reset prefetch bit
     if (useful_prefetch) {
-      sim_stats.record_pf_useful(handle_pkt.address, warmup);
+      sim_stats.record_pf_useful(handle_pkt.v_address, handle_pkt.address, warmup);
       way->prefetch = false;
     }
   }
@@ -356,12 +356,12 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
     if (mshr_entry->type == access_type::PREFETCH && handle_pkt.type != access_type::PREFETCH) {
       // Mark the prefetch as useful
       if (mshr_entry->prefetch_from_this) {
-        sim_stats.record_pf_useful(handle_pkt.address, warmup);
+        sim_stats.record_pf_useful(handle_pkt.v_address, handle_pkt.address, warmup);
       }
     }
 
     // COLLECT STATS
-    sim_stats.record_mshr_merge(to_allocate.type, to_allocate.cpu, handle_pkt.address, warmup);
+    sim_stats.record_mshr_merge(to_allocate.type, to_allocate.cpu, handle_pkt.v_address, handle_pkt.address, warmup);
 
     *mshr_entry = mshr_type::merge(*mshr_entry, to_allocate);
   } else {
@@ -382,7 +382,7 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
     }
   }
 
-  sim_stats.record_miss(handle_pkt.type, handle_pkt.cpu, handle_pkt.address, warmup);
+  sim_stats.record_miss(handle_pkt.type, handle_pkt.cpu, handle_pkt.v_address, handle_pkt.address, warmup);
 
   return true;
 }
@@ -399,7 +399,7 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
   to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
   inflight_writes.push_back(to_allocate);
 
-  sim_stats.record_miss(handle_pkt.type, handle_pkt.cpu, handle_pkt.address, warmup);
+  sim_stats.record_miss(handle_pkt.type, handle_pkt.cpu, handle_pkt.v_address, handle_pkt.address, warmup);
 
   return true;
 }
@@ -591,7 +591,7 @@ long CACHE::invalidate_entry(champsim::address inval_addr)
 
 bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata)
 {
-  sim_stats.record_pf_requested(pf_addr, warmup);
+  sim_stats.record_pf_requested(champsim::address{}, pf_addr, warmup);
 
   if (std::size(internal_PQ) >= PQ_SIZE) {
     return false;
@@ -606,7 +606,7 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
   pf_packet.is_translated = !virtual_prefetch;
 
   internal_PQ.emplace_back(pf_packet, true, !fill_this_level);
-  sim_stats.record_pf_issued(pf_addr, warmup);
+  sim_stats.record_pf_issued(champsim::address{}, pf_addr, warmup);
 
   return true;
 }

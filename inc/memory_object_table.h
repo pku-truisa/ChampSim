@@ -9,7 +9,7 @@
  *
  * tracereader → record_alloc() / record_free() → active_objects + all_objects
  * VirtualMemory::va_to_pa() → register_mapping() → ppage_to_allocid
- * Cache/DRAM → lookup_alloc_id_by_pa() → find object → accumulate stats
+ * Cache/DRAM → lookup_alloc_id_by_va() → find object → accumulate stats
  */
 
 #ifndef MEMORY_OBJECT_TABLE_H
@@ -128,6 +128,10 @@ public:
   // Called by Cache/DRAM to find which object owns a physical page
   // Returns alloc_id (0 if no mapping found for this page)
   uint64_t lookup_alloc_id_by_pa(champsim::page_number ppage) const;
+
+  // Called by Cache/DRAM to find which object owns a virtual address
+  // Uses page-aligned address lookup in active_objects for O(log n) search
+  uint64_t lookup_alloc_id_by_va(champsim::address vaddr) const;
 
   // Access the per-object stats by alloc_id
   PerCacheStats& get_cache_stats(uint64_t alloc_id, const std::string& cache_name);
