@@ -510,7 +510,18 @@ void for_ins_in_trace(const TRACE& trace, Func f)
   }
 }
 
-VOID docount(UINT32 c) { total_instruction_count += c; }
+static constexpr UINT64 PROGRESS_STEP = 100000000000ULL; // 100 billion
+static UINT64 next_progress_milestone = PROGRESS_STEP;
+
+VOID docount(UINT32 c)
+{
+  total_instruction_count += c;
+  if (!alloc_only_mode && total_instruction_count >= next_progress_milestone) {
+    std::cout << "[ChampSim Tracer] Progress: " << total_instruction_count
+              << " instructions counted." << std::endl;
+    next_progress_milestone += PROGRESS_STEP;
+  }
+}
 
 void insert_count_instrumentation(TRACE trace, void* v)
 {
@@ -523,13 +534,18 @@ void insert_instrumentation(TRACE trace, void* v)
   if (alloc_only_mode) return;  // No instruction tracing in alloc-only mode
 
   for_ins_in_trace(trace, [](const INS& ins) {
+    // Always register check_end_of_trace for seamless transition (has internal guard).
+    // This ensures trace_insts_left starts decrementing immediately after
+    // fast-forward completes, without waiting for the next trace boundary.
+    INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
+    INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_UINT32, 1, IARG_END);
+
     if (fast_forward_insts_left > 0 || skip_dumping_instructions) {
       // Fast-forward phase: count down instructions per-ins, no trace output
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
     } else {
       // Tracing phase: normal instruction instrumentation
       insert_analysis_functions(ins);
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
     }
   });
 }
