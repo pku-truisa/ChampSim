@@ -66,6 +66,8 @@ INT64 trace_insts_left = 0;
 INT64 fast_forward_insts_left = 0;
 bool skip_dumping_instructions = false;
 bool trace_limit_reached = false;
+bool instruction_count_mode = false;
+static UINT64 total_instruction_count = 0;
 
 // Mode flags:
 //   compat_mode (no -m):          instruction trace ONLY, no allocation events
@@ -267,6 +269,8 @@ INT32 Usage()
             << "  -c <file>   Multi-segment config file" << std::endl
             << "  -m          Enable allocation event recording" << std::endl
             << "  -a <file>   (with -m) Alloc-only mode: only allocation events to <file>" << std::endl
+            << "  -f          Instruction count mode: count total instructions only" << std::endl
+            << "              (incompatible with all other options)" << std::endl
             << std::endl;
 
   std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
@@ -517,12 +521,21 @@ void for_ins_in_trace(const TRACE& trace, Func f)
   }
 }
 
+VOID docount(UINT32 c) { total_instruction_count += c; }
+
+void insert_count_instrumentation(TRACE trace, void* v)
+{
+  for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl))
+    BBL_InsertCall(bbl, IPOINT_BEFORE, (AFUNPTR)docount, IARG_UINT32, BBL_NumIns(bbl), IARG_END);
+}
+
 void insert_instrumentation(TRACE trace, void* v)
 {
   if (alloc_only_mode) return;  // No instruction tracing in alloc-only mode
 
   if (fast_forward_insts_left > 500) {
-    TRACE_InsertCall(trace, IPOINT_BEFORE, (AFUNPTR)fast_forward_trace, IARG_UINT32, TRACE_NumIns(trace), IARG_END);
+    for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl))
+      BBL_InsertCall(bbl, IPOINT_BEFORE, (AFUNPTR)fast_forward_trace, IARG_UINT32, BBL_NumIns(bbl), IARG_END);
   } else {
     for_ins_in_trace(trace, [](const INS& ins) {
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
@@ -1292,7 +1305,9 @@ VOID Fini(INT32 code, VOID* v)
     outfile.close();
   }
 
-  if (compat_mode) {
+  if (instruction_count_mode) {
+    std::cout << "[ChampSim Tracer] Total instruction count: " << total_instruction_count << std::endl;
+  } else if (compat_mode) {
     std::cout << "[ChampSim Tracer] Compat mode trace saved.\n";
   } else if (alloc_only_mode) {
     std::cout << "\n[ChampSim Tracer] === Alloc-only Mode Statistics ===" << std::endl;
@@ -1333,7 +1348,7 @@ static bool is_pinplay_arg(const std::string& arg)
 
 int main(int argc, char* argv[])
 {
-  // Scan argv for -m and -a before PIN_Init
+  // Scan argv for -m, -a, -f, and other flags before PIN_Init
   std::vector<char*> filtered;
   std::string alloc_only_filename;
   bool has_m_flag = false;
@@ -1361,11 +1376,26 @@ int main(int argc, char* argv[])
       }
       continue;  // do not pass -a to PIN_Init
     }
+    if (arg == "-f") {
+      instruction_count_mode = true;
+      continue;  // do not pass -f to PIN_Init
+    }
     filtered.push_back(argv[i]);
   }
 
   // Determine mode
-  if (has_m_flag && has_a_flag) {
+  if (instruction_count_mode) {
+    // -f mode must be exclusive.
+    // -m and -a are detected pre-PIN_Init; other options are checked post-PIN_Init via Knob values.
+    if (has_m_flag || has_a_flag) {
+      std::cerr << "[ChampSim Tracer] ERROR: -f mode is incompatible with -m or -a." << std::endl;
+      std::cerr << "  Please use -f alone without any other options." << std::endl;
+      exit(1);
+    }
+    compat_mode = false;
+    embedded_alloc_mode = false;
+    alloc_only_mode = false;
+  } else if (has_m_flag && has_a_flag) {
     alloc_only_mode = true;
     embedded_alloc_mode = false;
     compat_mode = false;
@@ -1387,6 +1417,29 @@ int main(int argc, char* argv[])
   PIN_InitLock(&malloc_lock);
   PIN_InitLock(&stats_lock);
   tls_key = PIN_CreateThreadDataKey(ThreadCleanup);
+
+  if (instruction_count_mode) {
+    // --- Instruction count mode (-f) ---
+    // Count total instructions executed by the program.
+    // No output file, no allocation tracing — just a counter.
+    // Check for incompatible options via Knob values (check after PIN_Init so Knobs are parsed)
+    if (KnobOutputFile.Value() != "champsim.trace" ||
+        KnobFastForward.Value() != 0 ||
+        KnobTraceLen.Value() != 0 ||
+        KnobMallocThreshold.Value() != 256 ||
+        !KnobConfigFile.Value().empty()) {
+      std::cerr << "[ChampSim Tracer] ERROR: -f mode is incompatible with all other options "
+                << "(-o, -s, -t, -k, -c)." << std::endl;
+      std::cerr << "  Please use -f alone without any other options." << std::endl;
+      exit(1);
+    }
+    std::cout << "[ChampSim Tracer] Instruction count mode (-f): counting total instructions only." << std::endl;
+
+    TRACE_AddInstrumentFunction(insert_count_instrumentation, 0);
+    PIN_AddFiniFunction(Fini, 0);
+    PIN_StartProgram();
+    return 0;
+  }
 
   if (alloc_only_mode) {
     // --- Alloc-only mode (-m -a <file>) ---
