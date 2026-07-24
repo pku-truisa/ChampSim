@@ -278,16 +278,6 @@ INT32 Usage()
   return -1;
 }
 
-void fast_forward_trace(UINT32 trace_size)
-{
-  fast_forward_insts_left -= trace_size;
-  if (fast_forward_insts_left < 500) {
-    std::cout << "Fast-forward almost done, switching to per instruction "
-                 "fast-forward.\n";
-    PIN_RemoveInstrumentation();
-  }
-}
-
 void dump_tracked_allocations(std::ofstream& of)
 {
   // In compat mode, do not dump allocation events
@@ -467,21 +457,20 @@ void start_next_segment()
   // Reset trace_limit_reached so allocator callbacks run again
   trace_limit_reached = false;
 
-  // Re-instrument if we're in fast-forward mode
-  if (fast_forward_insts_left > 500) {
+  // Notify user about the new segment
+  if (fast_forward_insts_left > 0) {
     std::cout << "[ChampSim Tracer] Segment " << current_segment_idx
               << ": fast-forwarding " << fast_forward_insts_left
               << " instructions (abs_skip=" << seg.abs_skip
               << "), then tracing " << seg.length
               << " instrs to " << seg.output_file << std::endl;
-    PIN_RemoveInstrumentation();
   } else {
+    skip_dumping_instructions = false;
     std::cout << "[ChampSim Tracer] Segment " << current_segment_idx
               << ": no fast-forward needed (abs_skip=" << seg.abs_skip
               << "), tracing " << seg.length
               << " instrs to " << seg.output_file
               << ". Baseline allocations: " << tracked_allocations.size() << std::endl;
-    skip_dumping_instructions = false;
   }
 }
 
@@ -533,12 +522,14 @@ void insert_instrumentation(TRACE trace, void* v)
 {
   if (alloc_only_mode) return;  // No instruction tracing in alloc-only mode
 
-  if (fast_forward_insts_left > 500) {
-    for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl))
-      BBL_InsertCall(bbl, IPOINT_BEFORE, (AFUNPTR)fast_forward_trace, IARG_UINT32, BBL_NumIns(bbl), IARG_END);
-  } else {
+  if (fast_forward_insts_left > 0 || skip_dumping_instructions) {
+    // Fast-forward phase: count down instructions per-ins, no trace output
     for_ins_in_trace(trace, [](const INS& ins) {
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
+    });
+  } else {
+    // Tracing phase: normal instruction instrumentation
+    for_ins_in_trace(trace, [](const INS& ins) {
       insert_analysis_functions(ins);
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
     });
