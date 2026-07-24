@@ -522,18 +522,16 @@ void insert_instrumentation(TRACE trace, void* v)
 {
   if (alloc_only_mode) return;  // No instruction tracing in alloc-only mode
 
-  if (fast_forward_insts_left > 0 || skip_dumping_instructions) {
-    // Fast-forward phase: count down instructions per-ins, no trace output
-    for_ins_in_trace(trace, [](const INS& ins) {
+  for_ins_in_trace(trace, [](const INS& ins) {
+    if (fast_forward_insts_left > 0 || skip_dumping_instructions) {
+      // Fast-forward phase: count down instructions per-ins, no trace output
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
-    });
-  } else {
-    // Tracing phase: normal instruction instrumentation
-    for_ins_in_trace(trace, [](const INS& ins) {
+    } else {
+      // Tracing phase: normal instruction instrumentation
       insert_analysis_functions(ins);
       INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
-    });
-  }
+    }
+  });
 }
 
 /* ===================================================================== */
