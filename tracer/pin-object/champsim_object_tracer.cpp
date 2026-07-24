@@ -533,20 +533,17 @@ void insert_instrumentation(TRACE trace, void* v)
 {
   if (alloc_only_mode) return;  // No instruction tracing in alloc-only mode
 
+  // Unconditionally register all callbacks on every instruction.
+  // Each callback has its own internal guard to handle the
+  // fast-forward → tracing transition seamlessly at instruction granularity:
+  //   - fast_forward_ins:   guards with fast_forward_insts_left > 0
+  //   - check_end_of_trace: guards with fast_forward_insts_left > 0 || skip_dumping_instructions
+  //   - insert_analysis_functions: guards by skipping output when skip_dumping_instructions is true
   for_ins_in_trace(trace, [](const INS& ins) {
-    // Always register check_end_of_trace for seamless transition (has internal guard).
-    // This ensures trace_insts_left starts decrementing immediately after
-    // fast-forward completes, without waiting for the next trace boundary.
+    INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
+    insert_analysis_functions(ins);
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_UINT32, 1, IARG_END);
-
-    if (fast_forward_insts_left > 0 || skip_dumping_instructions) {
-      // Fast-forward phase: count down instructions per-ins, no trace output
-      INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
-    } else {
-      // Tracing phase: normal instruction instrumentation
-      insert_analysis_functions(ins);
-    }
   });
 }
 
