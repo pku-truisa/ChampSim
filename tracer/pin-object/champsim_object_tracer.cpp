@@ -1486,26 +1486,25 @@ int main(int argc, char* argv[])
 
   if (embedded_alloc_mode) {
     // --- Embedded alloc mode (-m, no -a) ---
-    outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
-    if (!outfile) {
-      std::cout << "Error: Cannot open output trace file: " << KnobOutputFile.Value() << std::endl;
-      exit(1);
-    }
-    std::cout << "[ChampSim Tracer] Embedded alloc mode. Output: " << KnobOutputFile.Value() << std::endl;
-    std::cout << "[ChampSim Tracer] Instruction trace with embedded allocation events.\n";
-
-    // With -m, -s, -t, -c, -k still apply
     std::string config_path = KnobConfigFile.Value();
     if (!config_path.empty()) {
       parse_config(config_path);
       const auto& first = segments[0];
+      outfile.open(first.output_file.c_str(), std::ios_base::binary | std::ios_base::trunc);
       fast_forward_insts_left = first.abs_skip;
       trace_insts_left = first.length;
       skip_dumping_instructions = (first.abs_skip > 0);
     } else {
+      outfile.open(KnobOutputFile.Value().c_str(), std::ios_base::binary | std::ios_base::trunc);
       trace_insts_left = KnobTraceLen.Value();
       fast_forward_insts_left = KnobFastForward.Value();
     }
+    if (!outfile) {
+      std::cout << "Error: Cannot open output trace file." << std::endl;
+      exit(1);
+    }
+    std::cout << "[ChampSim Tracer] Embedded alloc mode. Output: " << (config_path.empty() ? KnobOutputFile.Value() : segments[0].output_file) << std::endl;
+    std::cout << "[ChampSim Tracer] Instruction trace with embedded allocation events.\n";
 
     TRACE_AddInstrumentFunction(insert_instrumentation, 0);
     IMG_AddInstrumentFunction(ImageLoad, 0);
