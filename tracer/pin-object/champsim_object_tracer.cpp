@@ -302,12 +302,15 @@ void dump_tracked_allocations(std::ofstream& of)
   PIN_ReleaseLock(&malloc_lock);
 }
 
-void fast_forward_ins()
+void fast_forward_bbl(UINT32 num_ins)
 {
-  if (fast_forward_insts_left > 0) {
-    fast_forward_insts_left -= 1;
-    skip_dumping_instructions = true;
-  } else if (skip_dumping_instructions) {
+  if (fast_forward_insts_left <= 0) return;
+
+  if (fast_forward_insts_left > (INT64)num_ins) {
+    fast_forward_insts_left -= num_ins;
+  } else {
+    fast_forward_insts_left = 0;
+
     // Fast-forward finished: dump all active allocations as baseline
     // memory state for Champsim's initial memory footprint.
     dump_tracked_allocations(outfile);
@@ -318,6 +321,10 @@ void fast_forward_ins()
     std::cout << "Fast-forward finished, starting tracing. Baseline allocations: "
               << tracked_allocations.size() << std::endl;
     skip_dumping_instructions = false;
+
+    // Force Pin to invalidate JIT code cache.
+    // Subsequent traces will be re-instrumented with the full analysis functions.
+    PIN_RemoveInstrumentation();
   }
 }
 
@@ -464,6 +471,10 @@ void start_next_segment()
               << " instructions (abs_skip=" << seg.abs_skip
               << "), then tracing " << seg.length
               << " instrs to " << seg.output_file << std::endl;
+
+    // Invalidate JIT code cache so remaining traces from the previous
+    // segment are re-compiled with the lightweight fast-forward instrumentation.
+    PIN_RemoveInstrumentation();
   } else {
     skip_dumping_instructions = false;
     std::cout << "[ChampSim Tracer] Segment " << current_segment_idx
@@ -500,15 +511,6 @@ void check_end_of_trace()
   }
 }
 
-template <typename Func>
-void for_ins_in_trace(const TRACE& trace, Func f)
-{
-  for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl)) {
-    for (INS ins = BBL_InsHead(bbl); INS_Valid(ins); ins = INS_Next(ins)) {
-      f(ins);
-    }
-  }
-}
 
 static constexpr UINT64 PROGRESS_STEP = 100000000000ULL; // 100 billion
 static UINT64 next_progress_milestone = PROGRESS_STEP;
@@ -533,18 +535,29 @@ void insert_instrumentation(TRACE trace, void* v)
 {
   if (alloc_only_mode) return;  // No instruction tracing in alloc-only mode
 
-  // Unconditionally register all callbacks on every instruction.
-  // Each callback has its own internal guard to handle the
-  // fast-forward → tracing transition seamlessly at instruction granularity:
-  //   - fast_forward_ins:   guards with fast_forward_insts_left > 0
-  //   - check_end_of_trace: guards with fast_forward_insts_left > 0 || skip_dumping_instructions
-  //   - insert_analysis_functions: guards by skipping output when skip_dumping_instructions is true
-  for_ins_in_trace(trace, [](const INS& ins) {
-    INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)fast_forward_ins, IARG_END);
-    insert_analysis_functions(ins);
-    INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
-    INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_UINT32, 1, IARG_END);
-  });
+  for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl)) {
+    if (fast_forward_insts_left > 0 || skip_dumping_instructions) {
+      // ============================================================
+      // Fast-forward 阶段：仅插入极轻量的 BBL 级回调
+      // 完全不触碰 insert_analysis_functions（无 IARG_MEMORYOP_EA、
+      // 无寄存器解析、无 check_end_of_trace）
+      // 保留 docount 用于保持 progress 显示（每 100B 条指令）
+      // ============================================================
+      BBL_InsertCall(bbl, IPOINT_BEFORE, (AFUNPTR)fast_forward_bbl,
+                     IARG_UINT32, BBL_NumIns(bbl), IARG_END);
+      BBL_InsertCall(bbl, IPOINT_BEFORE, (AFUNPTR)docount,
+                     IARG_UINT32, BBL_NumIns(bbl), IARG_END);
+    } else {
+      // ============================================================
+      // 正式 Trace 阶段：逐条指令插入完整分析函数
+      // ============================================================
+      for (INS ins = BBL_InsHead(bbl); INS_Valid(ins); ins = INS_Next(ins)) {
+        insert_analysis_functions(ins);
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)check_end_of_trace, IARG_END);
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_UINT32, 1, IARG_END);
+      }
+    }
+  }
 }
 
 /* ===================================================================== */
