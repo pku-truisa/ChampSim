@@ -133,13 +133,15 @@ public:
   // Uses page-aligned address lookup in active_objects for O(log n) search
   uint64_t lookup_alloc_id_by_va(champsim::address vaddr) const;
 
-  // Access the per-object stats by alloc_id
+  // Access the per-object stats by alloc_id (alloc_id=0 returns the unmatched sentinel)
   PerCacheStats& get_cache_stats(uint64_t alloc_id, const std::string& cache_name);
   PerDRAMStats& get_dram_stats(uint64_t alloc_id, const std::string& dram_name);
 
   // Get all object records (for output)
   const std::vector<ObjectRecord>& get_all_objects() const { return all_objects; }
 
+  // Get the unmatched (no object mapping) sentinel record
+  const ObjectRecord& get_unmatched_record() const { return unmatched_record; }
 
   // Register known cache/DRAM names (for output, ensures all-zero stats are also printed)
   void register_cache_name(const std::string& name) { known_cache_names.push_back(name); }
@@ -166,6 +168,9 @@ private:
   // Uses vector index (not pointer) to avoid invalidation from vector reallocation
   std::unordered_map<uint64_t, std::size_t> allocid_to_record;
 
+  // Sentinel record for unmatched accesses (alloc_id=0)
+  ObjectRecord unmatched_record;
+
   // Known cache/DRAM channel names for output (even if all stats are zero)
   std::vector<std::string> known_cache_names;
   std::vector<std::string> known_dram_names;
@@ -182,7 +187,7 @@ private:
   // Find alloc_id by VA page overlap (active objects only)
   uint64_t find_alloc_id_by_va(champsim::address vaddr) const;
 
-  // Find ObjectRecord by alloc_id (uses fast index)
+  // Find ObjectRecord by alloc_id (uses fast index; returns sentinel for alloc_id=0)
   ObjectRecord* find_record(uint64_t alloc_id);
 };
 

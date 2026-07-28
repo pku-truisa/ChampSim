@@ -21,6 +21,7 @@ cache_stats operator-(cache_stats lhs, cache_stats rhs)
 
 // Helper: get ppage and lookup alloc_id, then get per-object cache stats
 // Uses VA first (preferred, avoids PA reuse issues), falls back to PA.
+// Always returns a valid pointer: if no object is found, uses the unmatched sentinel.
 static PerCacheStats* mol_lookup_cache(champsim::address va, champsim::address pa, const std::string& cache_name)
 {
   uint64_t alloc_id = 0;
@@ -34,10 +35,8 @@ static PerCacheStats* mol_lookup_cache(champsim::address va, champsim::address p
     champsim::page_number ppage{ppage_val};
     alloc_id = mol_table.lookup_alloc_id_by_pa(ppage);
   }
-  if (alloc_id > 0) {
-    return &mol_table.get_cache_stats(alloc_id, cache_name);
-  }
-  return nullptr;
+  // get_cache_stats handles alloc_id=0 (unmatched) via the sentinel record
+  return &mol_table.get_cache_stats(alloc_id, cache_name);
 }
 
 void cache_stats::record_hit(access_type type, uint32_t cpu, champsim::address va, champsim::address pa, bool warmup)

@@ -84,7 +84,12 @@ PerCacheStats& MemoryObjectTable::get_cache_stats(uint64_t alloc_id, const std::
 {
   ObjectRecord* rec = find_record(alloc_id);
   if (rec == nullptr) {
-    throw std::runtime_error("MemoryObjectTable::get_cache_stats: alloc_id " + std::to_string(alloc_id) + " not found");
+    // For alloc_id=0 (unmatched), use the sentinel; otherwise this is unexpected
+    if (alloc_id != 0) {
+      throw std::runtime_error("MemoryObjectTable::get_cache_stats: alloc_id " + std::to_string(alloc_id) + " not found");
+    }
+    rec = &unmatched_record;
+    unmatched_record.alloc_id = 0;
   }
   return rec->cache_stats[cache_name];
 }
@@ -93,7 +98,11 @@ PerDRAMStats& MemoryObjectTable::get_dram_stats(uint64_t alloc_id, const std::st
 {
   ObjectRecord* rec = find_record(alloc_id);
   if (rec == nullptr) {
-    throw std::runtime_error("MemoryObjectTable::get_dram_stats: alloc_id " + std::to_string(alloc_id) + " not found");
+    if (alloc_id != 0) {
+      throw std::runtime_error("MemoryObjectTable::get_dram_stats: alloc_id " + std::to_string(alloc_id) + " not found");
+    }
+    rec = &unmatched_record;
+    unmatched_record.alloc_id = 0;
   }
   return rec->dram_stats[dram_name];
 }
