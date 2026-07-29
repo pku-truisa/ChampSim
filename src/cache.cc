@@ -591,7 +591,9 @@ long CACHE::invalidate_entry(champsim::address inval_addr)
 
 bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata)
 {
-  sim_stats.record_pf_requested(champsim::address{}, pf_addr, warmup);
+  auto pf_va = virtual_prefetch ? pf_addr : champsim::address{};
+  auto pf_pa = virtual_prefetch ? champsim::address{} : pf_addr;
+  sim_stats.record_pf_requested(pf_va, pf_pa, warmup);
 
   if (std::size(internal_PQ) >= PQ_SIZE) {
     return false;
@@ -606,7 +608,7 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
   pf_packet.is_translated = !virtual_prefetch;
 
   internal_PQ.emplace_back(pf_packet, true, !fill_this_level);
-  sim_stats.record_pf_issued(champsim::address{}, pf_addr, warmup);
+  sim_stats.record_pf_issued(pf_va, pf_pa, warmup);
 
   return true;
 }
