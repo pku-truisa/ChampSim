@@ -169,9 +169,27 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
 
   auto phase_stats = champsim::main(gen_environment, phases, traces);
 
+  // Set trace prefix for output filenames
+  // Extract the stem (filename without extension) from the first trace path
+  {
+    std::string prefix = std::filesystem::path(trace_names.at(0)).stem().string();
+    // Handle double extensions like .trace.xz: apply stem() again
+    std::string second_stem = std::filesystem::path(prefix).stem().string();
+    if (!second_stem.empty() && second_stem != prefix) {
+      prefix = second_stem;
+    }
+    mol_table.set_trace_prefix(prefix);
+  }
+
   fmt::print("\nChampSim completed all CPUs\n\n");
 
+  // Output simulation statistics to screen and to a file
   champsim::plain_printer{std::cout}.print(phase_stats);
+  {
+    std::string stats_filename = mol_table.get_trace_prefix() + "_stats.txt";
+    std::ofstream stats_file{stats_filename};
+    champsim::plain_printer{stats_file}.print(phase_stats);
+  }
 
   for (CACHE& cache : gen_environment.cache_view()) {
     cache.impl_prefetcher_final_stats();
@@ -188,18 +206,6 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
       std::ofstream json_file{json_file_name};
       champsim::json_printer{json_file}.print(phase_stats);
     }
-  }
-
-  // Set trace prefix for output filenames
-  // Extract the stem (filename without extension) from the first trace path
-  {
-    std::string prefix = std::filesystem::path(trace_names.at(0)).stem().string();
-    // Handle double extensions like .trace.xz: apply stem() again
-    std::string second_stem = std::filesystem::path(prefix).stem().string();
-    if (!second_stem.empty() && second_stem != prefix) {
-      prefix = second_stem;
-    }
-    mol_table.set_trace_prefix(prefix);
   }
 
   // Output per-object memory statistics (prefixed with trace name)
