@@ -50,15 +50,28 @@ void print_cache_stats(std::ostream& os, const std::string& cache_name, const Pe
   fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
              cache_name, "TOTAL", total_access, total_hits, total_misses, st.mshr_merge);
 
-  // Per access_type lines (matching plain_printer.cc format)
-  constexpr std::array types{access_type::LOAD, access_type::RFO, access_type::PREFETCH, access_type::WRITE, access_type::TRANSLATION};
-  for (const auto type : types) {
-    auto idx = champsim::to_underlying(type);
-    uint64_t hits = st.hits[idx];
-    uint64_t misses = st.misses[idx];
-    uint64_t access = hits + misses;
+  // DEMAND line: LOAD + RFO + WRITE + TRANSLATION (everything except PREFETCH)
+  {
+    uint64_t demand_hits = 0, demand_misses = 0;
+    auto p_idx = champsim::to_underlying(access_type::PREFETCH);
+    for (std::size_t i = 0; i < 5; ++i) {
+      if (i == p_idx) continue;
+      demand_hits += st.hits[i];
+      demand_misses += st.misses[i];
+    }
+    uint64_t demand_access = demand_hits + demand_misses;
     fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
-               cache_name, access_type_names.at(idx), access, hits, misses, st.mshr_merge);
+               cache_name, "DEMAND", demand_access, demand_hits, demand_misses, st.mshr_merge);
+  }
+
+  // PREFETCH line (separate from DEMAND)
+  {
+    auto pidx = champsim::to_underlying(access_type::PREFETCH);
+    uint64_t pf_hits = st.hits[pidx];
+    uint64_t pf_misses = st.misses[pidx];
+    uint64_t pf_access = pf_hits + pf_misses;
+    fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
+               cache_name, "PREFETCH", pf_access, pf_hits, pf_misses, st.mshr_merge);
   }
 
   // Prefetch stats line (matching plain_printer.cc: PREFETCH REQUESTED / ISSUED / USEFUL / USELESS)
@@ -367,6 +380,6 @@ void print_memory_object_stats(const std::string& filename)
 
   // Also output aggregated per-caller-IP stats
   const auto& prefix = mol_table.get_trace_prefix();
-  std::string caller_ip_file = prefix.empty() ? "caller_ip_status.txt" : prefix + "_caller_ip_status.txt";
+  std::string caller_ip_file = prefix.empty() ? "caller_ip_stats.txt" : prefix + "_caller_ip_stats.txt";
   print_caller_ip_grouped_stats(caller_ip_file);
 }
