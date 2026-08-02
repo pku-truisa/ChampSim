@@ -77,7 +77,7 @@ private:
 
   public:
     LatencyTable(const int size) : size(size) { latencyt = new latency_table[size]; }
-    ~LatencyTable() { delete latencyt; }
+    ~LatencyTable() { delete[] latencyt; }
 
     uint8_t add(uint64_t addr, uint64_t tag, bool pf, uint64_t cycle);
     uint64_t get(uint64_t addr);
@@ -113,8 +113,8 @@ private:
     ~ShadowCache()
     {
       for (int i = 0; i < sets; i++)
-        delete scache[i];
-      delete scache;
+        delete[] scache[i];
+      delete[] scache;
     }
 
     bool add(uint32_t set, uint32_t way, uint64_t addr, bool pf, uint64_t lat);
@@ -157,10 +157,10 @@ private:
     ~HistoryTable()
     {
       for (int i = 0; i < sets; i++)
-        delete historyt[i];
-      delete historyt;
+        delete[] historyt[i];
+      delete[] historyt;
 
-      delete history_pointers;
+      delete[] history_pointers;
     }
 
     int get_ways();

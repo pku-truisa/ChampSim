@@ -50,8 +50,14 @@ private:
         uint64_t bitmap;  // One bit per cache line in page (64 bits)
     };
 
+    // PLRU needs one bit per way. NUM_WAYS = 1360 bits cannot fit in a single
+    // uint16_t, so spread the bits across an array of 64-bit words.
+    static constexpr int PLRU_WORDS = (NUM_WAYS + 63) / 64; // 22 words = 1408 bits >= 1360
+    static constexpr int LAST_WORD_BITS = NUM_WAYS % 64;    // 16 valid bits in the last word
+    static constexpr uint64_t LAST_WORD_MASK = (LAST_WORD_BITS == 0) ? ~0ULL : ((1ULL << LAST_WORD_BITS) - 1);
+
     Entry table[NUM_SETS][NUM_WAYS];
-    uint16_t plru[NUM_SETS]; // 10-bit PLRU per set
+    uint64_t plru[NUM_SETS * PLRU_WORDS]; // One bit per way
 
     uint64_t stat_filter_hits;
     uint64_t stat_filter_misses;
@@ -64,18 +70,34 @@ private:
     uint64_t getBlockOffset(uint64_t addr) const { return (addr >> LOG2_BLOCK) & BLOCK_MASK; }
 
     int getVictim(uint32_t set) {
+        uint64_t* plru_set = &plru[set * PLRU_WORDS];
         for (int way = 0; way < NUM_WAYS; way++) {
-            if (!(plru[set] & (1 << way)))
+            if (!(plru_set[way >> 6] & (1ULL << (way & 63))))
                 return way; // found the first not recently used
         }
-        plru[set] = 0; // should not happen
+        for (int w = 0; w < PLRU_WORDS; w++)
+            plru_set[w] = 0; // should not happen
         return 0;
     }
 
     void touchPLRU(uint32_t set, int way) {
-        plru[set] |= (1 << way); // mark as recently used
-        if (plru[set] == ((1 << NUM_WAYS) - 1)) // All ones
-            plru[set] = (1 << way); // reset, keep this way as most recently used
+        uint64_t* plru_set = &plru[set * PLRU_WORDS];
+        plru_set[way >> 6] |= (1ULL << (way & 63)); // mark as recently used
+
+        // Check whether every valid bit (ways 0..NUM_WAYS-1) is set
+        bool all_ones = true;
+        for (int w = 0; w < PLRU_WORDS - 1; w++) {
+            if (plru_set[w] != ~0ULL) {
+                all_ones = false;
+                break;
+            }
+        }
+        if (all_ones && (plru_set[PLRU_WORDS - 1] & LAST_WORD_MASK) == LAST_WORD_MASK) {
+            // All ones: reset, keep this way as most recently used
+            for (int w = 0; w < PLRU_WORDS; w++)
+                plru_set[w] = 0;
+            plru_set[way >> 6] |= (1ULL << (way & 63));
+        }
     }
 
     int lookup(uint32_t set, uint64_t tag) {
@@ -87,7 +109,7 @@ private:
     }
 
 public:
-    Filter() : stat_filter_hits(0), stat_filter_misses(0), stat_evictions(0), multicore(false) {
+    Filter() : multicore(false), stat_filter_hits(0), stat_filter_misses(0), stat_evictions(0) {
         memset(table, 0, sizeof(table));
         memset(plru, 0, sizeof(plru));
 
