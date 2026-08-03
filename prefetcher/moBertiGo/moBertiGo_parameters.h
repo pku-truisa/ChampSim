@@ -55,8 +55,8 @@
 
 // TODO: chekc of limit
 // NOTE: comparisons use '>', so effective promotion threshold = value + 1.
-// e.g. CONFIDENCE_L1 = 6 means conf >= 7 promotes to L1D issue.
-#define CONFIDENCE_L1 (6) // 6 bits - conf > 6 (>=7)  -> issue to L1D
+// e.g. CONFIDENCE_L1 = 5 means conf >= 6 promotes to L1D issue.
+#define CONFIDENCE_L1 (5) // 6 bits - conf > 5 (>=6)  -> issue to L1D
 #define CONFIDENCE_L2 (4) // 6 bits - conf > 4 (>=5)  -> issue to L2C (mid)
 #define CONFIDENCE_L2R (2) // 6 bits - conf > 2 (>=3) -> issue to L2C (low)
 
