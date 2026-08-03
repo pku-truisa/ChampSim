@@ -7,7 +7,11 @@
 #define BERTI_TABLE_SIZE (64)
 #define BERTI_TABLE_DELTA_SIZE (16)
 #define PC_PATH_HISTORY_SIZE (4)
-#define MO_PATH_HISTORY_SIZE (4)
+
+// Enable the MO_hash prediction channel (memory object identity signature).
+// Disabled by default: MO_hash competes with IP/PC_Path for Berti Table and
+// HistoryTable capacity, which can degrade performance. Kept for evaluation.
+// # define ENABLE_MO_HASH
 
 // (Sizes summarized above)
 #define HISTORY_TABLE_SETS (48)

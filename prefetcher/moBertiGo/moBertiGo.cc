@@ -991,9 +991,11 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
   pc_path_raw = (pc_path_raw << 3) ^ (ip & 0xFFFF);
   uint64_t pc_path_hash = berti->ip_hash(pc_path_raw) & IP_MASK;
 
+#ifdef ENABLE_MO_HASH
   // ---- MO_hash: memory object identity ----
   uint64_t alloc_id = mol_table.lookup_alloc_id_by_va(address);
   uint64_t mo_hash = berti->ip_hash(alloc_id) & IP_MASK;
+#endif
 
   // ---- Memory object bounds: restrict prefetch within the owning object ----
   auto [obj_start, obj_end] = mol_table.get_object_bounds(address);
@@ -1013,7 +1015,9 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
     latencyt->add(line_addr, ip_hash, false, current_cycle);
     historyt->add(ip_hash, line_addr, current_cycle);
     historyt->add(pc_path_hash, line_addr, current_cycle);     // Also train PC_Path signature
+#ifdef ENABLE_MO_HASH
     historyt->add(mo_hash, line_addr, current_cycle);          // Also train MO signature
+#endif
   } else if (cache_hit && scache->is_pf(line_addr))       // Hit bc prefetch
   {
     if constexpr (champsim::debug_print)
@@ -1030,8 +1034,10 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
     historyt->add(ip_hash, line_addr, current_cycle & TIME_MASK);
     berti->find_and_update(latency, pc_path_hash, current_cycle & TIME_MASK, line_addr);
     historyt->add(pc_path_hash, line_addr, current_cycle & TIME_MASK);
+#ifdef ENABLE_MO_HASH
     berti->find_and_update(latency, mo_hash, current_cycle & TIME_MASK, line_addr);
     historyt->add(mo_hash, line_addr, current_cycle & TIME_MASK);
+#endif
   } else {
     if constexpr (champsim::debug_print)
       std::cout << "[moBERTI] operate cache hit" << std::endl;
@@ -1053,7 +1059,9 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
   
   add_deltas(ip_hash);
   add_deltas(pc_path_hash);
+#ifdef ENABLE_MO_HASH
   add_deltas(mo_hash);
+#endif
 
   bool first_issue = true;
   for (auto i : deltas) {
