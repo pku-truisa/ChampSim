@@ -69,6 +69,16 @@ uint64_t MemoryObjectTable::lookup_alloc_id_by_va(champsim::address vaddr) const
   return find_alloc_id_by_va(vaddr);
 }
 
+std::pair<champsim::address, champsim::address> MemoryObjectTable::get_object_bounds(champsim::address vaddr) const
+{
+  const ActiveObject* obj = find_active_by_va(vaddr);
+  if (obj == nullptr) {
+    // vaddr does not belong to any active object
+    return {champsim::address{0}, champsim::address{0}};
+  }
+  return {obj->vaddr_start, obj->vaddr_end};
+}
+
 uint64_t MemoryObjectTable::lookup_alloc_id_by_pa(champsim::page_number ppage) const
 {
   // Direct lookup: PA → alloc_id

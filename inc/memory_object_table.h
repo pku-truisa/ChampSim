@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -132,6 +133,10 @@ public:
   // Called by Cache/DRAM to find which object owns a virtual address
   // Uses page-aligned address lookup in active_objects for O(log n) search
   uint64_t lookup_alloc_id_by_va(champsim::address vaddr) const;
+
+  // Query the [vaddr_start, vaddr_end) bounds of the object owning vaddr.
+  // Returns {0, 0} if vaddr does not belong to any active object.
+  std::pair<champsim::address, champsim::address> get_object_bounds(champsim::address vaddr) const;
 
   // Access the per-object stats by alloc_id (alloc_id=0 returns the unmatched sentinel)
   PerCacheStats& get_cache_stats(uint64_t alloc_id, const std::string& cache_name);

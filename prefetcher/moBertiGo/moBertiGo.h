@@ -44,6 +44,8 @@ private:
   // Bloom filter metrics (optional)
   uint64_t filtered = 0;
   uint64_t bloom_issued = 0;
+  // Object-bounds filtered prefetches
+  uint64_t obj_filtered_oob = 0;
   
   // PC_Path signature tracking
   std::array<uint64_t, PC_PATH_HISTORY_SIZE> last_pcs = {};

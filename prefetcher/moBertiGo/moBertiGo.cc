@@ -847,6 +847,7 @@ void moBertiGo::prefetcher_initialize()
   average_num = 0;
   filtered = 0;
   bloom_issued = 0;
+  obj_filtered_oob = 0;
   // Calculate latency table size
   uint64_t latency_table_size = intern_->get_mshr_size();
   for (auto const& i : intern_->get_rq_size())
@@ -994,6 +995,16 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
   uint64_t alloc_id = mol_table.lookup_alloc_id_by_va(address);
   uint64_t mo_hash = berti->ip_hash(alloc_id) & IP_MASK;
 
+  // ---- Memory object bounds: restrict prefetch within the owning object ----
+  auto [obj_start, obj_end] = mol_table.get_object_bounds(address);
+  uint64_t obj_start_line = 0;
+  uint64_t obj_end_line = 0;
+  bool has_object_bounds = (obj_start.to<uint64_t>() != 0);
+  if (has_object_bounds) {
+    obj_start_line = obj_start.to<uint64_t>() >> LOG2_BLOCK_SIZE;
+    obj_end_line = (obj_end.to<uint64_t>() - 1) >> LOG2_BLOCK_SIZE;
+  }
+
   if (!cache_hit) // This is a miss
   {
     if constexpr (champsim::debug_print)
@@ -1046,7 +1057,15 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
 
   bool first_issue = true;
   for (auto i : deltas) {
-    uint64_t p_addr = (line_addr + i.delta) << LOG2_BLOCK_SIZE;
+    uint64_t p_line = line_addr + i.delta;
+    // Do not prefetch outside the owning memory object's bounds
+    if (has_object_bounds) {
+      if (p_line < obj_start_line || p_line > obj_end_line) {
+        ++obj_filtered_oob;
+        continue;
+      }
+    }
+    uint64_t p_addr = p_line << LOG2_BLOCK_SIZE;
     uint64_t p_b_addr = (p_addr >> LOG2_BLOCK_SIZE);
 
     if (latencyt->get(p_b_addr))
@@ -1198,4 +1217,7 @@ void moBertiGo::prefetcher_final_stats()
   std::cout << "BLOOM FILTER";
   std::cout << " FILTERED: " << filtered;
   std::cout << " PREFETCHED: " << bloom_issued << std::endl;
+
+  std::cout << "MO_OBJECT_BOUNDS";
+  std::cout << " OUT_OF_BOUNDS_FILTERED: " << obj_filtered_oob << std::endl;
 }
