@@ -1,5 +1,5 @@
 {
-  "executable_name": "1C.fullBW.BertiGo-pythia-no",
+  "executable_name": "1C.fullBW.vberti-no-no",
   "block_size": 64,
   "page_size": 4096,
   "heartbeat_frequency": 100000,
@@ -68,7 +68,7 @@
     "prefetch_as_load": false,
     "virtual_prefetch": true,
     "prefetch_activate": "LOAD,PREFETCH",
-    "prefetcher": "BertiGo"
+    "prefetcher": "vberti"
   },
 
   "L2C": {
@@ -84,7 +84,7 @@
     "prefetch_as_load": false,
     "virtual_prefetch": false,
     "prefetch_activate": "LOAD,PREFETCH",
-    "prefetcher": "pythia"
+    "prefetcher": "no"
   },
 
   "ITLB": {
