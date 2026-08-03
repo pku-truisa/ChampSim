@@ -54,9 +54,17 @@
 #define CONFIDENCE_INIT (1) // 6 bits
 
 // TODO: chekc of limit
-#define CONFIDENCE_L1 (10) // 6 bits - 10
-#define CONFIDENCE_L2 (6)  // 6 bits - 8
-#define CONFIDENCE_L2R (4) // 6 bits - 6
+// NOTE: comparisons use '>', so effective promotion threshold = value + 1.
+// e.g. CONFIDENCE_L1 = 6 means conf >= 7 promotes to L1D issue.
+#define CONFIDENCE_L1 (6) // 6 bits - conf > 6 (>=7)  -> issue to L1D
+#define CONFIDENCE_L2 (4) // 6 bits - conf > 4 (>=5)  -> issue to L2C (mid)
+#define CONFIDENCE_L2R (2) // 6 bits - conf > 2 (>=3) -> issue to L2C (low)
+
+// High-confidence boundary used by the tiered MSHR scheme.
+// Deltas with conf >= this value are considered fully validated (they would
+// have been L1D-eligible at the original conservative threshold) and are
+// allowed to issue to L1D even under heavier MSHR pressure.
+#define CONFIDENCE_L1_HIGH_BOUND (10)
 
 #define CONFIDENCE_MIDDLE_L1 (14) // 6 bits
 #define CONFIDENCE_MIDDLE_L2 (12) // 6 bits
@@ -65,7 +73,14 @@
 /*****************************************************************************
  *                              LIMITS                                       *
  *****************************************************************************/
-#define MSHR_LIMIT (70)
+// Tiered MSHR thresholds: high-confidence deltas can fill L1D under heavier
+// MSHR pressure, while mid/low-confidence deltas are kept more conservative.
+#define MSHR_LIMIT_HIGH_CONF (85) // conf >= CONFIDENCE_L1_HIGH_BOUND: almost never rejected
+#define MSHR_LIMIT_MID_CONF (75)  // conf >= CONFIDENCE_L1: moderately allowed
+#define MSHR_LIMIT_LOW_CONF (60)  // conf <  CONFIDENCE_L1: strict
+
+// Legacy aggregate limit (kept for reference/compatibility)
+#define MSHR_LIMIT (MSHR_LIMIT_MID_CONF)
 
 /*****************************************************************************
  *                              CONSTANT PARAMETERS                          *
