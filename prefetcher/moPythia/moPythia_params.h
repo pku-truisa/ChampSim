@@ -70,7 +70,7 @@ static const uint32_t max_deltas = 5;
 static const uint32_t max_alloc_ids = 5;
 static const uint32_t max_actions = 64;
 static const uint32_t max_rewards = 16;
-static const uint32_t max_degree = 16;
+static const uint32_t max_degree = 20;
 static const uint32_t max_dram_bw_levels = 16;
 
 //----------------------------//
@@ -85,9 +85,9 @@ static const int32_t reward_correct_timely = 20;
 static const int32_t reward_hbw_correct_timely = 20;
 static const int32_t reward_correct_untimely = 12;
 static const int32_t reward_hbw_correct_untimely = 12;
-static const int32_t reward_incorrect = -8;
+static const int32_t reward_incorrect = -6;
 static const int32_t reward_hbw_incorrect = -14;
-static const int32_t reward_none = -4;
+static const int32_t reward_none = -6;
 static const int32_t reward_hbw_none = -2;
 static const int32_t reward_out_of_bounds = -12;
 static const int32_t reward_hbw_out_of_bounds = -12;
@@ -105,15 +105,14 @@ static const std::vector<int32_t> dyn_degrees_type2_hbw = {1, 2, 4, 6};
 //------------------------------------//
 // Knobs for Featurewise learning engine
 //------------------------------------//
-// Active features:
-//   20 = F_Object           (alloc_id)
-//   21 = F_Object_Delta     (alloc_id + delta)
-//   22 = F_Object_Delta_Path (object_path_sig + delta_path)
-static const std::vector<int32_t> le_featurewise_active_features = {20, 21, 22};
-static const std::vector<int32_t> le_featurewise_num_tilings = {3, 3, 3};
-static const std::vector<int32_t> le_featurewise_num_tiles = {128, 128, 128};
-static const std::vector<int32_t> le_featurewise_hash_types = {2, 2, 2};
-static const std::vector<int32_t> le_featurewise_enable_tiling_offset = {1, 1, 1};
+// Active features (restored to original Pythia):
+//   0  = F_PC               (pc)
+//   10 = F_PC_Delta         (pc + delta)
+static const std::vector<int32_t> le_featurewise_active_features = {0, 10};
+static const std::vector<int32_t> le_featurewise_num_tilings = {3, 3};
+static const std::vector<int32_t> le_featurewise_num_tiles = {128, 128};
+static const std::vector<int32_t> le_featurewise_hash_types = {2, 2};
+static const std::vector<int32_t> le_featurewise_enable_tiling_offset = {1, 1};
 static const uint32_t le_featurewise_pooling_type = 2;
 
 } // namespace MO_PYTHIA

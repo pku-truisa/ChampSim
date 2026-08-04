@@ -41,7 +41,7 @@ uint32_t moPythia::prefetcher_cache_operate(champsim::address addr, champsim::ad
   auto [obj_start, obj_end] = mol_table.get_object_bounds(addr);
   uint64_t obj_start_addr = obj_start.to<uint64_t>();
   uint64_t obj_end_addr = obj_end.to<uint64_t>();
-  bool has_object_bounds = (obj_start_addr != 0);
+  bool has_object_bounds = intern_->virtual_prefetch && (obj_start_addr != 0);
 
   /* compute reward on demand */
   reward(address);

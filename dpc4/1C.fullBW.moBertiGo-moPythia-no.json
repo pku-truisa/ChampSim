@@ -82,7 +82,7 @@
     "max_tag_check": 1,
     "max_fill": 1,
     "prefetch_as_load": false,
-    "virtual_prefetch": true,
+    "virtual_prefetch": false, 
     "prefetch_activate": "LOAD,PREFETCH",
     "prefetcher": "moPythia"
   },
