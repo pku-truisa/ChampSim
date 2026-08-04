@@ -13,6 +13,14 @@
 // HistoryTable capacity, which can degrade performance. Kept for evaluation.
 // # define ENABLE_MO_HASH
 
+// Enable the Caller_IP prediction channel (allocation call-site signature).
+// Caller_IP provides coarse-grained object-level context: multiple allocation
+// instances from the same call site share one caller_ip hash, so cross-instance
+// delta patterns can be aggregated under a single tag. The IP (instruction),
+// PC_Path (control-flow path) and Caller_IP (allocation site) channels are
+// complementary and are learned together in the shared Berti/History tables.
+#define ENABLE_CALLER_IP_HASH
+
 // (Sizes summarized above)
 #define HISTORY_TABLE_SETS (48)
 #define HISTORY_TABLE_WAYS (32)

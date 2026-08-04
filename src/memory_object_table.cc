@@ -69,6 +69,15 @@ uint64_t MemoryObjectTable::lookup_alloc_id_by_va(champsim::address vaddr) const
   return find_alloc_id_by_va(vaddr);
 }
 
+uint64_t MemoryObjectTable::lookup_caller_ip_by_va(champsim::address vaddr) const
+{
+  const ActiveObject* obj = find_active_by_va(vaddr);
+  if (obj != nullptr) {
+    return obj->caller_ip;
+  }
+  return 0;
+}
+
 std::pair<champsim::address, champsim::address> MemoryObjectTable::get_object_bounds(champsim::address vaddr) const
 {
   const ActiveObject* obj = find_active_by_va(vaddr);

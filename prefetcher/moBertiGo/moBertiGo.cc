@@ -996,6 +996,14 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
   uint64_t alloc_id = mol_table.lookup_alloc_id_by_va(address);
   uint64_t mo_hash = berti->ip_hash(alloc_id) & IP_MASK;
 #endif
+#ifdef ENABLE_CALLER_IP_HASH
+  // ---- Caller_IP hash: allocation call-site signature ----
+  // Coarse-grained object-level context: all allocation instances from the
+  // same call site share one caller_ip, so cross-instance delta patterns are
+  // aggregated under a single tag, complementing the IP and PC_Path channels.
+  uint64_t caller_ip = mol_table.lookup_caller_ip_by_va(address);
+  uint64_t caller_ip_hash = berti->ip_hash(caller_ip) & IP_MASK;
+#endif
 
   // ---- Memory object bounds: restrict prefetch within the owning object ----
   auto [obj_start, obj_end] = mol_table.get_object_bounds(address);
@@ -1018,6 +1026,9 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
 #ifdef ENABLE_MO_HASH
     historyt->add(mo_hash, line_addr, current_cycle);          // Also train MO signature
 #endif
+#ifdef ENABLE_CALLER_IP_HASH
+    historyt->add(caller_ip_hash, line_addr, current_cycle);   // Also train Caller_IP signature
+#endif
   } else if (cache_hit && scache->is_pf(line_addr))       // Hit bc prefetch
   {
     if constexpr (champsim::debug_print)
@@ -1037,6 +1048,10 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
 #ifdef ENABLE_MO_HASH
     berti->find_and_update(latency, mo_hash, current_cycle & TIME_MASK, line_addr);
     historyt->add(mo_hash, line_addr, current_cycle & TIME_MASK);
+#endif
+#ifdef ENABLE_CALLER_IP_HASH
+    berti->find_and_update(latency, caller_ip_hash, current_cycle & TIME_MASK, line_addr);
+    historyt->add(caller_ip_hash, line_addr, current_cycle & TIME_MASK);
 #endif
   } else {
     if constexpr (champsim::debug_print)
@@ -1061,6 +1076,9 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
   add_deltas(pc_path_hash);
 #ifdef ENABLE_MO_HASH
   add_deltas(mo_hash);
+#endif
+#ifdef ENABLE_CALLER_IP_HASH
+  add_deltas(caller_ip_hash);
 #endif
 
   bool first_issue = true;

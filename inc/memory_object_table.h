@@ -134,6 +134,11 @@ public:
   // Uses page-aligned address lookup in active_objects for O(log n) search
   uint64_t lookup_alloc_id_by_va(champsim::address vaddr) const;
 
+  // Called by Cache/DRAM prefetchers to get the caller IP (allocation call-site
+  // return address) of the object owning vaddr. Returns 0 if vaddr does not
+  // belong to any active object.
+  uint64_t lookup_caller_ip_by_va(champsim::address vaddr) const;
+
   // Query the [vaddr_start, vaddr_end) bounds of the object owning vaddr.
   // Returns {0, 0} if vaddr does not belong to any active object.
   std::pair<champsim::address, champsim::address> get_object_bounds(champsim::address vaddr) const;
