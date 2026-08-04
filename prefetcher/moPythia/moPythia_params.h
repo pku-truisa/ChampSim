@@ -97,10 +97,11 @@ static const int32_t reward_hbw_out_of_bounds = -12;
 //----------------------------//
 static const bool enable_dyn_degree = true;
 static const uint32_t action_tracker_size = 2;
-static const std::vector<int32_t> last_pref_offset_conf_thresholds = {1, 3, 8};
-static const std::vector<int32_t> dyn_degrees_type2 = {1, 2, 4, 6};
-static const std::vector<int32_t> last_pref_offset_conf_thresholds_hbw = {1, 3, 8};
-static const std::vector<int32_t> dyn_degrees_type2_hbw = {1, 2, 4, 6};
+// NOTE: assert requires last_pref_offset_conf_thresholds.size() == dyn_degrees_type2.size() - 1
+static const std::vector<int32_t> last_pref_offset_conf_thresholds = {1, 2, 5, 8};
+static const std::vector<int32_t> dyn_degrees_type2 = {1, 2, 4, 6, 8};
+static const std::vector<int32_t> last_pref_offset_conf_thresholds_hbw = {1, 2, 5, 8};
+static const std::vector<int32_t> dyn_degrees_type2_hbw = {1, 2, 4, 6, 8};
 
 //------------------------------------//
 // Knobs for Featurewise learning engine
