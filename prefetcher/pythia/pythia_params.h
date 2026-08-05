@@ -69,7 +69,7 @@ static const uint32_t max_offsets = 5;
 static const uint32_t max_deltas = 5;
 static const uint32_t max_actions = 64;
 static const uint32_t max_rewards = 16;
-static const uint32_t max_degree = 16;
+static const uint32_t max_degree = 20;
 static const uint32_t max_dram_bw_levels = 16;
 
 //----------------------------//
@@ -84,9 +84,9 @@ static const int32_t reward_correct_timely = 20;
 static const int32_t reward_hbw_correct_timely = 20;
 static const int32_t reward_correct_untimely = 12;
 static const int32_t reward_hbw_correct_untimely = 12;
-static const int32_t reward_incorrect = -8;
+static const int32_t reward_incorrect = -6;
 static const int32_t reward_hbw_incorrect = -14;
-static const int32_t reward_none = -4;
+static const int32_t reward_none = -6;
 static const int32_t reward_hbw_none = -2;
 static const int32_t reward_out_of_bounds = -12;
 static const int32_t reward_hbw_out_of_bounds = -12;
@@ -96,10 +96,10 @@ static const int32_t reward_hbw_out_of_bounds = -12;
 //----------------------------//
 static const bool enable_dyn_degree = true;
 static const uint32_t action_tracker_size = 2;
-static const std::vector<int32_t> last_pref_offset_conf_thresholds = {1, 3, 8};
-static const std::vector<int32_t> dyn_degrees_type2 = {1, 2, 4, 6};
-static const std::vector<int32_t> last_pref_offset_conf_thresholds_hbw = {1, 3, 8};
-static const std::vector<int32_t> dyn_degrees_type2_hbw = {1, 2, 4, 6};
+static const std::vector<int32_t> last_pref_offset_conf_thresholds = {1, 2, 5, 8};
+static const std::vector<int32_t> dyn_degrees_type2 = {1, 2, 4, 6, 8};
+static const std::vector<int32_t> last_pref_offset_conf_thresholds_hbw = {1, 2, 5, 8};
+static const std::vector<int32_t> dyn_degrees_type2_hbw = {1, 2, 4, 6, 8};
 
 //------------------------------------//
 // Knobs for Featurewise learning engine
