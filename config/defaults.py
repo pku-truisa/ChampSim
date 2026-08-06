@@ -29,6 +29,28 @@ def ptw_core_defaults(cpu):
     ''' Generate the lower levels that a default core would expect for each of its PTWs '''
     yield { 'name': cpu.get('PTW'), 'lower_level': cpu.get('L1D') }
 
+def l2c_tlb_defaults(cpu, caches):
+    '''
+    Generate an L2CTLB (mirroring the DTLB) when the L2C of the given core
+    uses virtual prefetch (virtual_prefetch: true). The L2CTLB translates
+    the VA prefetch requests of the L2C, with the STLB as its next level.
+
+    When L2C.virtual_prefetch is false, nothing is generated and the
+    simulation is completely unaffected.
+    '''
+    l2c = caches.get(cpu.get('L2C'), {})
+    if not l2c.get('virtual_prefetch', False):
+        return
+
+    l2c_tlb_name = f"{cpu['name']}_L2CTLB"
+    # Mirror the DTLB structure: 16 sets x 4 ways, 1-cycle latency, page granularity
+    yield { 'name': l2c_tlb_name, 'lower_level': cpu.get('STLB') }
+    yield { 'name': cpu.get('L2C'), 'lower_translate': l2c_tlb_name }
+    yield { 'name': l2c_tlb_name,
+            '_first_level': True,
+            '_defaults': 'champsim::defaults::default_dtlb',
+            '_queue_factor': 16 }
+
 def list_defaults_for_core(cpu, caches):
     ''' Generate the down-path defaults that a default core would expect '''
     icache_path = itertools.tee(util.iter_system(caches, cpu.get('L1I')), 2)

@@ -1,9 +1,8 @@
 //=======================================================================================//
 // File             : moPythiaTLB/moPythiaTLB.h
-// Author           : Based on moPythia (Memory Object aware Pythia)
+// Author           : Based on Pythia (Bera+, MICRO'21)
 // Date             : 03/AUG/2026
-// Description      : Implements moPythiaTLB - Memory Object aware Pythia with an internal
-//                    PrefetchTLB to reduce STLB pressure.
+// Description      : Implements moPythiaTLB - Memory Object aware Pythia prefetcher
 //=======================================================================================//
 
 #ifndef __MO_PYTHIA_TLB_H__
@@ -25,10 +24,6 @@ private:
 
   /* Action array: basically a set of deltas to evaluate */
   std::vector<int32_t> Actions;
-
-  /* PrefetchTLB: internal L1-like TLB tracking pages with valid translations,
-   * used to reduce STLB pressure from prefetch-induced translation requests */
-  moptlb::PrefetchTLB prefetch_tlb;
 
   /* for managing stats */
   moptlb::PythiaStats stats;

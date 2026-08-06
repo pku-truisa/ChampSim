@@ -1,9 +1,8 @@
 //=======================================================================================//
 // File             : moPythiaTLB/moPythiaTLB_params.h
-// Author           : Based on moPythia (Memory Object aware Pythia)
+// Author           : Based on Pythia (Bera+, MICRO'21)
 // Date             : 03/AUG/2026
 // Description      : Defines all parameters of moPythiaTLB - Memory Object aware Pythia
-//                    with an internal PrefetchTLB to reduce STLB pressure.
 //=======================================================================================//
 
 #ifndef __MO_PYTHIA_TLB_PARAMS_H__
@@ -73,16 +72,6 @@ static const uint32_t max_actions = 64;
 static const uint32_t max_rewards = 16;
 static const uint32_t max_degree = 20;
 static const uint32_t max_dram_bw_levels = 16;
-
-//----------------------------//
-// PrefetchTLB parameters
-//----------------------------//
-// The internal TLB mirrors the L1 DTLB structure. It tracks which pages
-// are known to have valid translations. Demand accesses and fills fill the
-// table; prefetch predictions consult it to learn whether the destination
-// page is already translated (reducing pointless STLB lookups).
-static const uint32_t prefetch_tlb_sets = 16;
-static const uint32_t prefetch_tlb_ways = 4;
 
 //----------------------------//
 // Reward framework

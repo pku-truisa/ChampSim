@@ -1,9 +1,8 @@
 //=======================================================================================//
 // File             : moPythiaTLB/moPythiaTLB_helper.h
-// Author           : Based on moPythia (Memory Object aware Pythia)
+// Author           : Based on Pythia (Bera+, MICRO'21)
 // Date             : 03/AUG/2026
-// Description      : Implements helper functionalities for moPythiaTLB - Memory Object
-//                    aware Pythia with an internal PrefetchTLB to reduce STLB pressure.
+// Description      : Implements helper functionalities for moPythiaTLB - Memory Object aware Pythia
 //=======================================================================================//
 
 #ifndef __MO_PYTHIA_TLB_HELPER_H__
@@ -35,99 +34,6 @@ const char* getRewardTypeString(RewardType type);
 inline bool isRewardCorrect(RewardType type) { return (type == correct_timely || type == correct_untimely); }
 inline bool isRewardIncorrect(RewardType type) { return type == incorrect; }
 
-//----------------------------------------------------//
-// PrefetchTLB: an internal L1-like TLB used by the
-// prefetcher to track which pages are known to have
-// valid translations. Demand accesses and fills insert
-// entries; prefetch predictions consult it to learn
-// whether the destination page is already translated,
-// which reduces pointless STLB lookups.
-//----------------------------------------------------//
-class PrefetchTLB
-{
-public:
-  struct TLBEntry {
-    uint64_t vpn;
-    bool valid;
-    uint32_t lru;
-    TLBEntry() : vpn(0), valid(false), lru(0) {}
-  };
-
-private:
-  uint32_t m_sets;
-  uint32_t m_ways;
-  std::vector<std::vector<TLBEntry>> m_entries;
-
-  uint32_t get_set(uint64_t vpn) const { return vpn % m_sets; }
-
-public:
-  PrefetchTLB() : m_sets(MO_PYTHIA_TLB::prefetch_tlb_sets), m_ways(MO_PYTHIA_TLB::prefetch_tlb_ways)
-  {
-    m_entries.resize(m_sets, std::vector<TLBEntry>(m_ways));
-  }
-
-  ~PrefetchTLB() {}
-
-  /* Returns true if the page is present in the PrefetchTLB.
-   * On a hit, updates the LRU state of the set. */
-  bool lookup(uint64_t vpn)
-  {
-    uint32_t set = get_set(vpn);
-    for (uint32_t way = 0; way < m_ways; ++way) {
-      if (m_entries[set][way].valid && m_entries[set][way].vpn == vpn) {
-        m_entries[set][way].lru = 0;
-        for (uint32_t w = 0; w < m_ways; ++w) {
-          if (w != way && m_entries[set][w].valid) {
-            m_entries[set][w].lru++;
-          }
-        }
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /* Insert or refresh an entry for the given page. */
-  void fill(uint64_t vpn)
-  {
-    uint32_t set = get_set(vpn);
-    for (uint32_t way = 0; way < m_ways; ++way) {
-      if (m_entries[set][way].valid && m_entries[set][way].vpn == vpn) {
-        m_entries[set][way].lru = 0;
-        for (uint32_t w = 0; w < m_ways; ++w) {
-          if (w != way && m_entries[set][w].valid) {
-            m_entries[set][w].lru++;
-          }
-        }
-        return;
-      }
-    }
-
-    /* Find an invalid way first, otherwise the LRU victim */
-    uint32_t victim = 0;
-    uint32_t max_lru = 0;
-    for (uint32_t way = 0; way < m_ways; ++way) {
-      if (!m_entries[set][way].valid) {
-        victim = way;
-        break;
-      }
-      if (m_entries[set][way].lru > max_lru) {
-        max_lru = m_entries[set][way].lru;
-        victim = way;
-      }
-    }
-
-    m_entries[set][victim].vpn = vpn;
-    m_entries[set][victim].valid = true;
-    m_entries[set][victim].lru = 0;
-    for (uint32_t way = 0; way < m_ways; ++way) {
-      if (way != victim && m_entries[set][way].valid) {
-        m_entries[set][way].lru++;
-      }
-    }
-  }
-};
-
 class State
 {
 public:
@@ -146,10 +52,6 @@ public:
   uint64_t alloc_offset;
   uint32_t object_path_sig;
 
-  /* PrefetchTLB aware feature: whether the destination page of the
-   * predicted prefetch is already present in the internal PrefetchTLB */
-  bool dest_page_in_prefetch_tlb;
-
   /* Add more states here */
 
   void reset()
@@ -166,7 +68,6 @@ public:
     alloc_id = 0;
     alloc_offset = 0;
     object_path_sig = 0;
-    dest_page_in_prefetch_tlb = false;
   }
   State() { reset(); }
   ~State() {}
@@ -341,15 +242,6 @@ typedef struct _stats {
     uint64_t epochs;
     uint64_t histogram[MO_PYTHIA_TLB::max_dram_bw_levels];
   } bandwidth;
-
-  /* PrefetchTLB stats */
-  struct {
-    uint64_t lookup;
-    uint64_t hit;
-    uint64_t miss;
-    uint64_t fill;
-    uint64_t evict;
-  } prefetch_tlb;
 } PythiaStats;
 
 } // namespace moptlb

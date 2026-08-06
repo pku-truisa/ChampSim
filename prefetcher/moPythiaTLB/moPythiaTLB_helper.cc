@@ -1,9 +1,8 @@
 //=======================================================================================//
 // File             : moPythiaTLB/moPythiaTLB_helper.cc
-// Author           : Based on moPythia (Memory Object aware Pythia)
+// Author           : Based on Pythia (Bera+, MICRO'21)
 // Date             : 03/AUG/2026
-// Description      : Implements helper functionalities for moPythiaTLB - Memory Object
-//                    aware Pythia with an internal PrefetchTLB to reduce STLB pressure.
+// Description      : Implements helper functionalities for moPythiaTLB - Memory Object aware Pythia
 //=======================================================================================//
 
 #include "moPythiaTLB_helper.h"
@@ -145,6 +144,7 @@ void Scooby_STEntry::track_prefetch(uint32_t pred_offset, int32_t pref_offset)
 
 void Scooby_STEntry::insert_action_tracker(int32_t pref_offset)
 {
+  // bool found = false;
   auto it = find_if(action_tracker.begin(), action_tracker.end(), [pref_offset](ActionTracker* at) { return at->action == pref_offset; });
   if (it != action_tracker.end()) {
     (*it)->conf++;

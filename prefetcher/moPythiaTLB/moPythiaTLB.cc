@@ -1,9 +1,8 @@
 //=======================================================================================//
 // File             : moPythiaTLB/moPythiaTLB.cc
-// Author           : Based on moPythia (Memory Object aware Pythia)
+// Author           : Based on Pythia (Bera+, MICRO'21)
 // Date             : 03/AUG/2026
-// Description      : Implements moPythiaTLB - Memory Object aware Pythia with an internal
-//                    PrefetchTLB to reduce STLB pressure.
+// Description      : Implements moPythiaTLB - Memory Object aware Pythia prefetcher
 //=======================================================================================//
 
 #include "moPythiaTLB.h"
@@ -23,11 +22,11 @@ void moPythiaTLB::prefetcher_initialize()
   brain_featurewise = new moptlb::moLearningEngineFeaturewise(MO_PYTHIA_TLB::alpha, MO_PYTHIA_TLB::gamma, MO_PYTHIA_TLB::epsilon, (uint32_t)Actions.size(),
                                                            MO_PYTHIA_TLB::seed, MO_PYTHIA_TLB::policy, MO_PYTHIA_TLB::learning_type);
 
-  std::cout << "moPythiaTLB Prefetcher (Memory Object aware Pythia with PrefetchTLB)" << std::endl;
+  std::cout << "moPythiaTLB Prefetcher (Memory Object aware Pythia)" << std::endl;
 }
 
 uint32_t moPythiaTLB::prefetcher_cache_operate(champsim::address addr, champsim::address ip, uint8_t cache_hit, bool useful_prefetch, access_type type,
-                                               uint32_t metadata_in)
+                                            uint32_t metadata_in)
 {
   uint64_t address = addr.to<uint64_t>();
   uint64_t pc = ip.to<uint64_t>();
@@ -36,11 +35,6 @@ uint32_t moPythiaTLB::prefetcher_cache_operate(champsim::address addr, champsim:
   uint32_t offset = (uint32_t)((address >> LOG2_BLOCK_SIZE) & ((1ull << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) - 1));
 
   std::vector<uint64_t> pref_addr; // generated addresses to prefetch
-
-  /* Update PrefetchTLB: a demand access means the translation for this page
-   * is valid and present in the real TLB hierarchy. */
-  prefetch_tlb.fill(page);
-  stats.prefetch_tlb.fill++;
 
   /* Memory object lookup */
   uint64_t alloc_id = mol_table.lookup_alloc_id_by_va(addr);
@@ -90,26 +84,12 @@ uint32_t moPythiaTLB::prefetcher_cache_operate(champsim::address addr, champsim:
   return 0;
 }
 
-uint32_t moPythiaTLB::prefetcher_cache_fill(champsim::address addr, long set, long way, uint8_t prefetch, champsim::address evicted_addr,
-                                            uint32_t metadata_in)
+uint32_t moPythiaTLB::prefetcher_cache_fill(champsim::address addr, long set, long way, uint8_t prefetch, champsim::address evicted_addr, uint32_t metadata_in)
 {
-  /* Update PrefetchTLB: a fill means the translation for this page has been
-   * resolved and the page is now known to the TLB hierarchy. */
-  uint64_t page = addr.to<uint64_t>() >> LOG2_PAGE_SIZE;
-  prefetch_tlb.fill(page);
-  stats.prefetch_tlb.fill++;
-
   register_fill(addr.to<uint64_t>());
   return 0;
 }
 
 void moPythiaTLB::prefetcher_cycle_operate() {}
 
-void moPythiaTLB::prefetcher_final_stats()
-{
-  fprintf(stdout, "moPythiaTLB.prefetch_tlb.lookup %lu\n", stats.prefetch_tlb.lookup);
-  fprintf(stdout, "moPythiaTLB.prefetch_tlb.hit %lu\n", stats.prefetch_tlb.hit);
-  fprintf(stdout, "moPythiaTLB.prefetch_tlb.miss %lu\n", stats.prefetch_tlb.miss);
-  fprintf(stdout, "moPythiaTLB.prefetch_tlb.fill %lu\n", stats.prefetch_tlb.fill);
-  fprintf(stdout, "moPythiaTLB.prefetch_tlb.evict %lu\n", stats.prefetch_tlb.evict);
-}
+void moPythiaTLB::prefetcher_final_stats() {}

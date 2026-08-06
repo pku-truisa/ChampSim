@@ -1,8 +1,8 @@
 //=======================================================================================//
-// File             : moPythia/moPythia_aux.cc
+// File             : moPythiaTLB/moPythiaTLB_aux.cc
 // Author           : Based on Pythia (Bera+, MICRO'21)
 // Date             : 03/AUG/2026
-// Description      : Implements auxiliary functions of moPythia - Memory Object aware Pythia
+// Description      : Implements auxiliary functions of moPythiaTLB - Memory Object aware Pythia
 //=======================================================================================//
 
 #include "moPythiaTLB.h"
@@ -126,17 +126,6 @@ uint32_t moPythiaTLB::predict(uint64_t base_address, uint64_t page, uint32_t off
     } else {
       addr = (page << LOG2_PAGE_SIZE) + (predicted_offset << LOG2_BLOCK_SIZE);
 
-      /* PrefetchTLB aware feature: does the destination page have a known
-       * valid translation? This helps the RL agent learn to prefer
-       * prefetches that do not generate unnecessary STLB lookups. */
-      state->dest_page_in_prefetch_tlb = prefetch_tlb.lookup(addr >> LOG2_PAGE_SIZE);
-      stats.prefetch_tlb.lookup++;
-      if (state->dest_page_in_prefetch_tlb) {
-        stats.prefetch_tlb.hit++;
-      } else {
-        stats.prefetch_tlb.miss++;
-      }
-
       bool new_addr = track(addr, state, action_index, &ptentry); /* track prefetch */
       if (new_addr) {
         pref_addr.push_back(addr);
@@ -214,7 +203,7 @@ bool moPythiaTLB::track(uint64_t address, moptlb::State* state, uint32_t action_
 
 //----------------------------------------------------//
 // Computes the prefetch degree dynamically.
-// Should be called when moPythia makes a prediction.
+// Should be called when moPythiaTLB makes a prediction.
 //----------------------------------------------------//
 uint32_t moPythiaTLB::get_dyn_pref_degree(float max_to_avg_q_ratio, uint64_t page, int32_t action)
 {
