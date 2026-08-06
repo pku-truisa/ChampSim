@@ -67,6 +67,17 @@ void Scooby_STEntry::update_alloc_id(uint64_t _page, uint64_t alloc_id, uint32_t
   this->alloc_ids.push_back(alloc_id);
 }
 
+void Scooby_STEntry::update_caller_ip(uint64_t _page, uint64_t caller_ip)
+{
+  assert(this->page == _page);
+
+  /* insert caller_ip */
+  if (this->caller_ips.size() >= MO_PYTHIA_TLB::max_alloc_ids) {
+    this->caller_ips.pop_front();
+  }
+  this->caller_ips.push_back(caller_ip);
+}
+
 /* This is directly inspired by SPP's signature */
 uint32_t Scooby_STEntry::get_delta_sig2()
 {
@@ -111,6 +122,22 @@ uint32_t Scooby_STEntry::get_object_sig()
   for (uint32_t index = ptr; index < alloc_ids.size(); ++index) {
     signature = (signature << PC_SIG_SHIFT);
     signature = (signature ^ (uint32_t)alloc_ids[index]);
+  }
+  signature = signature & ((1ull << PC_SIG_MAX_BITS) - 1);
+  return signature;
+}
+
+uint32_t Scooby_STEntry::get_caller_ip_sig()
+{
+  uint32_t signature = 0;
+
+  /* compute signature using last 4 caller_ips */
+  uint32_t n = (uint32_t)caller_ips.size();
+  uint32_t ptr = (n >= 4) ? (n - 4) : 0;
+
+  for (uint32_t index = ptr; index < caller_ips.size(); ++index) {
+    signature = (signature << PC_SIG_SHIFT);
+    signature = (signature ^ (uint32_t)caller_ips[index]);
   }
   signature = signature & ((1ull << PC_SIG_MAX_BITS) - 1);
   return signature;

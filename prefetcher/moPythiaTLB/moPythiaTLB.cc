@@ -38,10 +38,18 @@ uint32_t moPythiaTLB::prefetcher_cache_operate(champsim::address addr, champsim:
 
   /* Memory object lookup */
   uint64_t alloc_id = mol_table.lookup_alloc_id_by_va(addr);
+  uint64_t caller_ip = mol_table.lookup_caller_ip_by_va(addr);
   auto [obj_start, obj_end] = mol_table.get_object_bounds(addr);
   uint64_t obj_start_addr = obj_start.to<uint64_t>();
   uint64_t obj_end_addr = obj_end.to<uint64_t>();
-  bool has_object_bounds = intern_->virtual_prefetch && (obj_start_addr != 0);
+  uint64_t obj_size = obj_end_addr - obj_start_addr;
+  bool has_object_bounds = intern_->virtual_prefetch && (obj_start_addr != 0) && (obj_size > 4096);
+
+  /* Only prefetch for objects larger than 4KB.
+   * Skip prefetch entirely for small objects (<=4KB) and unmatched accesses. */
+  if (!has_object_bounds) {
+    return 0;
+  }
 
   /* compute reward on demand */
   reward(address);
@@ -52,6 +60,8 @@ uint32_t moPythiaTLB::prefetcher_cache_operate(champsim::address addr, champsim:
   moptlb::Scooby_STEntry* stentry = update_local_state(pc, page, offset, address);
   /* track alloc_id path in the STEntry */
   update_local_state_alloc(page, alloc_id);
+  /* track caller_ip path in the STEntry */
+  update_local_state_caller_ip(page, caller_ip);
 
   /* Measure state.
    * state can contain per page local information like delta signature, pc signature etc.
@@ -71,6 +81,8 @@ uint32_t moPythiaTLB::prefetcher_cache_operate(champsim::address addr, champsim:
   state->alloc_id = alloc_id;
   state->alloc_offset = has_object_bounds ? (address - obj_start_addr) : 0;
   state->object_path_sig = stentry->get_object_sig();
+  state->caller_ip = caller_ip;
+  state->caller_ip_path_sig = stentry->get_caller_ip_sig();
 
   // generate prefetch predictions
   predict(address, page, offset, state, pref_addr, has_object_bounds, obj_start_addr, obj_end_addr);

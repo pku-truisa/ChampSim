@@ -51,6 +51,8 @@ public:
   uint64_t alloc_id;
   uint64_t alloc_offset;
   uint32_t object_path_sig;
+  uint64_t caller_ip;
+  uint32_t caller_ip_path_sig;
 
   /* Add more states here */
 
@@ -68,6 +70,8 @@ public:
     alloc_id = 0;
     alloc_offset = 0;
     object_path_sig = 0;
+    caller_ip = 0;
+    caller_ip_path_sig = 0;
   }
   State() { reset(); }
   ~State() {}
@@ -89,6 +93,7 @@ public:
   uint64_t page;
   std::deque<uint64_t> pcs;
   std::deque<uint64_t> alloc_ids;
+  std::deque<uint64_t> caller_ips;
   std::deque<uint32_t> offsets;
   std::deque<int32_t> deltas;
   Bitmap bmp_pred;
@@ -108,6 +113,7 @@ public:
   {
     pcs.clear();
     alloc_ids.clear();
+    caller_ips.clear();
     offsets.clear();
     deltas.clear();
     bmp_pred.reset();
@@ -123,8 +129,10 @@ public:
   uint32_t get_pc_sig();
   uint32_t get_offset_sig();
   uint32_t get_object_sig();
+  uint32_t get_caller_ip_sig();
   void update(uint64_t page, uint64_t pc, uint32_t offset, uint64_t address);
   void update_alloc_id(uint64_t page, uint64_t alloc_id, uint32_t offset, uint64_t address);
+  void update_caller_ip(uint64_t page, uint64_t caller_ip);
   void track_prefetch(uint32_t offset, int32_t pref_offset);
   void insert_action_tracker(int32_t pref_offset);
   bool search_action_tracker(int32_t action, int32_t& conf);

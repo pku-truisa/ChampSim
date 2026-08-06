@@ -33,6 +33,7 @@ private:
   void update_global_state(uint64_t pc, uint64_t page, uint32_t offset, uint64_t address);
   moptlb::Scooby_STEntry* update_local_state(uint64_t pc, uint64_t page, uint32_t offset, uint64_t address);
   void update_local_state_alloc(uint64_t page, uint64_t alloc_id);
+  void update_local_state_caller_ip(uint64_t page, uint64_t caller_ip);
   uint32_t predict(uint64_t address, uint64_t page, uint32_t offset, moptlb::State* state, std::vector<uint64_t>& pref_addr, bool has_object_bounds,
                    uint64_t obj_start, uint64_t obj_end);
   bool track(uint64_t address, moptlb::State* state, uint32_t action_index, moptlb::Scooby_PTEntry** tracker);

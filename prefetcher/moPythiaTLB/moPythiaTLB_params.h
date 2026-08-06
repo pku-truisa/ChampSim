@@ -106,14 +106,18 @@ static const std::vector<int32_t> dyn_degrees_type2_hbw = {1, 2, 4, 6, 8};
 //------------------------------------//
 // Knobs for Featurewise learning engine
 //------------------------------------//
-// Active features (restored to original Pythia):
-//   0  = F_PC               (pc)
-//   10 = F_PC_Delta         (pc + delta)
-static const std::vector<int32_t> le_featurewise_active_features = {0, 10};
-static const std::vector<int32_t> le_featurewise_num_tilings = {3, 3};
-static const std::vector<int32_t> le_featurewise_num_tiles = {128, 128};
-static const std::vector<int32_t> le_featurewise_hash_types = {2, 2};
-static const std::vector<int32_t> le_featurewise_enable_tiling_offset = {1, 1};
+// Active features (Memory Object aware):
+//   20 = F_Object                (alloc_id)
+//   21 = F_Object_Delta          (alloc_id + delta)
+//   22 = F_Object_Delta_Path     (object_path_sig + delta_path)
+//   23 = F_Caller_IP             (caller_ip)
+//   24 = F_Caller_IP_Delta       (caller_ip + delta)
+//   25 = F_Caller_IP_Delta_Path  (caller_ip_path_sig + delta_path)
+static const std::vector<int32_t> le_featurewise_active_features = {20, 21, 22, 23, 24, 25};
+static const std::vector<int32_t> le_featurewise_num_tilings = {3, 3, 3, 3, 3, 3};
+static const std::vector<int32_t> le_featurewise_num_tiles = {128, 128, 128, 128, 128, 128};
+static const std::vector<int32_t> le_featurewise_hash_types = {2, 2, 2, 2, 2, 2};
+static const std::vector<int32_t> le_featurewise_enable_tiling_offset = {1, 1, 1, 1, 1, 1};
 static const uint32_t le_featurewise_pooling_type = 2;
 
 } // namespace MO_PYTHIA_TLB

@@ -67,6 +67,14 @@ void moPythiaTLB::update_local_state_alloc(uint64_t page, uint64_t alloc_id)
   }
 }
 
+void moPythiaTLB::update_local_state_caller_ip(uint64_t page, uint64_t caller_ip)
+{
+  auto st_index = find_if(signature_table.begin(), signature_table.end(), [page](moptlb::Scooby_STEntry* _stentry) { return _stentry->page == page; });
+  if (st_index != signature_table.end()) {
+    (*st_index)->update_caller_ip(page, caller_ip);
+  }
+}
+
 //----------------------------------------------------//
 // Main predict function. Does four broader tasks:
 // 1. Asks the RL engine to select an action

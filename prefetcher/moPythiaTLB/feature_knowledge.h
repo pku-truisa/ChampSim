@@ -31,6 +31,9 @@ typedef enum {
   F_Object,                         // 20
   F_Object_Delta,                   // 21
   F_Object_Delta_Path,              // 22
+  F_Caller_IP,                      // 23
+  F_Caller_IP_Delta,                // 24
+  F_Caller_IP_Delta_Path,           // 25
 
   NumFeatureTypes
 } FeatureType;
@@ -78,6 +81,9 @@ private:
   uint32_t process_Object(uint32_t tiling, uint64_t alloc_id);
   uint32_t process_Object_delta(uint32_t tiling, uint64_t alloc_id, int32_t delta);
   uint32_t process_Object_Delta_Path(uint32_t tiling, uint32_t object_path, uint32_t delta_path);
+  uint32_t process_Caller_IP(uint32_t tiling, uint64_t caller_ip);
+  uint32_t process_Caller_IP_Delta(uint32_t tiling, uint64_t caller_ip, int32_t delta);
+  uint32_t process_Caller_IP_Delta_Path(uint32_t tiling, uint64_t caller_ip, uint32_t delta_path);
 
 public:
   moFeatureKnowledge(FeatureType feature_type, float alpha, float gamma, uint32_t actions, uint32_t num_tilings, uint32_t num_tiles, uint32_t hash_type,

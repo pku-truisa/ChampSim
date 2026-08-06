@@ -34,7 +34,10 @@ const char* MapFeatureTypeString[] = {"PC",
                                       "Delta_Path_PC",
                                       "Object",
                                       "Object_Delta",
-                                      "Object_Delta_Path"};
+                                      "Object_Delta_Path",
+                                      "Caller_IP",
+                                      "Caller_IP_Delta",
+                                      "Caller_IP_Delta_Path"};
 
 std::string moFeatureKnowledge::getFeatureString(FeatureType feature)
 {
@@ -191,6 +194,12 @@ uint32_t moFeatureKnowledge::get_tile_index(uint32_t tiling, State* state)
     return process_Object_delta(tiling, state->alloc_id, delta);
   case F_Object_Delta_Path:
     return process_Object_Delta_Path(tiling, state->object_path_sig, delta_path);
+  case F_Caller_IP:
+    return process_Caller_IP(tiling, state->caller_ip);
+  case F_Caller_IP_Delta:
+    return process_Caller_IP_Delta(tiling, state->caller_ip, delta);
+  case F_Caller_IP_Delta_Path:
+    return process_Caller_IP_Delta_Path(tiling, state->caller_ip, delta_path);
   default:
     assert(false);
     return 0;
@@ -479,6 +488,40 @@ uint32_t moFeatureKnowledge::process_Object_delta(uint32_t tiling, uint64_t allo
 uint32_t moFeatureKnowledge::process_Object_Delta_Path(uint32_t tiling, uint32_t object_path, uint32_t delta_path)
 {
   uint64_t tmp = object_path;
+  tmp = tmp << 16;
+  tmp += delta_path;
+  uint32_t raw_index = folded_xor(tmp, 2);
+  if (m_enable_tiling_offset)
+    raw_index = raw_index ^ tiling_offset[tiling];
+  uint32_t hashed_index = HashZoo::getHash(m_hash_type, raw_index);
+  return (hashed_index % m_num_tiles);
+}
+
+uint32_t moFeatureKnowledge::process_Caller_IP(uint32_t tiling, uint64_t caller_ip)
+{
+  uint32_t raw_index = folded_xor(caller_ip, 2); /* 32-b folded XOR */
+  if (m_enable_tiling_offset)
+    raw_index = raw_index ^ tiling_offset[tiling];
+  uint32_t hashed_index = HashZoo::getHash(m_hash_type, raw_index);
+  return (hashed_index % m_num_tiles);
+}
+
+uint32_t moFeatureKnowledge::process_Caller_IP_Delta(uint32_t tiling, uint64_t caller_ip, int32_t delta)
+{
+  uint32_t unsigned_delta = (delta < 0) ? (((-1) * delta) + (1 << (DELTA_BITS - 1))) : delta;
+  uint64_t tmp = caller_ip;
+  tmp = tmp << 7;
+  tmp += unsigned_delta;
+  uint32_t raw_index = folded_xor(tmp, 2);
+  if (m_enable_tiling_offset)
+    raw_index = raw_index ^ tiling_offset[tiling];
+  uint32_t hashed_index = HashZoo::getHash(m_hash_type, raw_index);
+  return (hashed_index % m_num_tiles);
+}
+
+uint32_t moFeatureKnowledge::process_Caller_IP_Delta_Path(uint32_t tiling, uint64_t caller_ip, uint32_t delta_path)
+{
+  uint64_t tmp = caller_ip;
   tmp = tmp << 16;
   tmp += delta_path;
   uint32_t raw_index = folded_xor(tmp, 2);
