@@ -1117,19 +1117,9 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
 
     float mshr_load = intern_->get_mshr_occupancy_ratio() * 100;
 
-    // Tiered MSHR thresholds: higher-confidence deltas may fill L1D under
-    // heavier MSHR pressure, while mid/low-confidence deltas are throttled
-    // more aggressively. This feeds more (validated) L1D misses into the L2C
-    // so downstream prefetchers (e.g. pythia) see a richer training stream.
-    uint64_t mshr_threshold = MSHR_LIMIT_LOW_CONF;
-    if (i.conf >= CONFIDENCE_L1_HIGH_BOUND)
-      mshr_threshold = MSHR_LIMIT_HIGH_CONF;
-    else if (i.conf > CONFIDENCE_L1)
-      mshr_threshold = MSHR_LIMIT_MID_CONF;
+    bool fill_this_level = (i.rpl == BERTI_L1) && (mshr_load < MSHR_LIMIT);
 
-    bool fill_this_level = (i.rpl == BERTI_L1) && (mshr_load < mshr_threshold);
-
-    if (i.rpl == BERTI_L1 && mshr_load >= mshr_threshold)
+    if (i.rpl == BERTI_L1 && mshr_load >= MSHR_LIMIT)
       pf_to_l2_bc_mshr++;
     if (fill_this_level)
       pf_to_l1++;

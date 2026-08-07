@@ -19,7 +19,7 @@
 // delta patterns can be aggregated under a single tag. The IP (instruction),
 // PC_Path (control-flow path) and Caller_IP (allocation site) channels are
 // complementary and are learned together in the shared Berti/History tables.
-#define ENABLE_CALLER_IP_HASH
+// #define ENABLE_CALLER_IP_HASH
 
 // (Sizes summarized above)
 #define HISTORY_TABLE_SETS (48)
@@ -68,12 +68,6 @@
 #define CONFIDENCE_L2 (4) // 6 bits - conf > 4 (>=5)  -> issue to L2C (mid)
 #define CONFIDENCE_L2R (2) // 6 bits - conf > 2 (>=3) -> issue to L2C (low)
 
-// High-confidence boundary used by the tiered MSHR scheme.
-// Deltas with conf >= this value are considered fully validated (they would
-// have been L1D-eligible at the original conservative threshold) and are
-// allowed to issue to L1D even under heavier MSHR pressure.
-#define CONFIDENCE_L1_HIGH_BOUND (10)
-
 #define CONFIDENCE_MIDDLE_L1 (14) // 6 bits
 #define CONFIDENCE_MIDDLE_L2 (12) // 6 bits
 #define LAUNCH_MIDDLE_CONF (8)
@@ -81,14 +75,7 @@
 /*****************************************************************************
  *                              LIMITS                                       *
  *****************************************************************************/
-// Tiered MSHR thresholds: high-confidence deltas can fill L1D under heavier
-// MSHR pressure, while mid/low-confidence deltas are kept more conservative.
-#define MSHR_LIMIT_HIGH_CONF (85) // conf >= CONFIDENCE_L1_HIGH_BOUND: almost never rejected
-#define MSHR_LIMIT_MID_CONF (75)  // conf >= CONFIDENCE_L1: moderately allowed
-#define MSHR_LIMIT_LOW_CONF (60)  // conf <  CONFIDENCE_L1: strict
-
-// Legacy aggregate limit (kept for reference/compatibility)
-#define MSHR_LIMIT (MSHR_LIMIT_MID_CONF)
+#define MSHR_LIMIT (75)
 
 /*****************************************************************************
  *                              CONSTANT PARAMETERS                          *
