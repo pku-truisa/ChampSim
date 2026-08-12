@@ -438,7 +438,7 @@ void vberti::InnerBerti::add(uint64_t tag, int64_t stride)
   int dx_remove = -1;
   for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++) {
     if (aux[i].rpl == BERTI_R && aux[i].conf < dx_conf) {
-      dx_conf = aux[i].conf;
+      dx_conf = static_cast<uint8_t>(aux[i].conf);
       dx_remove = i;
     }
   }
@@ -455,7 +455,7 @@ void vberti::InnerBerti::add(uint64_t tag, int64_t stride)
   dx_remove = -1;
   for (int i = 0; i < BERTI_TABLE_STRIDE_SIZE; i++) {
     if (aux[i].rpl == BERTI_L2R && aux[i].conf < dx_conf) {
-      dx_conf = aux[i].conf;
+      dx_conf = static_cast<uint8_t>(aux[i].conf);
       dx_remove = i;
     }
   }
@@ -504,7 +504,7 @@ uint8_t vberti::InnerBerti::get(uint64_t tag, stride_t* res)
         res[dx].stride = aux[i].stride;
         float temp = (float)aux[i].conf / (float)tmp->conf;
         uint64_t aux_conf = (uint64_t)(temp * 100);
-        res[dx].per = aux_conf;
+        res[dx].per = static_cast<float>(aux_conf);
         dx++;
       }
     }
@@ -573,7 +573,7 @@ void vberti::InnerBerti::find_and_update(uint64_t latency, uint64_t tag, uint64_
   uint16_t num_on_time = 0;
 
   // Get the IPs that can launch a prefetch
-  num_on_time = historyt->get(latency, tag, line_addr, tags, addr, cycle);
+  num_on_time = historyt->get(static_cast<uint32_t>(latency), tag, line_addr, tags, addr, cycle);
 
   for (uint32_t i = 0; i < num_on_time; i++) {
     // Increase conf tag
@@ -615,7 +615,7 @@ void vberti::prefetcher_initialize()
     latency_table_size += i;
 
   // New structures
-  berti = new InnerBerti(latency_table_size, intern_->NUM_SET, intern_->NUM_WAY);
+  berti = new InnerBerti(static_cast<int>(latency_table_size), intern_->NUM_SET, intern_->NUM_WAY);
 
   std::cout << "L1D VBerti prefetcher" << std::endl;
   std::cout << "History Sets: " << HISTORY_TABLE_SET << std::endl;
@@ -691,7 +691,7 @@ uint32_t vberti::prefetcher_cache_operate(champsim::address address, champsim::a
 
     // Level of prefetching depends on CONFIDENCE
     bool fill_this_level = false;
-    float mshr_load = intern_->get_mshr_occupancy_ratio() * 100;
+    float mshr_load = static_cast<float>(intern_->get_mshr_occupancy_ratio() * 100);
 
     if (stride[i].rpl == BERTI_L1 && mshr_load < MSHR_LIMIT) {
       fill_this_level = true;
@@ -734,7 +734,7 @@ uint32_t vberti::prefetcher_cache_fill(champsim::address address, long set, long
     latency = 0;
 
   // Add to the shadow cache
-  scache->add(set, way, line_addr, prefetch, latency);
+  scache->add(static_cast<uint32_t>(set), static_cast<uint32_t>(way), line_addr, prefetch, latency);
 
   if (latency != 0 && !prefetch) {
     berti->find_and_update(latency, tag, cycle, line_addr);

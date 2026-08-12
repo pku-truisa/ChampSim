@@ -332,7 +332,7 @@ void moBertiGo::HistoryTable::add(uint64_t tag, uint64_t addr, uint64_t cycle)
    *  - tag: PC tag
    *  - addr: addr access
    */
-  uint16_t set = tag % HISTORY_TABLE_SETS;
+  uint16_t set = static_cast<uint16_t>(tag % HISTORY_TABLE_SETS);
   // If the latest entry is the same, we do not add it
   if (history_pointers[set] == &historyt[set][ways - 1]) {
     if (historyt[set][0].addr == (addr & ADDR_MASK))
@@ -369,7 +369,7 @@ uint16_t moBertiGo::HistoryTable::get_aux(uint32_t latency, uint64_t tag, uint64
    */
 
   uint16_t num_on_time = 0;
-  uint16_t set = tag % HISTORY_TABLE_SETS;
+  uint16_t set = static_cast<uint16_t>(tag % HISTORY_TABLE_SETS);
 
   if constexpr (champsim::debug_print) {
     std::cout << "[BERTI_HISTORY_TABLE] " << __func__;
@@ -507,10 +507,10 @@ void moBertiGo::InnerBerti::add(uint64_t tag, int64_t delta)
     std::cout << " delta: " << delta;
   }
 
-  auto add_delta = [](auto delta, auto entry) {
+  auto add_delta = [](auto d, auto entry) {
     // Lambda function to add a new element
     delta_t new_delta;
-    new_delta.delta = delta;
+    new_delta.delta = d;
     new_delta.conf = CONFIDENCE_INIT;
     new_delta.rpl = BERTI_R;
     auto it = std::find_if(std::begin(entry->deltas), std::end(entry->deltas), [](const auto i) { return (i.delta == 0); });
@@ -576,7 +576,7 @@ void moBertiGo::InnerBerti::add(uint64_t tag, int64_t delta)
   // We have space to add a new entry
   auto ssize = std::count_if(std::begin(entry->deltas), std::end(entry->deltas), [](const auto i) { return i.delta != 0; });
 
-  if (ssize < size) {
+  if (static_cast<decltype(size)>(ssize) < size) {
     add_delta(delta, entry);
     assert((std::size(entry->deltas) <= size) && "I remember too much deltas");
     return;
@@ -656,7 +656,7 @@ void moBertiGo::InnerBerti::find_and_update(uint64_t latency, uint64_t tag, uint
   uint16_t num_on_time = 0;
 
   // Get the IPs that can launch a prefetch
-  num_on_time = historyt->get(latency, tag, line_addr, tags, addr, cycle);
+  num_on_time = historyt->get(static_cast<uint32_t>(latency), tag, line_addr, tags, addr, cycle);
 
   for (uint32_t i = 0; i < num_on_time; i++) {
     // Increase conf tag
@@ -858,7 +858,7 @@ void moBertiGo::prefetcher_initialize()
     latency_table_size += i;
 
   // New structures
-  berti = new InnerBerti(BERTI_TABLE_DELTA_SIZE, latency_table_size, intern_->NUM_SET, intern_->NUM_WAY);
+  berti = new InnerBerti(BERTI_TABLE_DELTA_SIZE, static_cast<int>(latency_table_size), intern_->NUM_SET, intern_->NUM_WAY);
 
   std::cout << "moBertiGo Prefetcher" << std::endl;
 
@@ -961,7 +961,7 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
   uint64_t addr = address.to<uint64_t>();
   uint64_t ip = ip_addr.to<uint64_t>();
   auto current_cycle = intern_->current_time.time_since_epoch() / intern_->clock_period;
-  size_t cpu = 0;
+  // size_t cpu = 0;
 
   // We select the structures for every cpu
   auto latencyt = berti->latencyt;
@@ -1115,7 +1115,7 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
       continue;
     }
 
-    float mshr_load = intern_->get_mshr_occupancy_ratio() * 100;
+    float mshr_load = static_cast<float>(intern_->get_mshr_occupancy_ratio() * 100);
 
     bool fill_this_level = (i.rpl == BERTI_L1) && (mshr_load < MSHR_LIMIT);
 
@@ -1126,7 +1126,7 @@ uint32_t moBertiGo::prefetcher_cache_operate(champsim::address address, champsim
     else
       pf_to_l2++;
 
-    if (prefetch_line(p_addr, fill_this_level, 0)) {
+    if (prefetch_line(champsim::address{p_addr}, fill_this_level, 0)) {
       ++bloom_issued;
       filter.markAccessed(p_addr);
       ++average_issued;
@@ -1165,12 +1165,12 @@ uint32_t moBertiGo::prefetcher_cache_fill(champsim::address address, long set, l
   uint64_t addr = address.to<uint64_t>();
   uint64_t evicted_addr = evicted_address.to<uint64_t>();
   auto current_cycle = intern_->current_time.time_since_epoch() / intern_->clock_period;
-  size_t cpu = 0;
+  // size_t cpu = 0;
 
   // We select the structures for every cpu
   auto latencyt = berti->latencyt;
   auto scache = berti->scache;
-  auto historyt = berti->historyt;
+  // auto historyt = berti->historyt;
 
   uint64_t line_addr = (addr >> LOG2_BLOCK_SIZE); // Line addr
   uint64_t tag = latencyt->get_tag(line_addr);
@@ -1196,7 +1196,7 @@ uint32_t moBertiGo::prefetcher_cache_fill(champsim::address address, long set, l
       if (average_latency.num == 0)
         average_latency.average = (float)latency;
       else {
-        average_latency.average = average_latency.average + ((((float)latency) - average_latency.average) / average_latency.num);
+        average_latency.average = average_latency.average + ((((float)latency) - average_latency.average) / static_cast<float>(average_latency.num));
       }
       average_latency.num++;
     }
@@ -1208,7 +1208,7 @@ uint32_t moBertiGo::prefetcher_cache_fill(champsim::address address, long set, l
   }
 
   // Add to the shadow cache
-  scache->add(set, way, line_addr, prefetch, latency);
+  scache->add(static_cast<uint32_t>(set), static_cast<uint32_t>(way), line_addr, prefetch, latency);
 
   if (latency != 0 && !prefetch) {
     berti->find_and_update(latency, tag, cycle, line_addr);
@@ -1237,7 +1237,7 @@ void moBertiGo::prefetcher_final_stats()
   std::cout << " NO_FOUND_BERTI: " << no_found_berti << std::endl;
 
   std::cout << "moBERTI";
-  std::cout << " AVERAGE_ISSUED: " << ((1.0 * average_issued) / average_num);
+  std::cout << " AVERAGE_ISSUED: " << (static_cast<double>(average_issued) / static_cast<double>(average_num));
   std::cout << std::endl;
 
   std::cout << "BLOOM FILTER";

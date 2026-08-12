@@ -76,7 +76,7 @@ private:
     latency_table* latencyt;
 
   public:
-    LatencyTable(const int size) : size(size) { latencyt = new latency_table[size]; }
+    LatencyTable(const int sz) : size(sz) { latencyt = new latency_table[sz]; }
     ~LatencyTable() { delete[] latencyt; }
 
     uint8_t add(uint64_t addr, uint64_t tag, bool pf, uint64_t cycle);
@@ -100,14 +100,14 @@ private:
     shadow_cache** scache;
 
   public:
-    ShadowCache(const int sets, const int ways)
+    ShadowCache(const int num_sets, const int num_ways)
     {
-      scache = new shadow_cache*[sets];
-      for (int i = 0; i < sets; i++)
-        scache[i] = new shadow_cache[ways];
+      scache = new shadow_cache*[num_sets];
+      for (int i = 0; i < num_sets; i++)
+        scache[i] = new shadow_cache[num_ways];
 
-      this->sets = sets;
-      this->ways = ways;
+      this->sets = num_sets;
+      this->ways = num_ways;
     }
 
     ~ShadowCache()
