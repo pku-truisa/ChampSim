@@ -204,7 +204,7 @@ private:
 // Global singleton instance
 extern MemoryObjectTable mol_table;
 
-// Output per-object statistics to a file (sorted by size descending)
+// Output per-object statistics to a file (sorted by LOAD count descending)
 void print_memory_object_stats(const std::string& filename);
 
 #endif

@@ -1,6 +1,6 @@
 /*
  * Memory Object Statistics Printer
- * Outputs per-object cache statistics sorted by object size (descending)
+ * Outputs per-object cache statistics sorted by LOAD count (descending)
  * Objects with no access data are omitted from output.
  *
  * Format matches the global stats output format from plain_printer.cc.
@@ -215,11 +215,20 @@ void print_memory_object_stats(const std::string& filename)
     return;
   }
 
-  // Make a copy and sort by size descending
+  // Make a copy and sort by total LOAD count descending
+  // LOAD count = sum of (hits + misses) for access_type::LOAD (index 0) across all caches
+  auto total_load_count = [](const auto& obj) {
+    uint64_t total = 0;
+    for (const auto& [cname, cs] : obj.cache_stats) {
+      total += cs.hits[0] + cs.misses[0];
+    }
+    return total;
+  };
   auto sorted = all_objects;
-  std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.size > b.size; });
+  std::sort(sorted.begin(), sorted.end(),
+            [&](const auto& a, const auto& b) { return total_load_count(a) > total_load_count(b); });
 
-  fmt::print(out, "=== Memory Object Statistics ({} objects, sorted by size descending) ===\n\n", sorted.size());
+  fmt::print(out, "=== Memory Object Statistics ({} objects, sorted by LOAD count descending) ===\n\n", sorted.size());
 
   uint64_t printed_count = 0;
   for (const auto& obj : sorted) {
