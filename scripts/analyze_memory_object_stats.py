@@ -45,13 +45,14 @@ CACHE_STATS_RE = re.compile(
 )
 
 # Prefetch stats line:
-#   cpu0-><cache_name> PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+#   cpu0-><cache_name> PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0 FILL:          0
 PF_STATS_RE = re.compile(
     r'cpu0->(?P<cache_name>[^\s]+)\s+'
     r'PREFETCH REQUESTED:\s*(?P<pf_req>\d+)\s+'
     r'ISSUED:\s*(?P<pf_issued>\d+)\s+'
     r'USEFUL:\s*(?P<pf_useful>\d+)\s+'
     r'USELESS:\s*(?P<pf_useless>\d+)'
+    r'(?:\s+FILL:\s*(?P<pf_fill>\d+))?'
 )
 
 # Cache name extractor for the header-less flat format.
@@ -164,8 +165,8 @@ def parse_input(filepath: str) -> list[ObjectInfo]:
                 pf_issued = int(m.group('pf_issued'))
                 pf_useful = int(m.group('pf_useful'))
                 pf_useless = int(m.group('pf_useless'))
-                # pf_fill is not in the flat format line, default to 0
-                pf_fill = 0
+                # FILL is now part of the flat format line; default to 0 for older logs that lack it
+                pf_fill = int(m.group('pf_fill')) if m.group('pf_fill') else 0
                 prev = current_obj.cache_prefetch.get(cache_name, (0, 0, 0, 0, 0))
                 current_obj.cache_prefetch[cache_name] = (
                     prev[0] + pf_req,

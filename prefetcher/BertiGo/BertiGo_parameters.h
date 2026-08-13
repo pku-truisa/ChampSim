@@ -49,9 +49,9 @@
 #define CONFIDENCE_INIT (1) // 6 bits
 
 // TODO: chekc of limit
-#define CONFIDENCE_L1 (5) // 6 bits - conf > 5 (>=6)  -> issue to L1D
-#define CONFIDENCE_L2 (4) // 6 bits - conf > 4 (>=5)  -> issue to L2C (mid)
-#define CONFIDENCE_L2R (2) // 6 bits - conf > 2 (>=3) -> issue to L2C (low)
+#define CONFIDENCE_L1 (10) // 6 bits - 10
+#define CONFIDENCE_L2 (6)  // 6 bits - 8
+#define CONFIDENCE_L2R (4) // 6 bits - 6
 
 #define CONFIDENCE_MIDDLE_L1 (14) // 6 bits
 #define CONFIDENCE_MIDDLE_L2 (12) // 6 bits
@@ -60,7 +60,7 @@
 /*****************************************************************************
  *                              LIMITS                                       *
  *****************************************************************************/
-#define MSHR_LIMIT (75)
+#define MSHR_LIMIT (70)
 
 /*****************************************************************************
  *                              CONSTANT PARAMETERS                          *

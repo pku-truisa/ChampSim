@@ -50,6 +50,16 @@ void print_cache_stats(std::ostream& os, const std::string& cache_name, const Pe
   fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
              cache_name, "TOTAL", total_access, total_hits, total_misses, st.mshr_merge);
 
+  // LOAD line
+  {
+    auto l_idx = champsim::to_underlying(access_type::LOAD);
+    uint64_t load_hits = st.hits[l_idx];
+    uint64_t load_misses = st.misses[l_idx];
+    uint64_t load_access = load_hits + load_misses;
+    fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
+               cache_name, "LOAD", load_access, load_hits, load_misses, st.mshr_merge);
+  }
+
   // DEMAND line: LOAD + RFO + WRITE + TRANSLATION (everything except PREFETCH)
   {
     uint64_t demand_hits = 0, demand_misses = 0;

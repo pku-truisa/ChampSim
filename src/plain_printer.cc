@@ -116,8 +116,8 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
                       stats.mshr_merge.value_or(std::pair{type, cpu}, mshr_merge_value_type{})));
     }
 
-    lines.push_back(fmt::format("cpu{}->{} PREFETCH REQUESTED: {:10} ISSUED: {:10} USEFUL: {:10} USELESS: {:10}", cpu, stats.name, stats.pf_requested,
-                                stats.pf_issued, stats.pf_useful, stats.pf_useless));
+    lines.push_back(fmt::format("cpu{}->{} PREFETCH REQUESTED: {:10} ISSUED: {:10} USEFUL: {:10} USELESS: {:10} FILL: {:10}", cpu, stats.name, stats.pf_requested,
+                                stats.pf_issued, stats.pf_useful, stats.pf_useless, stats.pf_fill));
 
     uint64_t total_downstream_demands = total_mshr_return - stats.mshr_return.value_or(std::pair{access_type::PREFETCH, cpu}, mshr_return_value_type{});
     lines.push_back(
