@@ -73,7 +73,10 @@ void cache_stats::record_mshr_merge(access_type type, uint32_t cpu, champsim::ad
   if (!warmup) {
     auto* st = mol_lookup_cache(va, pa, name);
     if (st) {
-      ++st->mshr_merge;
+      auto idx = champsim::to_underlying(type);
+      if (idx < 5) {
+        ++st->mshr_merge[idx];
+      }
     }
   }
 }
@@ -84,7 +87,10 @@ void cache_stats::record_mshr_return(access_type type, uint32_t cpu, champsim::a
   if (!warmup) {
     auto* st = mol_lookup_cache(va, pa, name);
     if (st) {
-      ++st->mshr_return;
+      auto idx = champsim::to_underlying(type);
+      if (idx < 5) {
+        ++st->mshr_return[idx];
+      }
     }
   }
 }

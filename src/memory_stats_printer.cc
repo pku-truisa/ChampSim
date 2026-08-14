@@ -29,8 +29,9 @@ inline bool has_any_data(const PerCacheStats& st)
   for (int i = 0; i < 5; ++i)
     if (st.hits[i] > 0 || st.misses[i] > 0)
       return true;
-  if (st.mshr_merge > 0 || st.mshr_return > 0)
-    return true;
+  for (int i = 0; i < 5; ++i)
+    if (st.mshr_merge[i] > 0 || st.mshr_return[i] > 0)
+      return true;
   if (st.pf_requested > 0 || st.pf_issued > 0 || st.pf_useful > 0 || st.pf_useless > 0 || st.pf_fill > 0)
     return true;
   return false;
@@ -39,16 +40,19 @@ inline bool has_any_data(const PerCacheStats& st)
 void print_cache_stats(std::ostream& os, const std::string& cache_name, const PerCacheStats& st)
 {
   // Calculate totals across all access types
-  uint64_t total_hits = 0, total_misses = 0;
+  uint64_t total_hits = 0, total_misses = 0, total_mshr_merge = 0;
   for (int i = 0; i < 5; ++i) {
     total_hits += st.hits[i];
     total_misses += st.misses[i];
+    total_mshr_merge += st.mshr_merge[i];
   }
   uint64_t total_access = total_hits + total_misses;
 
+  auto p_idx = champsim::to_underlying(access_type::PREFETCH);
+
   // TOTAL line
   fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
-             cache_name, "TOTAL", total_access, total_hits, total_misses, st.mshr_merge);
+             cache_name, "TOTAL", total_access, total_hits, total_misses, total_mshr_merge);
 
   // LOAD line
   {
@@ -57,31 +61,30 @@ void print_cache_stats(std::ostream& os, const std::string& cache_name, const Pe
     uint64_t load_misses = st.misses[l_idx];
     uint64_t load_access = load_hits + load_misses;
     fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
-               cache_name, "LOAD", load_access, load_hits, load_misses, st.mshr_merge);
+               cache_name, "LOAD", load_access, load_hits, load_misses, st.mshr_merge[l_idx]);
   }
 
   // DEMAND line: LOAD + RFO + WRITE + TRANSLATION (everything except PREFETCH)
   {
-    uint64_t demand_hits = 0, demand_misses = 0;
-    auto p_idx = champsim::to_underlying(access_type::PREFETCH);
+    uint64_t demand_hits = 0, demand_misses = 0, demand_mshr_merge = 0;
     for (std::size_t i = 0; i < 5; ++i) {
       if (i == p_idx) continue;
       demand_hits += st.hits[i];
       demand_misses += st.misses[i];
+      demand_mshr_merge += st.mshr_merge[i];
     }
     uint64_t demand_access = demand_hits + demand_misses;
     fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
-               cache_name, "DEMAND", demand_access, demand_hits, demand_misses, st.mshr_merge);
+               cache_name, "DEMAND", demand_access, demand_hits, demand_misses, demand_mshr_merge);
   }
 
   // PREFETCH line (separate from DEMAND)
   {
-    auto pidx = champsim::to_underlying(access_type::PREFETCH);
-    uint64_t pf_hits = st.hits[pidx];
-    uint64_t pf_misses = st.misses[pidx];
+    uint64_t pf_hits = st.hits[p_idx];
+    uint64_t pf_misses = st.misses[p_idx];
     uint64_t pf_access = pf_hits + pf_misses;
     fmt::print(os, "cpu0->{} {:<12s} ACCESS: {:10d} HIT: {:10d} MISS: {:10d} MSHR_MERGE: {:10d}\n",
-               cache_name, "PREFETCH", pf_access, pf_hits, pf_misses, st.mshr_merge);
+               cache_name, "PREFETCH", pf_access, pf_hits, pf_misses, st.mshr_merge[p_idx]);
   }
 
   // Prefetch stats line (matching plain_printer.cc: PREFETCH REQUESTED / ISSUED / USEFUL / USELESS)
@@ -121,9 +124,9 @@ void add_object_to_group(GroupedCallerIPStats& grp, const MemoryObjectTable::Obj
     for (int i = 0; i < 5; ++i) {
       dst.hits[i] += cstats.hits[i];
       dst.misses[i] += cstats.misses[i];
+      dst.mshr_merge[i] += cstats.mshr_merge[i];
+      dst.mshr_return[i] += cstats.mshr_return[i];
     }
-    dst.mshr_merge += cstats.mshr_merge;
-    dst.mshr_return += cstats.mshr_return;
     dst.total_miss_latency += cstats.total_miss_latency;
     dst.pf_requested += cstats.pf_requested;
     dst.pf_issued += cstats.pf_issued;
@@ -318,9 +321,9 @@ void print_memory_object_stats(const std::string& filename)
         for (int i = 0; i < 5; ++i) {
           dst->hits[i] += cstats.hits[i];
           dst->misses[i] += cstats.misses[i];
+          dst->mshr_merge[i] += cstats.mshr_merge[i];
+          dst->mshr_return[i] += cstats.mshr_return[i];
         }
-        dst->mshr_merge += cstats.mshr_merge;
-        dst->mshr_return += cstats.mshr_return;
         dst->total_miss_latency += cstats.total_miss_latency;
         dst->pf_requested += cstats.pf_requested;
         dst->pf_issued += cstats.pf_issued;
@@ -343,9 +346,9 @@ void print_memory_object_stats(const std::string& filename)
         for (int i = 0; i < 5; ++i) {
           dst->hits[i] += cstats.hits[i];
           dst->misses[i] += cstats.misses[i];
+          dst->mshr_merge[i] += cstats.mshr_merge[i];
+          dst->mshr_return[i] += cstats.mshr_return[i];
         }
-        dst->mshr_merge += cstats.mshr_merge;
-        dst->mshr_return += cstats.mshr_return;
         dst->total_miss_latency += cstats.total_miss_latency;
         dst->pf_requested += cstats.pf_requested;
         dst->pf_issued += cstats.pf_issued;

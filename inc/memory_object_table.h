@@ -71,8 +71,8 @@ struct PerCacheStats {
   // Access counts by access_type (indexed by to_underlying(access_type))
   uint64_t hits[5] = {};   // LOAD, RFO, PREFETCH, WRITE, TRANSLATION
   uint64_t misses[5] = {};
-  uint64_t mshr_merge = 0;
-  uint64_t mshr_return = 0;
+  uint64_t mshr_merge[5] = {};
+  uint64_t mshr_return[5] = {};
   long total_miss_latency = 0;
 
   // Prefetch statistics
