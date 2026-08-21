@@ -22,6 +22,17 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
   obj.size = size;
 
   obj.caller_ip = caller_ip;
+
+  // Large-object segmentation: only the page-aligned middle is contiguous.
+  obj.is_large = (size >= LARGE_OBJECT_THRESHOLD);
+  if (obj.is_large) {
+    const uint64_t s = vaddr.to<uint64_t>();
+    const uint64_t e = s + size; // exclusive
+    obj.contig_start_page = champsim::page_number{(s + PAGE_SIZE - 1) / PAGE_SIZE}; // ceil(start/PAGE_SIZE)
+    obj.contig_num_pages =
+        static_cast<int64_t>(e / PAGE_SIZE) - static_cast<int64_t>(obj.contig_start_page.to<uint64_t>());
+  }
+
   active_objects.emplace(vaddr, obj);
 
   // Add to all_objects
@@ -88,6 +99,38 @@ std::pair<champsim::address, champsim::address> MemoryObjectTable::get_object_bo
   return {obj->vaddr_start, obj->vaddr_end};
 }
 
+void MemoryObjectTable::register_mapping_range(champsim::page_number ppage_start, std::size_t num_pages, uint64_t alloc_id)
+{
+  using diff = champsim::page_number::difference_type;
+  for (std::size_t i = 0; i < num_pages; ++i) {
+    ppage_to_allocid[ppage_start + static_cast<diff>(i)] = alloc_id;
+  }
+}
+
+MemoryObjectTable::ActiveObject* MemoryObjectTable::find_large_contig(champsim::page_number vpage)
+{
+  // Reconstruct the page-aligned byte address and locate the owning active object.
+  champsim::address vaddr{vpage.to<uint64_t>() << champsim::lg2(PAGE_SIZE)};
+  auto it = active_objects.upper_bound(vaddr);
+  if (it == active_objects.begin()) {
+    return nullptr;
+  }
+  --it;
+  auto& obj = it->second;
+
+  if (!obj.is_large || obj.contig_num_pages <= 0) {
+    return nullptr;
+  }
+
+  // Check the vpage falls within the page-aligned contiguous middle segment.
+  const uint64_t vp = vpage.to<uint64_t>();
+  const uint64_t cs = obj.contig_start_page.to<uint64_t>();
+  if (vp < cs || vp >= cs + static_cast<uint64_t>(obj.contig_num_pages)) {
+    return nullptr;
+  }
+  return &obj;
+}
+
 uint64_t MemoryObjectTable::lookup_alloc_id_by_pa(champsim::page_number ppage) const
 {
   // Direct lookup: PA → alloc_id
@@ -128,16 +171,23 @@ PerDRAMStats& MemoryObjectTable::get_dram_stats(uint64_t alloc_id, const std::st
 
 const MemoryObjectTable::ActiveObject* MemoryObjectTable::find_active_by_va(champsim::address vaddr) const
 {
-  // Binary search: find the active_range whose page [vaddr, vaddr+PAGE_SIZE) 
-  // overlaps with the object's [vaddr_start, vaddr_end).
-  // Because vaddr is page-aligned and object boundaries may not be page-aligned,
-  // we use an overlap check rather than exact containment.
-  // Uses map::upper_bound for O(log n) search on the sorted map.
+  // Find the active object whose page [vaddr, vaddr+PAGE_SIZE) overlaps the
+  // object's [vaddr_start, vaddr_end). Because vaddr is page-aligned and object
+  // boundaries may not be page-aligned, a page can overlap the HEAD of an object
+  // (vaddr < vaddr_start) or its body, so we check both the predecessor and the
+  // successor of the upper_bound position.
   auto it = active_objects.upper_bound(vaddr);
 
   if (it != active_objects.begin()) {
-    --it;
-    // Check page overlap: Page [vaddr, vaddr+PAGE_SIZE) overlaps [it->vaddr_start, it->vaddr_end)?
+    auto prev = it;
+    --prev;
+    champsim::address page_end{vaddr.to<uint64_t>() + PAGE_SIZE};
+    if (vaddr < prev->second.vaddr_end && page_end > prev->second.vaddr_start) {
+      return &prev->second;
+    }
+  }
+
+  if (it != active_objects.end()) {
     champsim::address page_end{vaddr.to<uint64_t>() + PAGE_SIZE};
     if (vaddr < it->second.vaddr_end && page_end > it->second.vaddr_start) {
       return &it->second;

@@ -47,6 +47,7 @@ VirtualMemory::VirtualMemory(champsim::data::bytes page_table_page_size, std::si
   }
   populate_pages();
   shuffle_pages();
+  init_large_runs();
 }
 
 VirtualMemory::VirtualMemory(champsim::data::bytes page_table_page_size, std::size_t page_table_levels, champsim::chrono::clock::duration minor_penalty,
@@ -58,20 +59,32 @@ VirtualMemory::VirtualMemory(champsim::data::bytes page_table_page_size, std::si
 void VirtualMemory::populate_pages()
 {
   assert(dram.size() > 1_MiB);
-  ppage_free_list.resize(((dram.size() - 1_MiB) / PAGE_SIZE).count());
+  const auto total_pages = ((dram.size() - 1_MiB) / PAGE_SIZE).count();
+  const auto small_pages = static_cast<std::size_t>(static_cast<double>(total_pages) * (1.0 - LARGE_OBJECT_FRACTION));
+
+  large_pool_pages = total_pages - small_pages;
+
+  ppage_free_list.resize(small_pages);
   assert(ppage_free_list.size() != 0);
-  champsim::page_number base_address =
-      champsim::page_number{champsim::lowest_address_for_size(std::max<champsim::data::mebibytes>(champsim::data::bytes{PAGE_SIZE}, 1_MiB))};
+  champsim::page_number base_address{
+      champsim::lowest_address_for_size(std::max<champsim::data::mebibytes>(champsim::data::bytes{PAGE_SIZE}, 1_MiB))};
   for (auto it = ppage_free_list.begin(); it != ppage_free_list.end(); it++) {
     *it = base_address;
     base_address++;
   }
+  large_pool_start = base_address; // just past the small pool
 }
 
 void VirtualMemory::shuffle_pages()
 {
   if (randomization_seed.has_value())
     std::shuffle(ppage_free_list.begin(), ppage_free_list.end(), std::mt19937_64{randomization_seed.value()});
+}
+
+void VirtualMemory::init_large_runs()
+{
+  large_free_runs.clear();
+  large_free_runs[large_pool_start] = large_pool_pages;
 }
 
 champsim::dynamic_extent VirtualMemory::extent(std::size_t level) const
@@ -89,43 +102,116 @@ uint64_t VirtualMemory::get_offset(champsim::page_number vaddr, std::size_t leve
 
 champsim::page_number VirtualMemory::ppage_front() const
 {
-  assert(available_ppages() > 0);
+  assert(!ppage_free_list.empty());
   return ppage_free_list.front();
 }
 
 void VirtualMemory::ppage_pop()
 {
   ppage_free_list.pop_front();
-  if (available_ppages() == 0) {
+  if (ppage_free_list.empty()) {
     fmt::print("[VMEM] WARNING: Out of physical memory, freeing ppages\n");
     populate_pages();
     shuffle_pages();
   }
 }
 
-std::size_t VirtualMemory::available_ppages() const { return (ppage_free_list.size()); }
+champsim::page_number VirtualMemory::allocate_contiguous(std::size_t num_pages)
+{
+  using diff = champsim::page_number::difference_type;
+  for (auto it = large_free_runs.rbegin(); it != large_free_runs.rend(); ++it) {
+    if (it->second < num_pages) {
+      continue;
+    }
+    const champsim::page_number run_start = it->first;
+    const std::size_t run_len = it->second;
+    // Carve from the top of the highest run (high -> low).
+    const champsim::page_number base = run_start + static_cast<diff>(run_len - num_pages);
+    large_free_runs.erase(run_start);
+    if (run_len > num_pages) {
+      large_free_runs[run_start] = run_len - num_pages; // keep the lower remainder
+    }
+    return base;
+  }
+  // No run is large enough: recycle the large pool (infinite-memory semantics).
+  init_large_runs();
+  return allocate_contiguous(num_pages);
+}
+
+void VirtualMemory::free_pages(champsim::page_number start, std::size_t num_pages)
+{
+  using diff = champsim::page_number::difference_type;
+  const champsim::page_number end = start + static_cast<diff>(num_pages);
+
+  // Absorb a successor run that begins exactly at `end`.
+  auto succ = large_free_runs.find(end);
+  if (succ != large_free_runs.end()) {
+    num_pages += succ->second;
+    large_free_runs.erase(succ);
+  }
+
+  // Absorb a predecessor run that ends exactly at `start`.
+  auto pred = large_free_runs.lower_bound(start);
+  if (pred != large_free_runs.begin()) {
+    --pred;
+    if (pred->first + static_cast<diff>(pred->second) == start) {
+      pred->second += num_pages;
+      return;
+    }
+  }
+
+  large_free_runs[start] = num_pages;
+}
+
+std::size_t VirtualMemory::available_ppages() const
+{
+  std::size_t total = ppage_free_list.size();
+  for (auto& [run_start, run_len] : large_free_runs) {
+    (void)run_start;
+    total += run_len;
+  }
+  return total;
+}
 
 std::pair<champsim::page_number, champsim::chrono::clock::duration> VirtualMemory::va_to_pa(uint32_t cpu_num, champsim::page_number vaddr)
 {
-  auto [ppage, fault] = vpage_to_ppage_map.try_emplace({cpu_num, champsim::page_number{vaddr}}, ppage_front());
+  const auto key = std::pair<uint32_t, champsim::page_number>{cpu_num, vaddr};
+  auto hit = vpage_to_ppage_map.find(key);
 
-  // this vpage doesn't yet have a ppage mapping
-  if (fault) {
+  // Already translated: no minor fault, no new allocation.
+  if (hit != vpage_to_ppage_map.end()) {
+    return {hit->second, champsim::chrono::clock::duration::zero()};
+  }
+
+  // First touch of this virtual page: determine its physical page.
+  champsim::page_number ppage{};
+  auto* obj = (mol_table != nullptr) ? mol_table->find_large_contig(vaddr) : nullptr;
+  if (obj != nullptr) {
+    // The vpage lies in a large object's page-aligned contiguous middle segment.
+    if (obj->contig_base_ppage.to<uint64_t>() == 0) {
+      // First touch of the segment: allocate the whole contiguous block at once (high -> low).
+      obj->contig_base_ppage = allocate_contiguous(static_cast<std::size_t>(obj->contig_num_pages));
+      mol_table->register_mapping_range(obj->contig_base_ppage, static_cast<std::size_t>(obj->contig_num_pages), obj->alloc_id);
+    }
+    using diff = champsim::page_number::difference_type;
+    ppage = obj->contig_base_ppage + static_cast<diff>(vaddr.to<uint64_t>() - obj->contig_start_page.to<uint64_t>());
+  } else {
+    // Small object, unaligned head/tail page, or PTE page: classic small-pool
+    // single page (random/linear per the original allocator).
+    ppage = ppage_front();
     ppage_pop();
+    if (mol_table != nullptr) {
+      mol_table->register_mapping(vaddr, ppage);
+    }
   }
 
-  auto penalty = fault ? minor_fault_penalty : champsim::chrono::clock::duration::zero();
-
-  // Register the PA→VA mapping in the memory object table
-  if (mol_table != nullptr) {
-    mol_table->register_mapping(champsim::page_number{vaddr}, ppage->second);
-  }
+  vpage_to_ppage_map[key] = ppage;
 
   if constexpr (champsim::debug_print) {
-    fmt::print("[VMEM] {} paddr: {} vpage: {} fault: {}\n", __func__, ppage->second, champsim::page_number{vaddr}, fault);
+    fmt::print("[VMEM] {} paddr: {} vpage: {} fault: 1\n", __func__, ppage, vaddr);
   }
 
-  return std::pair{ppage->second, penalty};
+  return {ppage, minor_fault_penalty};
 }
 
 std::pair<champsim::address, champsim::chrono::clock::duration> VirtualMemory::get_pte_pa(uint32_t cpu_num, champsim::page_number vaddr, std::size_t level)

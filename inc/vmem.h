@@ -32,6 +32,9 @@ class MemoryObjectTable;
 
 using pte_entry = champsim::data::size<long long, std::ratio<8>>;
 
+// Fraction of physical memory reserved for the large-object contiguous pool (top half).
+constexpr double LARGE_OBJECT_FRACTION = 0.5;
+
 class VirtualMemory
 {
 private:
@@ -46,18 +49,26 @@ public:
   const pte_entry pte_page_size; // Size of a PTE page
 
 private:
+  // Physical memory is partitioned: the bottom `LARGE_OBJECT_FRACTION`-complement holds
+  // ordinary/small pages (and PTE pages) via the classic free list, with optional
+  // randomization preserved from the original behavior. The top half is a dedicated
+  // large-object pool whose free runs are allocated contiguously, high -> low.
   std::deque<champsim::page_number> ppage_free_list;
   champsim::page_number active_pte_page{};
   champsim::address_slice<champsim::dynamic_extent> next_pte_page;
 
-  // champsim::page_number next_ppage;
-  // champsim::page_number last_ppage;
+  // Large-object pool (top half): free runs map start_page -> num contiguous pages.
+  std::map<champsim::page_number, std::size_t> large_free_runs;
+  champsim::page_number large_pool_start{}; // first page of the large pool
+  std::size_t large_pool_pages = 0;
 
   [[nodiscard]] champsim::page_number ppage_front() const;
   void ppage_pop();
-
-  void shuffle_pages();
   void populate_pages();
+  void shuffle_pages();
+  void init_large_runs();
+  [[nodiscard]] champsim::page_number allocate_contiguous(std::size_t num_pages);
+  void free_pages(champsim::page_number start, std::size_t num_pages);
 
 public:
   /**

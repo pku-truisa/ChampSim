@@ -26,6 +26,10 @@
 #include "address.h"
 #include "champsim.h"
 
+// Objects of at least this size (bytes) are treated as "large objects":
+// their page-aligned middle portion gets a contiguous physical mapping.
+constexpr uint64_t LARGE_OBJECT_THRESHOLD = 16 * 1024; // 16KB
+
 // Memory allocation event types
 // These values MUST match the instr_info encoding produced by
 // champsim_object_tracer.cpp (tracer/pin-object/):
@@ -104,6 +108,15 @@ public:
     uint64_t alloc_id;
     uint64_t size;
     uint64_t caller_ip = 0;      // return address from the allocator call site
+
+    // Large-object contiguous-allocation metadata (size >= LARGE_OBJECT_THRESHOLD).
+    // Only the page-aligned middle [contig_start_page, contig_start_page+contig_num_pages)
+    // of the object is backed by contiguous physical pages (allocated high->low on first
+    // touch via VirtualMemory). Unaligned head/tail pages use the normal single-page path.
+    bool is_large = false;
+    champsim::page_number contig_start_page{}; // = ceil(vaddr_start / PAGE_SIZE)
+    int64_t contig_num_pages = 0;              // <= 0 means no contiguous segment
+    champsim::page_number contig_base_ppage{}; // physical base once allocated (0 = not yet)
   };
 
   // Historical record of all allocations with per-object statistics
@@ -125,6 +138,15 @@ public:
 
   // Called by VirtualMemory::va_to_pa() after translation
   void register_mapping(champsim::page_number vpage, champsim::page_number ppage);
+
+  // Register a contiguous physical run [ppage_start, ppage_start+num_pages) -> alloc_id.
+  // Used for the page-aligned middle of a large object. Each physical page gets its own
+  // per-page entry in the reverse table so lookups stay uniform.
+  void register_mapping_range(champsim::page_number ppage_start, std::size_t num_pages, uint64_t alloc_id);
+
+  // Return the active large object whose page-aligned contiguous middle segment contains
+  // vpage, or nullptr. Non-const: VirtualMemory back-fills contig_base_ppage on first touch.
+  ActiveObject* find_large_contig(champsim::page_number vpage);
 
   // Called by Cache/DRAM to find which object owns a physical page
   // Returns alloc_id (0 if no mapping found for this page)
