@@ -47,6 +47,9 @@
 #include "util/to_underlying.h" // for to_underlying
 #include "waitable.h"
 
+class MemoryObjectTable;
+class VirtualMemory;
+
 class CACHE : public champsim::operable
 {
   enum [[deprecated(
@@ -159,6 +162,35 @@ private:
   std::deque<tag_lookup_type> inflight_tag_check{};
   std::deque<tag_lookup_type> translation_stash{};
 
+  // RTLB: recent large-object translations, parallel to the 4KB entries. Only wired for
+  // the DTLB (see CACHE::set_mol_table / CACHE::set_vmem). One entry covers a whole large
+  // object (its page-aligned contiguous middle) via a range lookup.
+  struct rtlb_entry {
+    bool valid = false;
+    champsim::page_number vpage_start{};
+    int64_t num_pages = 0;
+    champsim::page_number base_ppage{};
+    uint64_t lru = 0;
+  };
+  static constexpr std::size_t RTLB_SIZE = 64;
+  std::array<rtlb_entry, RTLB_SIZE> rtlb{};
+  uint64_t rtlb_lru_counter = 0;
+  MemoryObjectTable* mol_table = nullptr;
+  VirtualMemory* vmem = nullptr;
+
+  // First-touch RTLB translations are delayed by the minor-fault penalty before delivery.
+  struct rtlb_pending_type {
+    champsim::chrono::clock::time_point ready_at;
+    response_type response;
+    std::vector<std::deque<response_type>*> to_return;
+  };
+  std::deque<rtlb_pending_type> rtlb_pending;
+
+  // Returns true if the translation was handled by the RTLB / large-object fast path.
+  bool rtlb_try_translate(const tag_lookup_type& handle_pkt);
+  void rtlb_respond(const tag_lookup_type& handle_pkt, champsim::page_number ppage, champsim::chrono::clock::duration penalty);
+  void rtlb_finish();
+
 public:
   std::vector<channel_type*> upper_levels;
   channel_type* lower_level;
@@ -177,6 +209,10 @@ public:
   bool match_offset_bits;
   bool virtual_prefetch;
   std::vector<access_type> pref_activate_mask;
+
+  // Wire the RTLB fast path (only the DTLB should be wired).
+  void set_mol_table(MemoryObjectTable& mol) { mol_table = &mol; }
+  void set_vmem(VirtualMemory& vm) { vmem = &vm; }
 
   using stats_type = cache_stats;
 

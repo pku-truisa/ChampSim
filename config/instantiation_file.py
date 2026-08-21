@@ -326,6 +326,9 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
         *(c['_prefetcher_data'] for c in caches),
         *(c['_replacement_data'] for c in caches)
     ))
+    # Global master switch for large-object contiguous allocation + DTLB RTLB fast path.
+    yield f'bool large_object_allocation_enabled = {str(bool(vmem["large_object_allocation"])).lower()};'
+    yield ''
     yield from module_include_files(datas)
 
     # Get fastest clock period in picoseconds

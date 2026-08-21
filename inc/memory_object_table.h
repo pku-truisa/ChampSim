@@ -226,6 +226,10 @@ private:
 // Global singleton instance
 extern MemoryObjectTable mol_table;
 
+// Master switch from the "virtual_memory.large_object_allocation" config. When false,
+// large-object contiguous allocation and the DTLB RTLB fast path are disabled entirely.
+extern bool large_object_allocation_enabled;
+
 // Output per-object statistics to a file (sorted by LOAD count descending)
 void print_memory_object_stats(const std::string& filename);
 

@@ -182,6 +182,7 @@
     "pte_page_size": 4096,
     "num_levels": 5,
     "minor_fault_penalty": 200,
-    "randomization": 1
+    "randomization": 1,
+    "large_object_allocation": true
   }
 }

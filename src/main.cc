@@ -152,9 +152,23 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
   }
 
   // Wire up the memory object table to all VirtualMemory instances via PTW
+  VirtualMemory* dtlb_vmem = nullptr;
   for (PageTableWalker& ptw : gen_environment.ptw_view()) {
     if (ptw.vmem != nullptr) {
       ptw.vmem->set_mol_table(mol_table);
+      if (dtlb_vmem == nullptr) {
+        dtlb_vmem = ptw.vmem;
+      }
+    }
+  }
+
+  // Wire the DTLB for the RTLB fast path (recent large-object translations)
+  if (large_object_allocation_enabled && dtlb_vmem != nullptr) {
+    for (CACHE& cache : gen_environment.cache_view()) {
+      if (cache.NAME.find("DTLB") != std::string::npos) {
+        cache.set_mol_table(mol_table);
+        cache.set_vmem(*dtlb_vmem);
+      }
     }
   }
 

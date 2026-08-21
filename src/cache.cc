@@ -28,6 +28,8 @@
 #include "chrono.h"
 #include "deadlock.h"
 #include "instruction.h"
+#include "memory_object_table.h"
+#include "vmem.h"
 #include "util/algorithm.h"
 #include "util/bits.h"
 #include "util/span.h"
@@ -264,6 +266,11 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 
 bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
 {
+  // RTLB fast path: recent large-object translations (only when the DTLB is wired).
+  if (mol_table != nullptr && rtlb_try_translate(handle_pkt)) {
+    return true;
+  }
+
   cpu = handle_pkt.cpu;
 
   // access cache
@@ -306,6 +313,82 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   }
 
   return hit;
+}
+
+bool CACHE::rtlb_try_translate(const tag_lookup_type& handle_pkt)
+{
+  const champsim::page_number vpage{handle_pkt.v_address};
+
+  // 1) RTLB range lookup (hit -> 1 cycle, no STLB, no 4KB DTLB entry).
+  for (auto& e : rtlb) {
+    if (e.valid) {
+      const uint64_t vp = vpage.to<uint64_t>();
+      const uint64_t start = e.vpage_start.to<uint64_t>();
+      if (vp >= start && vp < start + static_cast<uint64_t>(e.num_pages)) {
+        e.lru = rtlb_lru_counter++;
+        const champsim::page_number ppage{e.base_ppage.to<uint64_t>() + (vp - start)};
+        rtlb_respond(handle_pkt, ppage, champsim::chrono::clock::duration::zero());
+        return true;
+      }
+    }
+  }
+
+  // 2) RTLB miss: consult the full object table. Only large objects are served here.
+  auto* obj = mol_table->find_large_contig(vpage);
+  if (obj == nullptr) {
+    return false; // not a large object -> normal 4KB DTLB/STLB/PTW path
+  }
+
+  auto [ppage, penalty] = vmem->va_to_pa(handle_pkt.cpu, vpage);
+
+  // Insert into the RTLB (fill an empty slot, else LRU-evict among the 64 entries).
+  rtlb_entry* slot = nullptr;
+  for (auto& e : rtlb) {
+    if (!e.valid) {
+      slot = &e;
+      break;
+    }
+  }
+  if (slot == nullptr) {
+    slot = &rtlb[0];
+    for (auto& e : rtlb) {
+      if (e.lru < slot->lru) {
+        slot = &e;
+      }
+    }
+  }
+  *slot = rtlb_entry{true, obj->contig_start_page, obj->contig_num_pages, ppage, rtlb_lru_counter++};
+
+  rtlb_respond(handle_pkt, ppage, penalty);
+  return true;
+}
+
+void CACHE::rtlb_respond(const tag_lookup_type& handle_pkt, champsim::page_number ppage, champsim::chrono::clock::duration penalty)
+{
+  sim_stats.record_hit(handle_pkt.type, handle_pkt.cpu, handle_pkt.v_address, champsim::address{ppage}, warmup);
+
+  response_type response{handle_pkt.address, handle_pkt.v_address, champsim::address{ppage}, handle_pkt.pf_metadata, handle_pkt.instr_depend_on_me};
+  if (penalty == champsim::chrono::clock::duration::zero()) {
+    for (auto* ret : handle_pkt.to_return) {
+      ret->push_back(response);
+    }
+  } else {
+    rtlb_pending.push_back({current_time + penalty, response, handle_pkt.to_return});
+  }
+}
+
+void CACHE::rtlb_finish()
+{
+  for (auto it = rtlb_pending.begin(); it != rtlb_pending.end();) {
+    if (it->ready_at <= current_time) {
+      for (auto* ret : it->to_return) {
+        ret->push_back(it->response);
+      }
+      it = rtlb_pending.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 auto CACHE::mshr_and_forward_packet(const tag_lookup_type& handle_pkt) -> std::pair<mshr_type, request_type>
@@ -454,6 +537,9 @@ long CACHE::operate()
     progress += std::distance(std::cbegin(lower_translate->returned), std::cend(lower_translate->returned));
     lower_translate->returned.clear();
   }
+
+  // Deliver ready RTLB (large-object) translations that were delayed by a minor fault
+  rtlb_finish();
 
   // Perform fills
   champsim::bandwidth fill_bw{MAX_FILL};

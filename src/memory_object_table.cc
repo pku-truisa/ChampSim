@@ -24,7 +24,7 @@ uint64_t MemoryObjectTable::record_alloc(champsim::address vaddr, uint64_t size,
   obj.caller_ip = caller_ip;
 
   // Large-object segmentation: only the page-aligned middle is contiguous.
-  obj.is_large = (size >= LARGE_OBJECT_THRESHOLD);
+  obj.is_large = large_object_allocation_enabled && (size >= LARGE_OBJECT_THRESHOLD);
   if (obj.is_large) {
     const uint64_t s = vaddr.to<uint64_t>();
     const uint64_t e = s + size; // exclusive
@@ -171,11 +171,10 @@ PerDRAMStats& MemoryObjectTable::get_dram_stats(uint64_t alloc_id, const std::st
 
 const MemoryObjectTable::ActiveObject* MemoryObjectTable::find_active_by_va(champsim::address vaddr) const
 {
-  // Find the active object whose page [vaddr, vaddr+PAGE_SIZE) overlaps the
-  // object's [vaddr_start, vaddr_end). Because vaddr is page-aligned and object
-  // boundaries may not be page-aligned, a page can overlap the HEAD of an object
-  // (vaddr < vaddr_start) or its body, so we check both the predecessor and the
-  // successor of the upper_bound position.
+  // Find the active object whose page [vaddr, vaddr+PAGE_SIZE) overlaps the object's
+  // [vaddr_start, vaddr_end). We check both the predecessor (object with start <= vaddr)
+  // and the successor (first object with start > vaddr), so that a page overlapping the
+  // unaligned HEAD of an object is correctly attributed.
   auto it = active_objects.upper_bound(vaddr);
 
   if (it != active_objects.begin()) {

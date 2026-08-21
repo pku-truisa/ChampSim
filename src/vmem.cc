@@ -60,7 +60,8 @@ void VirtualMemory::populate_pages()
 {
   assert(dram.size() > 1_MiB);
   const auto total_pages = ((dram.size() - 1_MiB) / PAGE_SIZE).count();
-  const auto small_pages = static_cast<std::size_t>(static_cast<double>(total_pages) * (1.0 - LARGE_OBJECT_FRACTION));
+  const double frac = large_object_allocation_enabled ? LARGE_OBJECT_FRACTION : 0.0;
+  const auto small_pages = static_cast<std::size_t>(static_cast<double>(total_pages) * (1.0 - frac));
 
   large_pool_pages = total_pages - small_pages;
 
@@ -192,6 +193,8 @@ std::pair<champsim::page_number, champsim::chrono::clock::duration> VirtualMemor
       // First touch of the segment: allocate the whole contiguous block at once (high -> low).
       obj->contig_base_ppage = allocate_contiguous(static_cast<std::size_t>(obj->contig_num_pages));
       mol_table->register_mapping_range(obj->contig_base_ppage, static_cast<std::size_t>(obj->contig_num_pages), obj->alloc_id);
+      fmt::print("[VMEM] large object alloc: id={} size={} vpage_start={:#x} num_pages={} base_ppage={:#x}\n", obj->alloc_id, obj->size,
+                 obj->contig_start_page.to<uint64_t>(), obj->contig_num_pages, obj->contig_base_ppage.to<uint64_t>());
     }
     using diff = champsim::page_number::difference_type;
     ppage = obj->contig_base_ppage + static_cast<diff>(vaddr.to<uint64_t>() - obj->contig_start_page.to<uint64_t>());
