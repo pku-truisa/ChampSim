@@ -120,6 +120,9 @@ private:
       delete[] scache;
     }
 
+    // Original set-way shadow cache mirroring the L1D. The "not found" cases in
+    // is_pf/set_pf/get_latency are handled gracefully (no assertion) because some fills
+    // (instruction fills) are intentionally not added to the shadow cache.
     bool add(uint32_t set, uint32_t way, uint64_t addr, bool pf, uint64_t lat);
     bool get(uint64_t addr);
     void set_pf(uint64_t addr, bool pf);

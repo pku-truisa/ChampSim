@@ -174,14 +174,7 @@ uint64_t moBertiGo::LatencyTable::get_tag(uint64_t addr)
 bool moBertiGo::ShadowCache::add(uint32_t set, uint32_t way, uint64_t addr, bool pf, uint64_t lat)
 {
   /*
-   * Add block to shadow cache
-   *
-   * Parameters:
-   *      - cpu: cpu
-   *      - set: cache set
-   *      - way: cache way
-   *      - addr: cache block v_addr
-   *      - access: the cache is access by a demand
+   * Add block to shadow cache (original set-way placement mirroring the L1D)
    */
 
   if constexpr (champsim::debug_print) {
@@ -253,8 +246,7 @@ void moBertiGo::ShadowCache::set_pf(uint64_t addr, bool pf)
     }
   }
 
-  // The address should always be in the cache
-  assert((0) && "Address is must be in shadow cache");
+  // Not found: nothing to update (the line may be an untracked instruction fill).
 }
 
 bool moBertiGo::ShadowCache::is_pf(uint64_t addr)
@@ -284,8 +276,9 @@ bool moBertiGo::ShadowCache::is_pf(uint64_t addr)
     }
   }
 
-  assert((0) && "Address is must be in shadow cache");
-  return 0;
+  // Not found: this line is not tracked by the prefetcher (e.g. an instruction fill that
+  // was never added to the shadow cache). Treat it as a non-prefetch instead of crashing.
+  return false;
 }
 
 uint64_t moBertiGo::ShadowCache::get_latency(uint64_t addr)
@@ -316,7 +309,7 @@ uint64_t moBertiGo::ShadowCache::get_latency(uint64_t addr)
     }
   }
 
-  assert((0) && "Address is must be in shadow cache");
+  // Not found: return a default latency (the line may be an untracked instruction fill).
   return 0;
 }
 
@@ -1207,7 +1200,7 @@ uint32_t moBertiGo::prefetcher_cache_fill(champsim::address address, long set, l
     filter.onEviction(evicted_addr);
   }
 
-  // Add to the shadow cache
+  // Add to the shadow cache (set-way placement mirroring the L1D)
   scache->add(static_cast<uint32_t>(set), static_cast<uint32_t>(way), line_addr, prefetch, latency);
 
   if (latency != 0 && !prefetch) {

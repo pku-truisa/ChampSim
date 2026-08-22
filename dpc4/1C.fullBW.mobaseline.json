@@ -1,5 +1,5 @@
 {
-  "executable_name": "1C.fullBW.moBertiGo-moPythiaTLB-no",
+  "executable_name": "1C.fullBW.mobaseline",
   "block_size": 64,
   "page_size": 4096,
   "heartbeat_frequency": 100000,
@@ -68,7 +68,7 @@
     "prefetch_as_load": false,
     "virtual_prefetch": true,
     "prefetch_activate": "LOAD,PREFETCH",
-    "prefetcher": "moBertiGo"
+    "prefetcher": "berti"
   },
 
   "L2C": {
@@ -82,9 +82,9 @@
     "max_tag_check": 1,
     "max_fill": 1,
     "prefetch_as_load": false,
-    "virtual_prefetch": true,
+    "virtual_prefetch": false,
     "prefetch_activate": "LOAD,PREFETCH",
-    "prefetcher": "moPythiaTLB"
+    "prefetcher": "pythia"
   },
 
   "ITLB": {
@@ -182,6 +182,7 @@
     "pte_page_size": 4096,
     "num_levels": 5,
     "minor_fault_penalty": 200,
-    "randomization": 1
+    "randomization": 1,
+    "large_object_allocation": true
   }
 }

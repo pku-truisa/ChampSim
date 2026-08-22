@@ -266,7 +266,8 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 
 bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
 {
-  // RTLB fast path: recent large-object translations (only when the DTLB is wired).
+  // RTLB fast path: recent large-object translations (only when this cache is wired with
+  // mol_table+vmem, i.e. the STLB). Unwired caches (e.g. the DTLB) keep original behavior.
   if (mol_table != nullptr && rtlb_try_translate(handle_pkt)) {
     return true;
   }
